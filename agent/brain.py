@@ -13,23 +13,7 @@ log = logging.getLogger("brain")
 
 SYSTEM = """Du er sannsynlighetsanalytiker for binære prediction markets på Polymarket.
 Oppgave: estimer P(YES inntreffer slik resolusjonskilden definerer det), ikke hva som «burde» skje.
-
-Regler:
-- Vær konservativ. Hvis informasjonen er tynn, sett confidence=low og p nær markedet.
-- Ikke jakt edge. De fleste markeder er OK priset.
-- Ta hensyn til resolusjonstekst, tid, base rates og nyhetsbildet du kjenner.
-- Aldri 0 eller 1. Hold p i [0.02, 0.98].
-- Svar KUN gyldig JSON-array. Ingen markdown.
-
-Hvert element:
-{
-  "condition_id": "...",
-  "p_yes": 0.0-1.0,
-  "confidence": "low"|"medium"|"high",
-  "thesis": "en setning",
-  "skip": false,
-  "skip_reason": ""
-}
+Regler: vær konservativ; confidence=low når tynt; aldri 0 eller 1; kun JSON-array.
 """
 
 
@@ -50,7 +34,7 @@ class Brain:
         if not markets:
             return {}
         if not settings.xai_api_key:
-            log.warning("XAI_API_KEY mangler — hopper over estimat")
+            log.warning("XAI_API_KEY mangler")
             return {}
         payload_markets = [
             {
@@ -71,7 +55,7 @@ class Brain:
                 {"role": "system", "content": SYSTEM},
                 {
                     "role": "user",
-                    "content": "Estimer disse markedene. Markedspris er kun referanse, ikke fasit.\n"
+                    "content": "Estimer disse markedene som JSON-array med condition_id,p_yes,confidence,thesis,skip,skip_reason.\n"
                     + json.dumps(payload_markets, ensure_ascii=False),
                 },
             ],
@@ -86,7 +70,7 @@ class Brain:
             timeout=120,
         )
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"][content]
+        content = r.json()["choices"][0]["message"]["content"]
         rows = _extract_json(content)
         out: dict[str, dict] = {}
         for row in rows:
