@@ -1,0 +1,4 @@
+python-dotenv>=1.0.1
+requests>=2.32.3
+py-clob-client>=0.18.0
+web3>=7.0.0
