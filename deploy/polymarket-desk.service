@@ -1,0 +1,15 @@
+[Unit]
+Description=Autonomous Polymarket desk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket-desk
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket-desk/.venv/bin/python main.py run
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
