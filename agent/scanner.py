@@ -35,6 +35,22 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _level_px(level: Any) -> float:
+    if isinstance(level, dict):
+        return _num(level.get("price") or level.get("p"))
+    if isinstance(level, (list, tuple)) and level:
+        return _num(level[0])
+    return _num(level)
+
+
+def _level_sz(level: Any) -> float:
+    if isinstance(level, dict):
+        return _num(level.get("size") or level.get("s") or level.get("quantity"))
+    if isinstance(level, (list, tuple)) and len(level) > 1:
+        return _num(level[1])
+    return 0.0
+
+
 def _category(raw: dict) -> str:
     tags = raw.get("tags") or []
     labels = []
@@ -138,22 +154,40 @@ class Scout:
         log.info("Scout: %s kandidater etter filter", len(out))
         return out
 
-    def book(self, token_id: str) -> dict:
-        r = requests.get(
-            f"{settings.clob_host}/book",
-            params={"token_id": token_id},
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid = _num(bids[0]["price"]) if bids else 0.0
-        best_ask = _num(asks[0]["price"]) if asks else 1.0
-        bid_sz = sum(_num(b.get("size")) for b in bids[:5])
-        ask_sz = sum(_num(a.get("size")) for a in asks[:5])
-        spread = max(0.0, best_ask - best_bid) if best_bid and best_ask else 1.0
-        mid = (best_bid + best_ask) / 2 if best_bid and best_ask else best_ask or best_bid
+    def book(self, token_id: str, fallback_mid: float | None = None) -> dict:
+        bids: list = []
+        asks: list = []
+        try:
+            r = requests.get(
+                f"{settings.clob_host}/book",
+                params={"token_id": token_id},
+                timeout=12,
+            )
+            if r.status_code == 404:
+                return self._synthetic(fallback_mid)
+            r.raise_for_status()
+            data = r.json() or {}
+            bids = data.get("bids") or data.get("buys") or []
+            asks = data.get("asks") or data.get("sells") or []
+        except Exception as exc:
+            log.debug("book %s: %s", (token_id or "")[:16], exc)
+            return self._synthetic(fallback_mid)
+        bid_px = [_level_px(x) for x in bids]
+        ask_px = [_level_px(x) for x in asks]
+        bid_px = [p for p in bid_px if 0 < p < 1]
+        ask_px = [p for p in ask_px if 0 < p < 1]
+        best_bid = max(bid_px) if bid_px else 0.0
+        best_ask = min(ask_px) if ask_px else 0.0
+        if best_bid and best_ask and best_ask < best_bid:
+            best_bid, best_ask = best_ask, best_bid
+        bid_sz = sum(_level_sz(x) for x in bids[:8])
+        ask_sz = sum(_level_sz(x) for x in asks[:8])
+        if not best_bid or not best_ask or (best_ask - best_bid) > 0.20:
+            syn = self._synthetic(fallback_mid)
+            if syn:
+                return syn
+        spread = max(0.0, best_ask - best_bid)
+        mid = (best_bid + best_ask) / 2
         return {
             "best_bid": best_bid,
             "best_ask": best_ask,
@@ -161,6 +195,20 @@ class Scout:
             "mid": mid,
             "bid_size": bid_sz,
             "ask_size": ask_sz,
+        }
+
+    def _synthetic(self, mid: float | None) -> dict:
+        px = float(mid or 0)
+        if px <= 0.01 or px >= 0.99:
+            return {}
+        return {
+            "best_bid": round(max(0.01, px - 0.01), 4),
+            "best_ask": round(min(0.99, px + 0.01), 4),
+            "spread": 0.02,
+            "mid": px,
+            "bid_size": 50,
+            "ask_size": 50,
+            "synthetic": True,
         }
 
     def enrich(self, markets: list[dict]) -> None:

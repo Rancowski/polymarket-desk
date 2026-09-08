@@ -177,16 +177,15 @@ class Desk:
 
         for m in batch:
             try:
+                mid = float(m.get("yes_mid") or m.get("mid") or 0)
                 if m.get("yes_token"):
-                    m["book"] = self.scout.book(m["yes_token"])
+                    m["book"] = self.scout.book(m["yes_token"], fallback_mid=mid)
                 if m.get("no_token"):
-                    try:
-                        m["no_book"] = self.scout.book(m["no_token"])
-                    except Exception:
-                        m["no_book"] = {}
+                    no_mid = float(m.get("no_mid") or (1 - mid if mid else 0))
+                    m["no_book"] = self.scout.book(m["no_token"], fallback_mid=no_mid)
             except Exception as exc:
                 log.warning("Bok-feil %s: %s", m.get("question", "")[:40], exc)
-                m["book"] = {}
+                m["book"] = self.scout._synthetic(float(m.get("yes_mid") or 0))
 
         self.scout.enrich(batch)
 
@@ -260,7 +259,9 @@ class Desk:
                 rejected += 1
                 continue
             try:
-                book = m.get("book") or self.scout.book(m["yes_token"])
+                book = m.get("book") or self.scout.book(
+                    m["yes_token"], fallback_mid=float(m.get("yes_mid") or m.get("mid") or 0)
+                )
             except Exception as exc:
                 self.store.log_decision(
                     condition_id=m["condition_id"],
