@@ -300,6 +300,49 @@ class Executor:
             log.warning("cancel_open: %s", exc)
         return n
 
+    def fetch_live_positions(self) -> list[dict] | None:
+        """Sannhet fra Polymarket. None = henting feilet, ikke tøm lokalt."""
+        funder = (settings.funder or "").strip()
+        if not funder:
+            return None
+        headers = {"User-Agent": "polymarket-desk/1.0"}
+        urls = [
+            f"https://data-api.polymarket.com/positions?user={funder}&sizeThreshold=0",
+            f"https://gamma-api.polymarket.com/positions?user={funder}",
+        ]
+        for url in urls:
+            try:
+                r = requests.get(url, headers=headers, timeout=15)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                rows = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
+                out = []
+                for p in rows:
+                    size = float(p.get("size") or p.get("shares") or 0)
+                    if size < 0.01:
+                        continue
+                    outcome = str(p.get("outcome") or p.get("side") or "Yes").upper()
+                    side = "NO" if outcome.startswith("NO") or outcome == "0" else "YES"
+                    out.append(
+                        {
+                            "condition_id": str(p.get("conditionId") or p.get("condition_id") or ""),
+                            "question": str(p.get("title") or p.get("question") or "")[:160],
+                            "category": str(p.get("eventSlug") or "other")[:40],
+                            "event_key": str(p.get("eventSlug") or p.get("conditionId") or ""),
+                            "side": side,
+                            "token_id": str(p.get("asset") or p.get("token_id") or ""),
+                            "shares": size,
+                            "avg_cost": float(p.get("avgPrice") or p.get("avg_price") or p.get("curPrice") or 0),
+                            "status": "open",
+                        }
+                    )
+                log.info("Live posisjoner fra API: %s", len(out))
+                return out
+            except Exception as exc:
+                log.warning("positions %s: %s", url.split("/")[2], exc)
+        return None
+
     def submit(self, ticket: Ticket) -> dict:
         payload = {
             "condition_id": ticket.condition_id,

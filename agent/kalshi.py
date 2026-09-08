@@ -84,43 +84,79 @@ HOSTS = (
 )
 
 
+SERIES = (
+    "KXFED",
+    "KXBTC",
+    "KXBTCD",
+    "KXETH",
+    "KXETHD",
+    "INX",
+    "KXTRUMP",
+    "KXHARRIS",
+)
+
+
+def _rows_to_out(rows: list) -> list[dict]:
+    out = []
+    for row in rows:
+        if str(row.get("market_type") or "binary") not in {"binary", ""}:
+            continue
+        title = str(row.get("title") or row.get("yes_sub_title") or row.get("subtitle") or "")
+        px = _yes_px(row)
+        if not title or not px:
+            continue
+        out.append(
+            {
+                "title": title,
+                "ticker": row.get("ticker"),
+                "yes": px,
+                "tokens": _tokens(title),
+                "theme": _theme(title),
+            }
+        )
+    return out
+
+
 def fetch_open(limit: int = 200) -> list[dict]:
     last_exc: Exception | None = None
-    for host in HOSTS:
+    host = HOSTS[0]
+    collected: list[dict] = []
+    seen: set[str] = set()
+    for series in SERIES:
         try:
             r = requests.get(
                 f"{host}/markets",
-                params={"limit": limit, "status": "open"},
+                params={"limit": 50, "status": "open", "series_ticker": series},
                 timeout=12,
             )
+            if r.status_code == 429:
+                log.warning("Kalshi 429 på %s — stopper serier", series)
+                break
             if r.status_code >= 400:
-                r = requests.get(f"{host}/markets", params={"limit": limit}, timeout=12)
-            r.raise_for_status()
+                continue
             rows = (r.json() or {}).get("markets") or []
-            out = []
-            for row in rows:
-                title = str(row.get("title") or row.get("yes_sub_title") or row.get("subtitle") or "")
-                px = _yes_px(row)
-                if not title or not px:
+            chunk = _rows_to_out(rows)
+            for item in chunk:
+                t = str(item.get("ticker") or item["title"])
+                if t in seen:
                     continue
-                out.append(
-                    {
-                        "title": title,
-                        "ticker": row.get("ticker"),
-                        "yes": px,
-                        "tokens": _tokens(title),
-                        "theme": _theme(title),
-                    }
-                )
-            log.info("Kalshi %s: %s rader, %s med pris", host.split("/")[2], len(rows), len(out))
-            if out:
-                return out
+                seen.add(t)
+                collected.append(item)
+            log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
         except Exception as exc:
             last_exc = exc
-            log.warning("Kalshi %s: %s", host, exc)
-    if last_exc:
+            log.warning("Kalshi %s: %s", series, exc)
+    if not collected:
+        try:
+            r = requests.get(f"{host}/markets", params={"limit": min(limit, 50), "status": "open"}, timeout=12)
+            r.raise_for_status()
+            collected = _rows_to_out((r.json() or {}).get("markets") or [])
+        except Exception as exc:
+            last_exc = exc
+    log.info("Kalshi totalt %s markeder med pris", len(collected))
+    if not collected and last_exc:
         log.warning("Kalshi-henting feilet: %s", last_exc)
-    return []
+    return collected
 
 
 def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:

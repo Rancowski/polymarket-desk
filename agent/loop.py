@@ -67,6 +67,12 @@ class Desk:
             self.exec.cancel_open()
         except Exception as exc:
             log.warning("cancel_open: %s", exc)
+        try:
+            live_pos = self.exec.fetch_live_positions()
+            if live_pos is not None:
+                self.store.sync_open_positions(live_pos)
+        except Exception as exc:
+            log.warning("sync posisjoner: %s", exc)
         open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
         equity = bankroll + locked

@@ -171,9 +171,18 @@ class Brain:
 
     def _parse(self, content: str, markets: list[dict]) -> dict[str, dict]:
         rows = _extract_json(content)
+        if not isinstance(rows, list):
+            rows = [rows] if isinstance(rows, dict) else []
+        known = {str(m.get("condition_id")): m for m in markets}
+        by_q = {(m.get("question") or "")[:80].lower(): str(m.get("condition_id")) for m in markets}
         out: dict[str, dict] = {}
-        for row in rows:
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
             cid = str(row.get("condition_id") or "")
+            if cid not in known:
+                q = str(row.get("question") or "")[:80].lower()
+                cid = by_q.get(q) or (list(known.keys())[i] if i < len(known) else "")
             if not cid:
                 continue
             try:

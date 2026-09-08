@@ -346,9 +346,32 @@ class Store:
 
     def live_fill_count(self) -> int:
         with self._lock:
-            cur = self.conn.execute("SELECT COUNT(*) AS n FROM fills WHERE dry_run=0")
-            row = cur.fetchone()
-        return int(row["n"] if row else 0)
+            cur = self.conn.execute("SELECT raw FROM fills WHERE dry_run=0")
+            rows = cur.fetchall()
+        n = 0
+        for row in rows:
+            raw = str(row["raw"] or "")
+            if any(x in raw for x in ('"matched"', "'matched'", '"filled"', "'filled'")):
+                n += 1
+                continue
+            if "takingAmount" in raw and not any(x in raw for x in ('"takingAmount": ""', "'takingAmount': ''", '"takingAmount":"')):
+                n += 1
+        return n
+
+    def sync_open_positions(self, live: list[dict]) -> None:
+        """Erstatt lokale open med det Polymarket faktisk viser."""
+        live_keys = {(str(r.get("condition_id")), str(r.get("side") or "YES").upper()) for r in live}
+        with self._lock:
+            cur = self.conn.execute("SELECT condition_id, side FROM positions WHERE status='open'")
+            for row in cur.fetchall():
+                key = (str(row["condition_id"]), str(row["side"] or "YES").upper())
+                if key not in live_keys:
+                    self.conn.execute(
+                        "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=? AND side=?",
+                        (utc_now(), row["condition_id"], row["side"]),
+                    )
+        for r in live:
+            self.upsert_position(**r)
 
     def first_mark(self) -> dict | None:
         with self._lock:
