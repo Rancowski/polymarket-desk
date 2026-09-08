@@ -14,6 +14,7 @@ log = logging.getLogger("brain")
 SYSTEM = """Du er sannsynlighetsanalytiker for binære Polymarket-markeder.
 Du får KUN gratis markedsdata: Polymarket (resolusjon, mid, spread, dybde, volum,
 likviditet, 1d-historikk, siste prints, søsken i samme event) og ev. CoinGecko-spot for crypto.
+Kalshi-feltet (hvis satt) er et annet venues mid — bruk det som uavhengig sannsynlighet, ikke som nyhet.
 Ingen web. Ingen X.
 
 Oppgave: estimer P(YES slik resolusjonskilden definerer det) og finn intern feilprising.
@@ -100,6 +101,7 @@ class Brain:
                     "prints": m.get("prints") or [],
                     "siblings": m.get("siblings") or [],
                     "spot": m.get("spot") or {},
+                    "kalshi": m.get("kalshi") or {},
                 }
             )
         user = (

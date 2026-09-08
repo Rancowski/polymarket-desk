@@ -81,7 +81,9 @@ class Arb:
         tickets.extend(self._event_sets(markets, bankroll, open_ids | taken))
         taken = {t.condition_id for t in tickets}
         tickets.extend(self._locked(markets, bankroll, open_ids | taken))
-        log.info("Arb: %s ben (complement/event/låst)", len(tickets))
+        taken = {t.condition_id for t in tickets}
+        tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken))
+        log.info("Arb: %s ben (complement/event/låst/kalshi)", len(tickets))
         return tickets
 
     def _complements(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
@@ -199,5 +201,38 @@ class Arb:
             out.append(_ticket(m, side, token, book, cost, shares, thesis))
             open_ids.add(cid)
             if len(out) >= 4:
+                break
+        return out
+
+    def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
+        """Poly vs Kalshi ≥ 7 ¢: kjøp den billige siden på Polymarket (signal, ikke locked arb)."""
+        out: list[Ticket] = []
+        cap = settings.max_position_pct * bankroll * 0.7
+        for m in markets:
+            cid = m.get("condition_id")
+            ks = m.get("kalshi") or {}
+            if not cid or cid in open_ids or not ks:
+                continue
+            gap = float(ks.get("gap") or 0)
+            if abs(gap) < 0.07:
+                continue
+            # gap = poly_yes - kalshi_yes. Poly dyr YES → kjøp NO.
+            side = "NO" if gap > 0 else "YES"
+            book = self._book(m, "yes" if side == "YES" else "no")
+            token = m.get("yes_token") if side == "YES" else m.get("no_token")
+            cost = float(book.get("best_ask") or 0)
+            if cost <= 0.02 or cost >= 0.97:
+                continue
+            ask_sz = float(book.get("ask_size") or 0)
+            usd = min(cap, bankroll * 0.06)
+            shares = usd / cost
+            if ask_sz:
+                shares = min(shares, ask_sz / max(2, settings.min_book_multiple))
+            if shares * cost < 8:
+                continue
+            thesis = f"Kalshi {ks.get('yes')} vs Poly {float(m.get('yes_mid') or 0):.2f} gap={gap:+.2f} → {side}"
+            out.append(_ticket(m, side, token, book, cost, shares, thesis))
+            open_ids.add(cid)
+            if len(out) >= 3:
                 break
         return out

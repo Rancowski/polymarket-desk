@@ -75,9 +75,17 @@ class Desk:
         )
 
         markets = self.scout.fetch()
+        try:
+            from agent.kalshi import attach as kalshi_attach
+            kalshi_attach(markets)
+        except Exception as exc:
+            log.warning("Kalshi: %s", exc)
         arb_tickets = self.arb.scan(markets, bankroll)
         arb_n = 0
+        failed_events: set[str] = set()
         for ticket in arb_tickets:
+            if ticket.event_key in failed_events:
+                continue
             try:
                 result = self.exec.submit(ticket)
                 arb_n += 1
@@ -95,6 +103,7 @@ class Desk:
                 bankroll = max(0.0, bankroll - ticket.size_usd)
             except Exception as exc:
                 log.exception("Arb-ordre feilet")
+                failed_events.add(ticket.event_key)
                 self.store.log_decision(
                     condition_id=ticket.condition_id,
                     question=ticket.question,
