@@ -123,6 +123,8 @@ class Desk:
                 log.warning("Bok-feil %s: %s", m.get("question", "")[:40], exc)
                 m["book"] = {}
 
+        self.scout.enrich(batch)
+
         try:
             estimates = self.brain.estimate(batch)
             self.last_error = None

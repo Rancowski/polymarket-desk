@@ -162,3 +162,111 @@ class Scout:
             "bid_size": bid_sz,
             "ask_size": ask_sz,
         }
+
+    def enrich(self, markets: list[dict]) -> None:
+        """Gratis Polymarket + CoinGecko. Ingen X."""
+        crypto = any((m.get("category") or "") == "crypto" for m in markets)
+        spots = self._coingecko() if crypto else {}
+        seen_events: set[str] = set()
+        for m in markets:
+            if spots:
+                m["spot"] = spots
+            token = m.get("yes_token") or ""
+            if token:
+                m["history"] = self._history(token)
+            cid = m.get("condition_id")
+            if cid:
+                m["prints"] = self._prints(str(cid))
+            ev = m.get("event_key") or ""
+            if ev and ev not in seen_events:
+                seen_events.add(ev)
+                extra = self._event_markets(ev)
+                if extra:
+                    existing = {s.get("q") for s in (m.get("siblings") or [])}
+                    existing.add((m.get("question") or "")[:90])
+                    more = [s for s in extra if s.get("q") not in existing]
+                    m["siblings"] = (m.get("siblings") or []) + more[:8]
+
+    def _history(self, token_id: str) -> dict:
+        try:
+            r = requests.get(
+                f"{settings.clob_host}/prices-history",
+                params={"market": token_id, "interval": "1d", "fidelity": 60},
+                timeout=8,
+            )
+            r.raise_for_status()
+            hist = (r.json() or {}).get("history") or r.json()
+            if not isinstance(hist, list) or len(hist) < 2:
+                return {}
+            first = _num(hist[0].get("p") if isinstance(hist[0], dict) else hist[0])
+            last = _num(hist[-1].get("p") if isinstance(hist[-1], dict) else hist[-1])
+            return {"n": len(hist), "from": round(first, 3), "to": round(last, 3), "chg": round(last - first, 3)}
+        except Exception as exc:
+            log.debug("history %s: %s", token_id[:12], exc)
+            return {}
+
+    def _prints(self, condition_id: str) -> list[dict]:
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/trades",
+                params={"market": condition_id, "limit": 5},
+                timeout=8,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            rows = payload if isinstance(payload, list) else payload.get("trades") or []
+            out = []
+            for t in rows[:5]:
+                out.append(
+                    {
+                        "side": t.get("side") or t.get("outcome"),
+                        "px": round(_num(t.get("price")), 3),
+                        "sz": round(_num(t.get("size") or t.get("amount")), 1),
+                    }
+                )
+            return out
+        except Exception as exc:
+            log.debug("prints %s: %s", condition_id[:12], exc)
+            return []
+
+    def _event_markets(self, slug: str) -> list[dict]:
+        if not slug or " " in slug:
+            return []
+        try:
+            r = requests.get(
+                f"{settings.gamma_host}/events",
+                params={"slug": slug, "limit": 1},
+                timeout=8,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            rows = payload if isinstance(payload, list) else []
+            if not rows and isinstance(payload, dict):
+                rows = [payload]
+            ev = rows[0] if rows else None
+            if not ev:
+                return []
+            out = []
+            for raw in ev.get("markets") or []:
+                q = str(raw.get("question") or "")[:90]
+                prices = _parse_list(raw.get("outcomePrices"))
+                yes = _num(prices[0] if prices else 0)
+                out.append({"q": q, "yes": round(yes, 3)})
+            return out
+        except Exception:
+            return []
+
+    def _coingecko(self) -> dict:
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd"},
+                timeout=8,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return {k: v.get("usd") for k, v in data.items() if isinstance(v, dict)}
+        except Exception as exc:
+            log.debug("coingecko: %s", exc)
+            return {}
+

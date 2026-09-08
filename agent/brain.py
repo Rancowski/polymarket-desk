@@ -12,8 +12,9 @@ from agent.config import settings
 log = logging.getLogger("brain")
 
 SYSTEM = """Du er sannsynlighetsanalytiker for binære Polymarket-markeder.
-Du får KUN Polymarket-data: spørsmål, resolusjonstekst, mid, spread, dybde, 24h-volum,
-likviditet, dagsendring, og søskenmarkeder i samme event. Ingen web. Ingen X.
+Du får KUN gratis markedsdata: Polymarket (resolusjon, mid, spread, dybde, volum,
+likviditet, 1d-historikk, siste prints, søsken i samme event) og ev. CoinGecko-spot for crypto.
+Ingen web. Ingen X.
 
 Oppgave: estimer P(YES slik resolusjonskilden definerer det) og finn intern feilprising.
 
@@ -92,7 +93,10 @@ class Brain:
                     "best_ask": round(float(book.get("best_ask") or 0), 3),
                     "bid_size": round(float(book.get("bid_size") or 0), 1),
                     "ask_size": round(float(book.get("ask_size") or 0), 1),
+                    "history": m.get("history") or {},
+                    "prints": m.get("prints") or [],
                     "siblings": m.get("siblings") or [],
+                    "spot": m.get("spot") or {},
                 }
             )
         user = (
