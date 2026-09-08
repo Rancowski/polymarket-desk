@@ -65,7 +65,12 @@ def _state() -> dict[str, Any]:
     bankroll = float(mark["bankroll"]) if mark else settings.paper_bankroll_usd
     equity = float(mark["equity"]) if mark else bankroll + locked
     halt = settings.halt_file.exists()
-    st = desk.store.portfolio_stats(equity, bankroll, open_pos) if desk else {}
+    st: dict[str, Any] = {}
+    if desk:
+        try:
+            st = desk.store.portfolio_stats(equity, bankroll, open_pos)
+        except Exception as exc:
+            log.exception("portfolio_stats: %s", exc)
     spent = float((st or {}).get("xai_total") or 0)
     prepaid = float((st or {}).get("xai_prepaid") or 0)
     remaining = max(0.0, prepaid - spent) if prepaid > 0 else _xai_remaining(spent)

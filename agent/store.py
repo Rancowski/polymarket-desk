@@ -363,14 +363,20 @@ class Store:
         week_base = _at(24 * 7)
         day = equity - day_base
         week = equity - week_base
-        peak = start
+        peak = start if start > 0 else 0.0
         max_dd = 0.0
+        max_dd_usd = 0.0
         for row in hist:
             eq = float(row["equity"])
+            if eq < 1:
+                continue
             peak = max(peak, eq)
-            if peak:
-                max_dd = min(max_dd, (eq - peak) / peak)
+            dd_usd = eq - peak
+            if peak and dd_usd < max_dd_usd:
+                max_dd_usd = dd_usd
+                max_dd = dd_usd / peak
         open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
+        xai_total = self.api_spend(hours=None)
         return {
             "start_equity": round(start, 2),
             "total": round(total, 2),
@@ -380,14 +386,15 @@ class Store:
             "week": round(week, 2),
             "week_pct": round(week / week_base, 4) if week_base else 0.0,
             "max_dd_pct": round(max_dd, 4),
+            "max_dd_usd": round(max_dd_usd, 2),
             "trades": self.fill_count(),
             "open_cost": round(open_cost, 2),
             "cash": round(bankroll, 2),
-            "xai_total": round(self.api_spend(hours=None), 4),
+            "xai_total": round(xai_total, 4),
             "xai_day": round(self.api_spend(hours=24), 4),
             "xai_prepaid": round(self.xai_prepaid_usd(), 2),
             "deposited": round(start, 2),
-            "after_xai": round(total - self.api_spend(hours=None), 2),
+            "after_xai": round(total - xai_total, 2),
             "top_rejects": self.top_rejects(8),
         }
 
