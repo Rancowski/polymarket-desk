@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#080c0b" />
+  <title>Fjord · Prediksjonsdesk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #080c0b; --surface: #121918; --raised: #18211f;
+      --fg: #e8eeea; --muted: #8b9c95; --subtle: #5e6e68;
+      --border: color-mix(in oklab, #e8eeea 12%, transparent);
+      --gain: #3d9b78; --loss: #c45c4a; --warn: #c4a35a; --primary: #d7e0dc;
+    }
+    * { box-sizing: border-box; border-color: var(--border); }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg);
+      font-family: "IBM Plex Sans", system-ui, sans-serif; }
+    button { font: inherit; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .wrap { max-width: 72rem; margin: 0 auto; padding: 0 1rem 6rem; }
+    header { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(12px);
+      background: color-mix(in oklab, var(--bg) 92%, transparent); border-bottom: 1px solid var(--border); }
+    header .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: .75rem; padding: .85rem 0; }
+    .brand { display: flex; align-items: center; gap: .75rem; min-width: 0; }
+    .mark { width: 2rem; height: 2rem; border-radius: .6rem; background: var(--raised);
+      border: 1px solid var(--border); display: grid; place-items: center; font-weight: 600; }
+    .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: .7rem; letter-spacing: .16em;
+      text-transform: uppercase; color: var(--muted); margin: 0; }
+    h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
+    .pills { display: flex; flex-wrap: wrap; gap: .4rem; }
+    .pill { font-family: "IBM Plex Mono", monospace; font-size: .72rem; border: 1px solid var(--border);
+      border-radius: 999px; padding: .4rem .75rem; display: inline-flex; align-items: center; gap: .4rem; }
+    .dot { width: .4rem; height: .4rem; border-radius: 99px; background: var(--subtle); }
+    .on .dot { background: var(--gain); } .off .dot { background: var(--loss); }
+    .on { color: var(--gain); border-color: color-mix(in oklab, var(--gain) 40%, transparent); }
+    .off { color: var(--loss); border-color: color-mix(in oklab, var(--loss) 40%, transparent); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .5rem; margin-top: 1rem; }
+    @media (min-width: 700px) { .grid { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 1rem; padding: .9rem 1rem; }
+    .stat span { display: block; color: var(--muted); font-size: .75rem; }
+    .stat strong { display: block; margin-top: .2rem; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; margin-top: 1rem; }
+    @media (min-width: 700px) { .actions { display: flex; flex-wrap: wrap; } }
+    .btn { min-height: 2.75rem; border-radius: .7rem; border: 1px solid var(--border);
+      background: var(--raised); color: var(--fg); padding: 0 1rem; font-weight: 500; }
+    .btn.primary { background: var(--primary); color: var(--bg); border-color: transparent; }
+    .btn.danger { background: color-mix(in oklab, var(--loss) 18%, var(--surface)); color: var(--loss);
+      border-color: color-mix(in oklab, var(--loss) 35%, transparent); }
+    .tabs { display: flex; gap: .25rem; margin-top: 1.25rem; border-bottom: 1px solid var(--border); }
+    .tabs button { background: none; border: 0; color: var(--muted); padding: .7rem .9rem; }
+    .tabs button.active { color: var(--fg); box-shadow: inset 0 -2px 0 var(--primary); }
+    .panel { margin-top: 1rem; }
+    .row-item { background: var(--surface); border: 1px solid var(--border); border-radius: .85rem;
+      padding: .85rem 1rem; margin-bottom: .5rem; }
+    .q { font-size: .92rem; margin: 0 0 .35rem; }
+    .meta { font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--muted); }
+    .gain { color: var(--gain); } .loss { color: var(--loss); }
+    .empty { color: var(--muted); padding: 1.5rem 0; }
+    .err { margin-top: .75rem; padding: .75rem 1rem; border-radius: .75rem;
+      border: 1px solid color-mix(in oklab, var(--loss) 30%, transparent);
+      background: color-mix(in oklab, var(--loss) 10%, transparent); color: var(--loss); font-size: .9rem; }
+    svg.spark { width: 100%; height: 88px; margin-top: 1rem; }
+    .note { color: var(--subtle); font-size: .78rem; margin-top: .75rem; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="row">
+        <div class="brand">
+          <div class="mark">F</div>
+          <div>
+            <p class="eyebrow">Prediksjonsdesk</p>
+            <h1>Fjord</h1>
+          </div>
+        </div>
+        <div class="pills" id="pills"></div>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <div class="grid" id="stats"></div>
+    <div class="actions">
+      <button class="btn primary" id="btnOn" type="button">Slå på</button>
+      <button class="btn danger" id="btnOff" type="button">Slå av</button>
+      <button class="btn" id="btnOnce" type="button">Kjør én syklus</button>
+    </div>
+    <div id="err"></div>
+    <svg class="spark" id="spark" viewBox="0 0 320 88" preserveAspectRatio="none"></svg>
+    <p class="note" id="cycle"></p>
+    <div class="tabs">
+      <button class="active" data-tab="pos" type="button">Posisjoner</button>
+      <button data-tab="log" type="button">Logg</button>
+      <button data-tab="fill" type="button">Fills</button>
+    </div>
+    <div class="panel" id="panel"></div>
+  </main>
+  <script>
+    let tab = "pos";
+    let state = null;
+    const $ = (id) => document.getElementById(id);
+    const usd = (n) => (Number(n) || 0).toLocaleString("nb-NO", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+    const clock = (iso) => {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("nb-NO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    };
+    async function api(path, method) {
+      const r = await fetch(path, { method: method || "GET" });
+      return r.json();
+    }
+    function pills(s) {
+      const live = s.dry_run ? "Paper" : "Live";
+      const on = !s.halted;
+      $("pills").innerHTML =
+        `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? "Autopilot på" : "Stoppet"}</span>` +
+        `<span class="pill">${live}</span>` +
+        (s.busy ? `<span class="pill">Kjører syklus…</span>` : "");
+    }
+    function stats(s) {
+      $("stats").innerHTML = [
+        ["Egenkapital", usd(s.equity)],
+        ["Kontanter", usd(s.bankroll)],
+        ["Åpne", `${s.open} / ${s.max_open}`],
+        ["Kant", `${(s.min_net_edge * 100).toFixed(0)}% net`],
+      ].map(([l, v]) => `<div class="stat"><span>${l}</span><strong>${v}</strong></div>`).join("");
+    }
+    function spark(hist) {
+      const el = $("spark");
+      if (!hist || hist.length < 2) { el.innerHTML = ""; return; }
+      const vals = hist.map((h) => Number(h.equity) || 0);
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const span = max - min || 1;
+      const pts = vals.map((v, i) => {
+        const x = (i / (vals.length - 1)) * 320;
+        const y = 80 - ((v - min) / span) * 68;
+        return `${x},${y}`;
+      }).join(" ");
+      el.innerHTML = `<polyline fill="none" stroke="#3d9b78" stroke-width="2" points="${pts}" />`;
+    }
+    function renderPanel(s) {
+      const el = $("panel");
+      if (tab === "pos") {
+        if (!s.positions.length) { el.innerHTML = `<p class="empty">Ingen åpne posisjoner.</p>`; return; }
+        el.innerHTML = s.positions.map((p) =>
+          `<div class="row-item"><p class="q">${p.question || ""}</p>
+           <div class="meta">${p.side} · ${Number(p.shares).toFixed(2)} andeler · snitt ${usd(p.avg_cost)} · ${p.category || ""}</div></div>`
+        ).join("");
+        return;
+      }
+      if (tab === "fill") {
+        if (!s.fills.length) { el.innerHTML = `<p class="empty">Ingen fills ennå.</p>`; return; }
+        el.innerHTML = s.fills.map((f) =>
+          `<div class="row-item"><p class="q">${f.side} ${usd(f.cost)}</p>
+           <div class="meta">${clock(f.ts)} · ${Number(f.size).toFixed(2)} @ ${Number(f.price).toFixed(3)} ${f.dry_run ? "· paper" : "· live"}</div></div>`
+        ).join("");
+        return;
+      }
+      if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen beslutninger ennå.</p>`; return; }
+      el.innerHTML = s.decisions.map((d) => {
+        const tone = (d.action === "live" || d.action === "paper") ? "gain" : "";
+        return `<div class="row-item"><p class="q">${d.question || ""}</p>
+          <div class="meta ${tone}">${clock(d.ts)} · ${d.action || "—"} · ${d.reason || ""}</div></div>`;
+      }).join("");
+    }
+    function paint(s) {
+      state = s;
+      pills(s);
+      stats(s);
+      spark(s.equity_history);
+      const c = s.last_cycle;
+      $("cycle").textContent = c
+        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · tatt ${c.accepted || 0} · avvist ${c.rejected || 0}`
+        : "Venter på første syklus.";
+      $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
+      $("btnOn").disabled = !s.halted;
+      $("btnOff").disabled = s.halted;
+      renderPanel(s);
+    }
+    async function refresh() {
+      try { paint(await api("/api/state")); }
+      catch (e) { $("err").innerHTML = `<div class="err">Kan ikke nå desken. Er main.py run i gang?</div>`; }
+    }
+    $("btnOn").onclick = async () => { await api("/api/on", "POST"); refresh(); };
+    $("btnOff").onclick = async () => { await api("/api/off", "POST"); refresh(); };
+    $("btnOnce").onclick = async () => {
+      $("btnOnce").disabled = true;
+      $("btnOnce").textContent = "Kjører…";
+      try { await api("/api/once", "POST"); }
+      finally { $("btnOnce").disabled = false; $("btnOnce").textContent = "Kjør én syklus"; refresh(); }
+    };
+    document.querySelectorAll(".tabs button").forEach((b) => {
+      b.onclick = () => {
+        tab = b.dataset.tab;
+        document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
+        if (state) renderPanel(state);
+      };
+    });
+    refresh();
+    setInterval(refresh, 4000);
+  </script>
+</body>
+</html>

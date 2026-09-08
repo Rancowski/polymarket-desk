@@ -5,6 +5,7 @@ import logging
 import sys
 
 from agent.config import settings
+from agent.dashboard import start_in_thread
 from agent.loop import Desk
 
 
@@ -26,11 +27,14 @@ def main() -> None:
         pos = desk.store.positions("open")
         print(f"DRY_RUN={settings.dry_run} open={len(pos)} halt={settings.halt_file.exists()}")
         for row in pos:
-            print(f"- {row['side']} {row['question'][:70]} shares={row['shares']} avg={row['avg_cost']}")
+            print(
+                f"- {row['side']} {row['question'][:70]} shares={row['shares']} avg={row['avg_cost']}"
+            )
         return
     if args.cmd == "once":
         desk.cycle()
         return
+    start_in_thread(desk)
     desk.run_forever()
 
 

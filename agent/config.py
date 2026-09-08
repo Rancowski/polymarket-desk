@@ -50,6 +50,7 @@ class Settings:
     loop_seconds: int = _i("LOOP_SECONDS", 900)
     estimate_batch: int = _i("ESTIMATE_BATCH", 12)
     paper_bankroll_usd: float = _f("PAPER_BANKROLL_USD", 1000)
+    dashboard_port: int = _i("DASHBOARD_PORT", 8788)
     data_dir: Path = ROOT / "data"
     halt_file: Path = ROOT / "HALT"
 
