@@ -10,7 +10,7 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import Risk, is_sports
+from agent.risk import MAX_SPORTS, Risk, is_primary, is_sports
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -140,16 +140,34 @@ class Desk:
                 mtm = 0.0
         return mtm - cost
 
-    def _trim_reasons(self, open_pos: list) -> dict[tuple, str]:
-        """Only flatten overflow above 12. Do not cut extra sports."""
+    def _trim_reasons(self, open_pos: list, equity: float = 0.0) -> dict[tuple, str]:
         force: dict[tuple, str] = {}
+        deposited = 0.0
+        try:
+            deposited = float(self.store.deposited_usd(0.0) or 0)
+        except (TypeError, ValueError):
+            deposited = 0.0
+        if deposited >= 1 and equity > 0 and equity <= 0.85 * deposited:
+            for p in open_pos:
+                if is_sports(p):
+                    key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
+                    force[key] = "equity ≤85% — flatten sports"
+        sports = [p for p in open_pos if is_sports(p)]
+        if len(sports) > MAX_SPORTS:
+            extra = sorted(sports, key=self._upnl)[: len(sports) - MAX_SPORTS]
+            for p in extra:
+                key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
+                force[key] = "maks 2 sports — trim"
+        remaining = [
+            p for p in open_pos
+            if (str(p.get("condition_id")), str(p.get("side") or "YES")) not in force
+        ]
         cap = settings.max_open_positions
-        if len(open_pos) <= cap:
-            return force
-        ranked = sorted(open_pos, key=self._upnl)  # worst first
-        for p in ranked[: len(open_pos) - cap]:
-            key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
-            force[key] = "maks 12 — trim dårligste"
+        if len(remaining) > cap:
+            ranked = sorted(remaining, key=self._upnl)
+            for p in ranked[: len(remaining) - cap]:
+                key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
+                force[key] = "maks 6 — trim dårligste"
         return force
 
     def _market_stubs(self, open_pos: list) -> dict:
@@ -177,11 +195,11 @@ class Desk:
             }
         return by_id
 
-    def _run_exits(self, open_pos: list, estimates: dict, by_id: dict) -> tuple[int, list]:
+    def _run_exits(self, open_pos: list, estimates: dict, by_id: dict, equity: float = 0.0) -> tuple[int, list]:
         """Flatten on live bid. Always log hold | selling | sold | reject. Independent of Grok."""
         sold = 0
         log_rows: list[dict] = []
-        force = self._trim_reasons(open_pos)
+        force = self._trim_reasons(open_pos, equity=equity)
         for pos in list(open_pos):
             q = (pos.get("question") or "")[:80]
             cid = pos.get("condition_id")
@@ -363,7 +381,7 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi (åpne): %s", exc)
         self._log_kalshi(kalshi_log)
-        exits, exit_log = self._run_exits(open_pos, {}, by_open)
+        exits, exit_log = self._run_exits(open_pos, {}, by_open, equity=equity)
         open_pos = self.store.positions("open")
         if halt:
             log.warning("Stoppet: %s", halt)
@@ -407,7 +425,7 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi: %s", exc)
         kalshi_n = len(kalshi_log)
-        arb_tickets = self.arb.scan(markets, bankroll)
+        arb_tickets = self.arb.scan(markets, bankroll, equity=equity)
         arb_n = 0
         failed_events: set[str] = set()
         pending_hedge = None
@@ -470,19 +488,13 @@ class Desk:
                 by_id[cid]["kalshi"] = stub["kalshi"]
         for cid, stub in self._market_stubs(open_pos).items():
             by_id.setdefault(cid, stub)
-        ranked = [m for m in markets if not m.get("_open_only")]
+        ranked = [m for m in markets if not m.get("_open_only") and is_primary(m)]
 
         def _prio(m: dict) -> tuple:
             ks = m.get("kalshi") or {}
             gap = abs(float(ks.get("gap") or 0))
-            mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
-            yes = float(m.get("yes_mid") or 0)
-            no = float(m.get("no_mid") or (1 - yes if yes else 0))
-            comp = yes + no if yes else float(m.get("complement") or 0)
-            resid = max(0.0, 0.982 - comp) if 0 < comp < 1.2 else 0.0
-            locked = 0 if mid >= 0.88 or mid <= 0.12 else 1
             vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
-            return (-gap, -resid, locked, -vol)
+            return (-vol, -gap)
 
         ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
@@ -503,28 +515,9 @@ class Desk:
             _take(m)
         if remaining >= 0.15:
             for m in ranked:
-                gap = abs(float((m.get("kalshi") or {}).get("gap") or 0))
-                if gap >= 0.04:
-                    _take(m)
-            for m in ranked:
-                if is_sports(m):
-                    continue
-                cat = str(m.get("category") or "")
-                if cat not in {"economics", "finance", "crypto", "politics", "geopolitics"}:
-                    continue
-                ks = m.get("kalshi") or {}
-                gap = abs(float(ks.get("gap") or 0))
-                chg = abs(float(m.get("price_change_1d") or 0))
-                spread = float((m.get("book") or {}).get("spread") or 0)
-                if gap >= 0.02 or chg >= 0.03 or spread >= 0.03:
-                    _take(m)
-            if remaining >= 0.50:
-                for m in ranked:
-                    if is_sports(m):
-                        continue
-                    _take(m)
-                    if len(batch) >= max(settings.estimate_batch, len(extras)):
-                        break
+                _take(m)
+                if len(batch) >= max(settings.estimate_batch, len(extras)):
+                    break
         batch = batch[: max(settings.estimate_batch, len(extras))]
         if not batch:
             log.info("Ingen markeder passerte filter")
@@ -587,7 +580,7 @@ class Desk:
                 est = estimates.get(cid) or {}
                 p = est.get("p_yes")
                 gap = abs(float(ks.get("gap") or 0))
-                w_k = 0.70 if gap >= 0.04 else 0.55
+                w_k = 0.70 if gap >= 0.05 else 0.55
                 blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
                 estimates[cid] = {
                     **est,
@@ -624,7 +617,7 @@ class Desk:
 
         open_pos = self.store.positions("open")
         if estimates:
-            more, log2 = self._run_exits(open_pos, estimates, by_id)
+            more, log2 = self._run_exits(open_pos, estimates, by_id, equity=equity)
             exits += more
             exit_log.extend(log2)
             open_pos = self.store.positions("open")

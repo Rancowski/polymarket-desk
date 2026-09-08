@@ -177,7 +177,7 @@
         `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? mode : "Stoppet"}</span>` +
         (s.busy ? `<span class="pill">Syklus…</span>` : `<span class="pill">neste ${countdown(s)}</span>`) +
         (rel ? `<span class="pill">${rel}</span>` : "") +
-        `<span class="pill">maks ${s.max_open || 12} · ${Math.round((s.loop_seconds || 300) / 60)} min</span>`;
+        `<span class="pill">maks ${s.max_open || 6} · ${Math.round((s.loop_seconds || 300) / 60)} min</span>`;
     }
     function stats(s) {
       const st = s.stats || {};
@@ -248,13 +248,14 @@
       }
       if (tab === "rules") {
         el.innerHTML = [
-          ["Syklus", "Hvert 5. minutt. Exits først, deretter tape/Kalshi, Grok maks hver 3. runde. FAK. Ingen X/web."],
-          ["Kjøp-rekkefølge", "1) YES+NO-ask < 0,982. 2) Låst/feilpris. 3) Kalshi-gap ≥ 4 ¢. 4) Søsken-stige. 5) Grok kun ved netto kant etter gebyr."],
-          ["12 seter", "Maks 12 åpne. Ved 12: kun exits og hedge (YES+NO samme marked). Ett event = én tese, hedge teller to linjer."],
-          ["Størrelse", "Sports/longshot 3–6 % av innskutt (~7–13 USD). Fed/Kalshi/complement 6–10 % (~13–22). Hard tak 12 % på ett navn."],
-          ["Sports", "Flere av 12 er lov, men små. Ny sports 0,22–0,78. Ikke 4. sports hvis tre allerede taper. Stopp −12 % / bud ≤ 0,03 / mark ≤ 0,05. +20 % så trail 8 % fra topp. Tom bok flatten."],
-          ["Andre exits", "Stopp −18 %. Ta gevinst bud ≥ 0,93 eller +25 %. Kalshi ≥ 6 ¢ mot kost, eller fersk p_hat ≥ 3 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes."],
-          ["Kalshi", "Kun navngitte serier. 25 = 25 bps, aldri 4,25 %. 70/30 blend ved gap ≥ 4 ¢."],
+          ["Syklus", "Hvert 5. minutt. Exits + Kalshi på åpne + tape først. Grok maks hver 3. runde. FAK. Ingen X/web. Tom bok er lov — hold kontanter."],
+          ["Kjøp", "Bare hvis én er sann etter gebyr, på ask, med dybde: 1) YES+NO-ask < 0,982. 2) Låst/feilpris med tid igjen (ikke død 0,01-sports). 3) Kalshi-bekreftelse ≥ 5 ¢ på kartlagt par og PM-ask 0,28–0,80. 4) Grok-kant ≥ MIN_NET_EDGE på kjerne (Fed/krypto/politikk)."],
+          ["6 seter", "Maks 6 åpne. Ved 6: kun exits og hedge (YES+NO samme marked). Ett event = én tese. Inntil 50 % av innskutt i markedet."],
+          ["Størrelse", "Sports/longshot 3 % av innskutt (~7 USD). Kjerne (Fed/krypto/politikk) 6–8 % (~13–18). Hard tak 10 % på ett navn."],
+          ["Sports", "Maks 2. Ingen nye sports-kjøp i denne profilen — kun exits. Stopp −12 % / bud ≤ 0,04 / mark ≤ 0,05. +18 % så trail 8 % fra topp. Død/umatchet og verdi < 0,25 USD → closed_dust. Aldri Fed."],
+          ["Kjerne-exits", "Stopp −15 %. Ta gevinst bud ≥ 0,92 eller +22 %. Kalshi ≥ 6 ¢ mot kost, eller fersk p_hat ≥ 4 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes."],
+          ["Kalshi", "Kun bekreftelse/veto. Navngitte serier, samme hendelse. 25 = 25 bps. Ingen par → ignorer. Ikke locked arb. Ingen Kalshi-konto."],
+          ["Sikring", "Dag realisert ≤ −6 % av innskutt → ingen nye kjøp før neste UTC-dag (exits kjører). Egenkapital ≤ 85 % av innskutt → halt kjøp, flatten sports."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;
       }

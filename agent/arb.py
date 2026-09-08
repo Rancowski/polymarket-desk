@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent.config import settings
-from agent.risk import Ticket, _row_upnl, is_sports
+from agent.risk import CORE_PCT, DEPLOYED_MAX, HARD_NAME_PCT, Ticket, _row_upnl, is_primary, is_sports
 
 log = logging.getLogger("arb")
 
@@ -75,8 +75,22 @@ class Arb:
         market[key] = data
         return data
 
-    def scan(self, markets: list[dict], bankroll: float) -> list[Ticket]:
+    def _size_base(self, bankroll: float) -> float:
+        try:
+            deposited = float(self.store.deposited_usd(bankroll) or 0)
+        except Exception:
+            deposited = 0.0
+        return deposited if deposited >= 1 else bankroll
+
+    def scan(self, markets: list[dict], bankroll: float, equity: float = 0.0) -> list[Ticket]:
+        from agent.risk import Risk
+
         open_pos = self.store.positions("open")
+        deposited = self._size_base(bankroll)
+        block = Risk(self.store).buys_blocked(equity or deposited, deposited)
+        if block:
+            log.info("Arb: hopper kjøp (%s)", block)
+            return []
         open_ids = {p["condition_id"] for p in open_pos}
         sports_pos = [p for p in open_pos if is_sports(p)]
         sports_n = len(sports_pos)
@@ -89,21 +103,14 @@ class Arb:
             tickets.extend(self._locked(markets, bankroll, open_ids | taken, sports_n, sports_losers))
             taken = {t.condition_id for t in tickets}
             tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken, sports_n, sports_losers))
-            taken = {t.condition_id for t in tickets}
-            tickets.extend(self._event_sets(markets, bankroll, open_ids | taken, sports_n, sports_losers))
-        log.info("Arb: %s ben (complement/låst/kalshi/stige)", len(tickets))
+        log.info("Arb: %s ben (complement/låst/kalshi-bekreftelse)", len(tickets))
         return tickets
 
     def _skip_sports(self, market: dict, sports_n: int, sports_losers: int, tickets: list[Ticket]) -> bool:
-        if not is_sports(market):
-            return False
-        n = sports_n + sum(
-            1
-            for t in tickets
-            if is_sports({"question": t.question, "category": t.category, "event_key": t.event_key})
-        )
-        if n >= 3 and sports_losers >= 3:
+        # Sports is optional spice: no new sports buys. Existing rows get exits only.
+        if is_sports(market):
             return True
+        _ = (sports_n, sports_losers, tickets)
         return False
 
     def _complements(
@@ -116,22 +123,23 @@ class Arb:
         at_cap: bool = False,
     ) -> list[Ticket]:
         out: list[Ticket] = []
-        cap = settings.max_position_pct * bankroll
+        size_base = self._size_base(bankroll)
+        open_cost = sum(float(p["shares"]) * float(p["avg_cost"]) for p in self.store.positions("open"))
+        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
+        powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
                 continue
             if at_cap and cid not in open_ids:
                 continue
+            if len(self.store.positions("open")) + len(out) + 2 > settings.max_open_positions:
+                break
             if self._skip_sports(m, sports_n, sports_losers, out):
                 continue
-            if is_sports(m):
-                ym = float(m.get("yes_mid") or 0)
-                if ym <= 0.22 or ym >= 0.78:
-                    continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
-            if yes_m <= 0.02 or no_m <= 0.02:
+            if yes_m <= 0.02 or no_m <= 0.02 or yes_m >= 0.94 or no_m >= 0.94:
                 continue
             if (yes_m + no_m) > 0.995:
                 continue
@@ -143,7 +151,9 @@ class Arb:
                 continue
             ysz = float(yb.get("ask_size") or 0)
             nsz = float(nb.get("ask_size") or 0)
-            budget = min(cap, bankroll * 0.08)
+            if ysz < 5 or nsz < 5:
+                continue
+            budget = min(cap, powder, CORE_PCT[1] * size_base)
             shares = budget / max(0.02, yask + nask)
             if ysz:
                 shares = min(shares, ysz / max(2, settings.min_book_multiple))
@@ -155,7 +165,7 @@ class Arb:
             out.append(_ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis))
             out.append(_ticket(m, "NO", m["no_token"], nb, nask, shares, thesis))
             open_ids.add(cid)
-            if len(out) >= 6:
+            if len(out) >= 4:
                 break
         return out
 
@@ -203,17 +213,21 @@ class Arb:
     def _locked(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_losers: int = 0) -> list[Ticket]:
         now = datetime.now(timezone.utc)
         out: list[Ticket] = []
-        cap = settings.max_position_pct * bankroll
+        size_base = self._size_base(bankroll)
+        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
                 continue
             if self._skip_sports(m, sports_n, sports_losers, out):
                 continue
-            if is_sports(m):
+            if is_sports(m) or not is_primary(m):
                 continue
             end = _parse_end(m.get("end_date"))
-            if not end or (now - end).total_seconds() < 90 * 60:
+            if not end:
+                continue
+            elapsed = (now - end).total_seconds()
+            if elapsed < 90 * 60 or elapsed > 72 * 3600:
                 continue
             yes = float(m.get("yes_mid") or m.get("mid") or 0.5)
             if LOCKED_NO < yes < LOCKED_YES:
@@ -222,17 +236,14 @@ class Arb:
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")
             cost = float(book.get("best_ask") or (yes if side == "YES" else max(0.01, 1.0 - yes)))
-            if cost <= 0.01 or cost >= 0.99:
+            if cost <= 0.05 or cost >= 0.98:
                 continue
             if side == "YES" and cost < LOCKED_YES - 0.04:
                 continue
-            if side == "NO" and cost < (1 - LOCKED_NO) - 0.04:
-                # buying NO should be cheap if YES is ~0.10 → NO ask ~0.90
-                pass
-            if side == "YES" and cost > 0.98:
-                continue
             ask_sz = float(book.get("ask_size") or 0)
-            usd = min(cap, bankroll * 0.08)
+            if ask_sz < 5:
+                continue
+            usd = min(cap, CORE_PCT[1] * size_base)
             shares = usd / cost
             if ask_sz:
                 shares = min(shares, ask_sz / max(2, settings.min_book_multiple))
@@ -247,15 +258,10 @@ class Arb:
         return out
 
     def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_losers: int = 0) -> list[Ticket]:
-        """Poly vs Kalshi ≥ 4 ¢: kjøp den billige siden på Polymarket (signal, ikke locked arb)."""
+        """Kalshi confirmation ≥ 5 ¢ on a mapped pair. Not locked arb."""
         out: list[Ticket] = []
-        deposited = 0.0
-        try:
-            deposited = float(self.store.deposited_usd(bankroll) or 0)
-        except Exception:
-            deposited = 0.0
-        size_base = deposited if deposited >= 1 else bankroll
-        cap = min(0.12 * size_base, settings.max_position_pct * size_base)
+        size_base = self._size_base(bankroll)
+        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
         for m in markets:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
@@ -263,24 +269,28 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_n, sports_losers, out):
                 continue
+            if not is_primary(m):
+                continue
             gap = float(ks.get("gap") or 0)
-            if abs(gap) < 0.04:
+            if abs(gap) < 0.05:
                 continue
             # gap = poly_yes - kalshi_yes. Poly dyr YES → kjøp NO.
             side = "NO" if gap > 0 else "YES"
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")
             cost = float(book.get("best_ask") or 0)
-            if cost < 0.22 or cost > 0.88:
+            if cost < 0.28 or cost > 0.80:
                 continue
             ask_sz = float(book.get("ask_size") or 0)
-            usd = min(cap, max(0.06 * size_base, min(0.10 * size_base, cap)))
+            if ask_sz < 5:
+                continue
+            usd = min(cap, CORE_PCT[1] * size_base)
             shares = usd / cost if cost else 0
             if ask_sz:
                 shares = min(shares, ask_sz / max(2, settings.min_book_multiple))
             if shares * cost < 8:
                 continue
-            thesis = f"Kalshi {ks.get('yes')} vs Poly {float(m.get('yes_mid') or 0):.2f} gap={gap:+.2f} → {side}"
+            thesis = f"Kalshi-bekreftelse {ks.get('yes')} vs Poly {float(m.get('yes_mid') or 0):.2f} gap={gap:+.2f} → {side}"
             out.append(_ticket(m, side, token, book, cost, shares, thesis))
             open_ids.add(cid)
             if len(out) >= 3:
