@@ -132,6 +132,14 @@ class Store:
             cur = self.conn.execute("SELECT * FROM positions WHERE status=?", (status,))
             return [dict(r) for r in cur.fetchall()]
 
+    def close_position(self, condition_id: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=?",
+                (utc_now(), condition_id),
+            )
+            self.conn.commit()
+
     def add_fill(self, **row: Any) -> None:
         with self._lock:
             self.conn.execute(

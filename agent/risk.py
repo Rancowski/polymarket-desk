@@ -15,7 +15,7 @@ class Ticket:
     question: str
     category: str
     event_key: str
-    side: str
+    side: str  # YES or NO
     token_id: str
     mid: float
     best_bid: float
@@ -36,8 +36,10 @@ def taker_fee_rate(category: str) -> float:
 
 
 def expected_taker_fee_frac(price: float, category: str) -> float:
+    """Fee as fraction of notional ≈ feeRate * (1-p) for buying at p."""
     p = min(0.99, max(0.01, price))
     rate = taker_fee_rate(category)
+    # fee per share = rate * p * (1-p); notional per share = p
     return rate * (1.0 - p) if p > 0 else rate
 
 
@@ -74,12 +76,12 @@ class Risk:
 
         if estimate.get("skip"):
             return None, estimate.get("skip_reason") or "brain skip"
-        conf = estimate.get("confidence", "low")
-        if conf == "low":
-            return None, "confidence=low"
-
+        conf = str(estimate.get("confidence") or "medium").lower()
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
+        disagreement = abs(p_yes - mid)
+        if conf == "low" and disagreement < 0.08:
+            return None, "confidence=low uten stor uenighet"
         spread = float(book.get("spread") or 0)
         if spread > settings.max_spread:
             return None, f"spread {spread:.3f} > max"
@@ -100,10 +102,13 @@ class Risk:
             token = market["no_token"]
             p_hat = 1.0 - p_yes
             edge_gross = no_edge
-            best_ask = max(0.01, 1.0 - float(book.get("best_bid") or mid))
-            best_bid = max(0.01, 1.0 - float(book.get("best_ask") or mid))
+            nb = market.get("no_book") or {}
+            best_ask = float(nb.get("best_ask") or max(0.01, 1.0 - float(book.get("best_bid") or mid)))
+            best_bid = float(nb.get("best_bid") or max(0.01, 1.0 - float(book.get("best_ask") or mid)))
             cost = best_ask
-            book_sz = float(book.get("bid_size") or 0)
+            book_sz = float(nb.get("ask_size") or book.get("bid_size") or 0)
+            if nb.get("spread") is not None:
+                spread = float(nb["spread"])
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
         edge_net = edge_gross - (spread / 2.0) - fee_frac - settings.model_haircut
@@ -149,7 +154,11 @@ class Risk:
         if weekly < -settings.weekly_loss_halt_pct * bankroll:
             return None, "ukentlig tap-stopp"
 
-        limit = round(min(cost, max(0.01, mid + 0.01 if side == "YES" else cost)), 2)
+        # Kryss spread når kanten er reell, ellers nær mid
+        if edge_net >= 0.05:
+            limit = round(min(0.99, max(0.01, cost)), 2)
+        else:
+            limit = round(min(cost, max(0.01, mid + 0.01)), 2)
         limit = min(0.99, max(0.01, limit))
 
         ticket = Ticket(
@@ -173,3 +182,53 @@ class Risk:
             shares=round(shares, 2),
         )
         return ticket, "ok"
+
+    def evaluate_exit(
+        self,
+        pos: dict,
+        book: dict,
+        estimate: dict | None,
+        bankroll: float,
+    ) -> tuple[dict | None, str]:
+        """Selg når edge er borte, p̂ har falt gjennom kost, eller uRealisert ≤ −25 %."""
+        shares = float(pos.get("shares") or 0)
+        avg = float(pos.get("avg_cost") or 0)
+        if shares <= 0 or avg <= 0:
+            return None, "tom posisjon"
+        mid = float(book.get("mid") or avg)
+        best_bid = float(book.get("best_bid") or mid)
+        if best_bid <= 0:
+            return None, "ingen bud"
+        pnl_pct = (best_bid - avg) / avg
+        if pnl_pct <= -0.25:
+            return self._exit_ticket(pos, book, shares, best_bid, f"stopp-tap {pnl_pct:.1%}"), "ok"
+
+        if not estimate or estimate.get("skip"):
+            return None, "ingen fersk estimat"
+
+        p_yes = float(estimate["p_yes"])
+        side = str(pos.get("side") or "YES").upper()
+        p_hat = p_yes if side == "YES" else 1.0 - p_yes
+        edge = p_hat - avg
+        if p_hat < avg:
+            return self._exit_ticket(pos, book, shares, best_bid, f"p_hat {p_hat:.2f} < kost {avg:.2f}"), "ok"
+        if edge < settings.min_net_edge / 2:
+            return self._exit_ticket(pos, book, shares, best_bid, f"edge borte {edge:.3f}"), "ok"
+        return None, "hold"
+
+    def _exit_ticket(self, pos: dict, book: dict, shares: float, price: float, reason: str) -> dict:
+        px = round(min(0.99, max(0.01, price)), 2)
+        return {
+            "condition_id": pos["condition_id"],
+            "question": pos.get("question"),
+            "category": pos.get("category"),
+            "event_key": pos.get("event_key"),
+            "side": pos.get("side"),
+            "token_id": pos.get("token_id"),
+            "shares": round(shares, 2),
+            "limit_price": px,
+            "size_usd": round(shares * px, 2),
+            "reason": reason,
+            "action": "sell",
+        }
+

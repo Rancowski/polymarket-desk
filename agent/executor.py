@@ -41,6 +41,7 @@ def _parse_balance(raw: Any) -> float:
     wei = _as_float(candidate)
     if wei <= 0:
         return 0.0
+    # 221.52 pUSD kommer som 221520000.
     return wei / 1e6 if wei >= 1000 else wei
 
 
@@ -213,3 +214,61 @@ class Executor:
             status="open",
         )
         return {"status": "live", "response": signed, "ticket": payload}
+
+    def sell(self, order: dict) -> dict:
+        payload = {**order}
+        if settings.dry_run:
+            log.info(
+                "PAPER SELL %s %s @ %s size=%s (%s)",
+                order.get("side"),
+                str(order.get("question") or "")[:60],
+                order.get("limit_price"),
+                order.get("shares"),
+                order.get("reason"),
+            )
+            self.store.add_fill(
+                condition_id=order.get("condition_id"),
+                side=f"SELL_{order.get('side')}",
+                price=order.get("limit_price"),
+                size=order.get("shares"),
+                cost=order.get("size_usd"),
+                dry_run=True,
+                raw=payload,
+            )
+            self.store.close_position(order["condition_id"])
+            return {"status": "paper_sell", "ticket": payload}
+
+        client = self._live_client()
+        from py_clob_client.clob_types import OrderArgs
+
+        try:
+            from py_clob_client.order_builder.constants import SELL
+            side = SELL
+        except Exception:
+            side = "SELL"
+        args = OrderArgs(
+            token_id=order["token_id"],
+            price=float(order["limit_price"]),
+            size=float(order["shares"]),
+            side=side,
+        )
+        signed = None
+        if hasattr(client, "create_and_post_order"):
+            signed = client.create_and_post_order(args)
+        elif hasattr(client, "create_order"):
+            placed = client.create_order(args)
+            signed = client.post_order(placed) if hasattr(client, "post_order") else placed
+        else:
+            raise RuntimeError("SDK mangler create/post order")
+        log.info("LIVE SELL %s", signed)
+        self.store.add_fill(
+            condition_id=order.get("condition_id"),
+            side=f"SELL_{order.get('side')}",
+            price=order.get("limit_price"),
+            size=order.get("shares"),
+            cost=order.get("size_usd"),
+            dry_run=False,
+            raw={"order": str(signed), **payload},
+        )
+        self.store.close_position(order["condition_id"])
+        return {"status": "live_sell", "response": signed, "ticket": payload}

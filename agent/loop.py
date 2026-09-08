@@ -73,7 +73,29 @@ class Desk:
         )
 
         markets = self.scout.fetch()
-        if not markets:
+        by_id = {m["condition_id"]: m for m in markets}
+        for pos in open_pos:
+            cid = pos.get("condition_id")
+            if cid and cid not in by_id:
+                by_id[cid] = {
+                    "condition_id": cid,
+                    "question": pos.get("question") or "",
+                    "description": "",
+                    "end_date": None,
+                    "category": pos.get("category") or "other",
+                    "event_key": pos.get("event_key") or cid,
+                    "yes_token": pos.get("token_id") if pos.get("side") == "YES" else "",
+                    "no_token": pos.get("token_id") if pos.get("side") == "NO" else "",
+                    "yes_mid": float(pos.get("avg_cost") or 0.5),
+                    "mid": float(pos.get("avg_cost") or 0.5),
+                    "liquidity": 0,
+                    "_open_only": True,
+                }
+        ranked = [m for m in markets if not m.get("_open_only")]
+        extras = [m for m in by_id.values() if m.get("_open_only")]
+        batch = extras + ranked
+        batch = batch[: max(settings.estimate_batch, len(extras))]
+        if not batch:
             log.info("Ingen markeder passerte filter")
             self.last_cycle = {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -82,12 +104,12 @@ class Desk:
                 "estimated": 0,
                 "accepted": 0,
                 "rejected": 0,
+                "exits": 0,
                 "bankroll": bankroll,
                 "equity": equity,
             }
             return {"ok": True, "scanned": 0}
 
-        batch = markets[: settings.estimate_batch]
         try:
             estimates = self.brain.estimate(batch)
             self.last_error = None
@@ -96,9 +118,54 @@ class Desk:
             self.last_error = str(exc)
             return {"ok": False, "reason": str(exc)}
 
+        exits = 0
+        for pos in list(open_pos):
+            token = pos.get("token_id")
+            if not token:
+                continue
+            try:
+                pbook = self.scout.book(token)
+            except Exception as exc:
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    action="skip",
+                    reason=f"exit-bok: {exc}",
+                )
+                continue
+            ticket_ex, why = self.risk.evaluate_exit(
+                pos, pbook, estimates.get(pos.get("condition_id")), bankroll
+            )
+            if not ticket_ex:
+                continue
+            try:
+                result = self.exec.sell(ticket_ex)
+                exits += 1
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    side=pos.get("side"),
+                    action=result.get("status"),
+                    reason=ticket_ex.get("reason") or why,
+                    payload=result,
+                )
+            except Exception as exc:
+                log.exception("Salg feilet")
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    action="error",
+                    reason=str(exc),
+                )
+
+        open_pos = self.store.positions("open")
+        locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
+
         accepted = 0
         rejected = 0
         for m in batch:
+            if m.get("_open_only"):
+                continue
             est = estimates.get(m["condition_id"])
             if not est:
                 self.store.log_decision(
@@ -111,6 +178,11 @@ class Desk:
                 continue
             try:
                 book = self.scout.book(m["yes_token"])
+                if m.get("no_token"):
+                    try:
+                        m["no_book"] = self.scout.book(m["no_token"])
+                    except Exception:
+                        m["no_book"] = {}
             except Exception as exc:
                 self.store.log_decision(
                     condition_id=m["condition_id"],
@@ -159,7 +231,7 @@ class Desk:
                     action="error",
                     reason=str(exc),
                 )
-        log.info("Syklus ferdig. Nye tickets: %s", accepted)
+        log.info("Syklus ferdig. Nye tickets: %s exits: %s", accepted, exits)
         self.last_cycle = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "halted": False,
@@ -167,6 +239,7 @@ class Desk:
             "estimated": len(estimates),
             "accepted": accepted,
             "rejected": rejected,
+            "exits": exits,
             "bankroll": bankroll,
             "equity": equity,
         }

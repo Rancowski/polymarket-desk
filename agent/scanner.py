@@ -63,13 +63,7 @@ def _category(raw: dict) -> str:
 
 
 def _event_key(raw: dict) -> str:
-    return str(
-        raw.get("eventSlug")
-        or raw.get("groupItemTitle")
-        or raw.get("questionID")
-        or raw.get("conditionId")
-        or ""
-    )
+    return str(raw.get("eventSlug") or raw.get("groupItemTitle") or raw.get("questionID") or raw.get("conditionId") or "")
 
 
 class Scout:

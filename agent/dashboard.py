@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import subprocess
 import threading
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -155,6 +156,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = _desk.cycle()
             self._json(200, result)
+            return
+        if path == "/api/update":
+            script = settings.halt_file.parent / "deploy" / "update.sh"
+            if not script.exists():
+                self._json(500, {"ok": False, "reason": "deploy/update.sh mangler"})
+                return
+            log.warning("Kodeoppdatering fra dashboard")
+            subprocess.Popen(
+                ["bash", str(script)],
+                cwd=str(settings.halt_file.parent),
+                start_new_session=True,
+            )
+            self._json(200, {"ok": True, "reason": "henter kode og restarter"})
             return
         self._json(404, {"error": "not found"})
 

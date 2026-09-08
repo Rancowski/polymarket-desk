@@ -11,13 +11,15 @@ from agent.config import settings
 
 log = logging.getLogger("brain")
 
-SYSTEM = """Du er sannsynlighetsanalytiker for binære prediction markets på Polymarket.
-Oppgave: estimer P(YES inntreffer slik resolusjonskilden definerer det), ikke hva som «burde» skje.
+SYSTEM = """Du er en edge-jeger for binære Polymarket-markeder.
+Oppgave: finn der live-informasjon (web + X) avviker fra markedets pris, og estimer P(YES slik resolusjonskilden definerer det).
 
 Regler:
-- Vær konservativ. Hvis informasjonen er tynn, sett confidence=low og p nær markedet.
-- Ikke jakt edge. De fleste markeder er OK priset.
-- Ta hensyn til resolusjonstekst, tid, base rates og nyhetsbildet du kjenner.
+- JAKT edge. Hvis markedet er feilpriset gitt ferske kilder, si det tydelig.
+- Bruk web_search og x_search aktivt: siste nyheter, offisielle kilder, odds, X-innlegg fra pålitelige kontoer.
+- Ikke default til mid-prisen. Mid er referanse, ikke fasit.
+- confidence=high kun med sterke, ferske kilder. medium ved rimelig dekning. low hvis tynt — men sett likevel ditt beste p_yes.
+- skip=true bare hvis markedet er uleselig (resolusjon udefinert, allerede avgjort, eller rent gambling uten signal).
 - Aldri 0 eller 1. Hold p i [0.02, 0.98].
 - Svar KUN gyldig JSON-array. Ingen markdown.
 
@@ -26,7 +28,7 @@ Hvert element:
   "condition_id": "...",
   "p_yes": 0.0-1.0,
   "confidence": "low"|"medium"|"high",
-  "thesis": "en setning",
+  "thesis": "en setning med kilden bak avviket",
   "skip": false,
   "skip_reason": ""
 }
@@ -34,7 +36,7 @@ Hvert element:
 
 
 def _extract_json(text: str) -> Any:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
@@ -45,8 +47,29 @@ def _extract_json(text: str) -> Any:
     return json.loads(text)
 
 
+def _response_text(data: dict) -> str:
+    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
+        return data["output_text"]
+    chunks: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for c in item.get("content") or []:
+                if isinstance(c, dict) and c.get("type") in {"output_text", "text"}:
+                    chunks.append(str(c.get("text") or ""))
+        elif item.get("type") in {"output_text", "text"}:
+            chunks.append(str(item.get("text") or ""))
+    if chunks:
+        return "\n".join(chunks)
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
 class Brain:
-    """Grok-agent: bare sannsynlighet. Ingen ordre."""
+    """Grok + web/X-søk: sannsynlighet. Ingen ordre."""
 
     def estimate(self, markets: list[dict]) -> dict[str, dict]:
         if not markets:
@@ -56,17 +79,14 @@ class Brain:
             log.warning("XAI_API_KEY mangler — hopper over estimat")
             return {}
         if not key.startswith("xai-"):
-            log.error(
-                "XAI_API_KEY ser feil ut (skal starte med xai- fra console.x.ai, "
-                "ikke en Polymarket-nøkkel). Hopper over estimat."
-            )
+            log.error("XAI_API_KEY ser feil ut. Hopper over estimat.")
             return {}
 
         payload_markets = [
             {
                 "condition_id": m["condition_id"],
                 "question": m["question"],
-                "description": m.get("description", "")[:400],
+                "description": m.get("description", "")[:900],
                 "end_date": m.get("end_date"),
                 "category": m.get("category"),
                 "yes_mid": round(m.get("yes_mid") or m.get("mid") or 0.5, 3),
@@ -74,6 +94,11 @@ class Brain:
             }
             for m in markets
         ]
+        user = (
+            "Søk web og X etter det som flytter disse markedene NÅ. "
+            "Estimer P(YES) uavhengig av mid. Marker edge i thesis.\n"
+            + json.dumps(payload_markets, ensure_ascii=False)
+        )
         models = [settings.grok_model, "grok-4.5", "grok-4"]
         seen: set[str] = set()
         last_err = ""
@@ -81,43 +106,60 @@ class Brain:
             if not model or model in seen:
                 continue
             seen.add(model)
-            body = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM},
-                    {
-                        "role": "user",
-                        "content": "Estimer disse markedene. Markedspris er kun referanse, ikke fasit.\n"
-                        + json.dumps(payload_markets, ensure_ascii=False),
-                    },
-                ],
-            }
             try:
-                r = requests.post(
-                    "https://api.x.ai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                    timeout=120,
-                )
-            except requests.RequestException as exc:
+                text = self._call(key, model, user)
+                if text:
+                    return self._parse(text, markets)
+            except Exception as exc:
                 last_err = str(exc)
-                log.warning("xAI nettverksfeil (%s): %s", model, exc)
-                continue
-            if r.ok:
-                return self._parse(r, markets)
-            last_err = f"{r.status_code} {r.text[:400]}"
-            log.warning("xAI %s feilet: %s", model, last_err)
-            if r.status_code in {401, 403}:
-                log.error("xAI avviste nøkkelen. Opprett ny på https://console.x.ai")
-                return {}
-        log.error("Ingen Grok-modell svarte. Siste feil: %s", last_err)
+                log.warning("xAI %s feilet: %s", model, last_err[:300])
+        log.error("Ingen Grok-modell svarte. Siste feil: %s", last_err[:400])
         return {}
 
-    def _parse(self, r: requests.Response, markets: list[dict]) -> dict[str, dict]:
-        content = r.json()["choices"][0]["message"]["content"]
+    def _call(self, key: str, model: str, user: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            "tools": [{"type": "web_search"}, {"type": "x_search"}],
+        }
+        r = requests.post(
+            "https://api.x.ai/v1/responses",
+            headers=headers,
+            json=body,
+            timeout=180,
+        )
+        if r.status_code in {401, 403}:
+            log.error("xAI avviste nøkkelen")
+            r.raise_for_status()
+        if r.ok:
+            return _response_text(r.json())
+        log.warning("Responses API %s: %s — fallback chat", r.status_code, r.text[:240])
+        chat = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            "tools": [{"type": "web_search"}, {"type": "x_search"}],
+        }
+        r2 = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers=headers,
+            json=chat,
+            timeout=180,
+        )
+        r2.raise_for_status()
+        data = r2.json()
+        return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+
+    def _parse(self, content: str, markets: list[dict]) -> dict[str, dict]:
         rows = _extract_json(content)
         out: dict[str, dict] = {}
         for row in rows:
@@ -131,7 +173,7 @@ class Brain:
             p = min(0.98, max(0.02, p))
             out[cid] = {
                 "p_yes": p,
-                "confidence": str(row.get("confidence") or "low").lower(),
+                "confidence": str(row.get("confidence") or "medium").lower(),
                 "thesis": str(row.get("thesis") or ""),
                 "skip": bool(row.get("skip")),
                 "skip_reason": str(row.get("skip_reason") or ""),

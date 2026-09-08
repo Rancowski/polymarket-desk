@@ -1,3 +1,6 @@
+"""Kjør én gang: python -m agent.bootstrap_creds
+Printer CLOB API-credentials derivert fra private key. Lagres ikke automatisk.
+"""
 from __future__ import annotations
 
 from agent.config import settings

@@ -87,6 +87,7 @@
       <button class="btn primary" id="btnOn" type="button">Slå på</button>
       <button class="btn danger" id="btnOff" type="button">Slå av</button>
       <button class="btn" id="btnOnce" type="button">Kjør én syklus</button>
+      <button class="btn" id="btnUpd" type="button">Oppdater agent</button>
     </div>
     <div id="err"></div>
     <svg class="spark" id="spark" viewBox="0 0 320 88" preserveAspectRatio="none"></svg>
@@ -182,7 +183,7 @@
       spark(s.equity_history);
       const c = s.last_cycle;
       $("cycle").textContent = c
-        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · tatt ${c.accepted || 0} · avvist ${c.rejected || 0}`
+        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · tatt ${c.accepted || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}`
         : "Venter på første syklus.";
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;
@@ -200,6 +201,16 @@
       $("btnOnce").textContent = "Kjører…";
       try { await api("/api/once", "POST"); }
       finally { $("btnOnce").disabled = false; $("btnOnce").textContent = "Kjør én syklus"; refresh(); }
+    };
+    $("btnUpd").onclick = async () => {
+      if (!confirm("Hente siste kode og restarte agenten?")) return;
+      $("btnUpd").disabled = true;
+      try {
+        await api("/api/update", "POST");
+        $("cycle").textContent = "Oppdaterer… dashboard kommer tilbake om ~20 s.";
+      } finally {
+        setTimeout(() => { $("btnUpd").disabled = false; refresh(); }, 20000);
+      }
     };
     document.querySelectorAll(".tabs button").forEach((b) => {
       b.onclick = () => {
