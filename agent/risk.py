@@ -168,6 +168,12 @@ MAX_SPORTS = 4
 HARD_NAME_PCT = 0.18
 SPORTS_PCT = (0.06, 0.08)
 CORE_PCT = (0.10, 0.14)
+MIN_NOTIONAL_PCT = 0.05
+DEPTH_USE_PCT = 0.50
+CASH_USE_PCT = 0.90
+DUST_VALUE_PCT = 0.001  # 0.1 % of sizing base
+VENUE_MIN_SHARES = 5.0  # CLOB share minimum, not a dollar floor
+REUP_MIN_PNL = 0.10
 
 
 def is_primary(row: dict) -> bool:
@@ -180,13 +186,76 @@ def is_primary(row: dict) -> bool:
     return any(h in blob for h in PRIMARY_HINTS)
 
 
-def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
-    """Kelly, then a fillable clip. Sports tickets are 6–8% (~$13–18)."""
-    kelly = kelly_usd(p_hat, cost, bankroll)
-    if kelly <= 0:
+def sizing_base(deposited: float, equity: float = 0.0) -> float:
+    """Deposited if set, else equity. Never a hardcoded dollar book."""
+    try:
+        dep = float(deposited or 0)
+    except (TypeError, ValueError):
+        dep = 0.0
+    if dep > 0:
+        return dep
+    try:
+        return max(0.0, float(equity or 0))
+    except (TypeError, ValueError):
         return 0.0
-    min_clip = min(cap, max(8.0, 0.06 * bankroll))
-    return min(cap, max(kelly, min_clip))
+
+
+def min_notional(base: float) -> float:
+    return max(0.0, MIN_NOTIONAL_PCT * float(base or 0))
+
+
+def dust_cutoff(base: float) -> float:
+    return max(0.0, DUST_VALUE_PCT * float(base or 0))
+
+
+def size_ticket(
+    *,
+    target_pct: float,
+    size_base: float,
+    cost: float,
+    ask_size: float,
+    cash: float,
+    name_room: float,
+    deployed_room: float,
+) -> tuple[float, float, str]:
+    """Percent-only size. Returns (usd, shares, skip_reason). Never a stub below 5% of base."""
+    if size_base <= 0 or cost <= 0:
+        return 0.0, 0.0, "ingen sizing-base"
+    floor = min_notional(size_base)
+    depth_usd = max(0.0, float(ask_size or 0) * cost)
+    if depth_usd < floor:
+        return 0.0, 0.0, "bok tynn (<5% dybde)"
+    cap18 = HARD_NAME_PCT * size_base
+    room = min(
+        cap18,
+        max(0.0, name_room),
+        max(0.0, deployed_room),
+        CASH_USE_PCT * max(0.0, cash),
+        DEPTH_USE_PCT * depth_usd,
+    )
+    usd = min(target_pct * size_base, room)
+    if usd < floor:
+        if room >= floor:
+            usd = floor
+        else:
+            return 0.0, 0.0, "under 5% og ikke rom for bump"
+    shares = usd / cost
+    if shares < VENUE_MIN_SHARES:
+        bumped = VENUE_MIN_SHARES * cost
+        if bumped < floor or bumped > room:
+            return 0.0, 0.0, "venue-min andeler under 5% eller over cap"
+        shares = VENUE_MIN_SHARES
+        usd = bumped
+    return usd, shares, ""
+
+
+def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
+    """Kelly clip in percent space. Floor is 5% of bankroll, never a dollar stub."""
+    kelly = kelly_usd(p_hat, cost, bankroll)
+    if kelly <= 0 or bankroll <= 0:
+        return 0.0
+    floor = min(cap, MIN_NOTIONAL_PCT * bankroll)
+    return min(cap, max(kelly, floor))
 
 
 class Risk:
@@ -290,13 +359,22 @@ class Risk:
         open_pos = self.store.positions("open")
         event = market.get("event_key") or market["condition_id"]
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
-        if any(str(p.get("side") or "").upper() == side for p in same_cid):
-            return None, "allerede i markedet"
-        hedge = bool(same_cid) and not any(str(p.get("side") or "").upper() == side for p in same_cid)
-        if not hedge and any(p.get("event_key") == event and p.get("condition_id") != cid for p in open_pos):
+        same_side = [p for p in same_cid if str(p.get("side") or "").upper() == side]
+        hedge = bool(same_cid) and not same_side
+        reup = False
+        if same_side:
+            if sports:
+                return None, "ingen påfyll sports"
+            held = same_side[0]
+            held_cost = float(held.get("shares") or 0) * float(held.get("avg_cost") or 0)
+            upnl = _row_upnl(held)
+            if held_cost <= 0 or upnl < REUP_MIN_PNL * held_cost:
+                return None, "aldri average down"
+            reup = True
+        if not hedge and not reup and any(p.get("event_key") == event and p.get("condition_id") != cid for p in open_pos):
             return None, "ett event en tese"
-        if len(open_pos) >= settings.max_open_positions and not hedge:
-            return None, "max 10 åpne (kun hedge)"
+        if len(open_pos) >= settings.max_open_positions and not hedge and not reup:
+            return None, "max 10 åpne (kun hedge/påfyll)"
         sports_pos = [p for p in open_pos if is_sports(p)]
         if sports and len(sports_pos) >= MAX_SPORTS:
             return None, "maks 4 sports"
@@ -312,38 +390,27 @@ class Risk:
         )
         open_cost = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
 
-        size_base = deposited if deposited >= 1 else bankroll
+        size_base = sizing_base(deposited, equity)
         longshot = cost <= 0.28
         if sports or longshot:
-            floor_pct, cap_pct = SPORTS_PCT
+            _floor_pct, cap_pct = SPORTS_PCT
         else:
-            floor_pct, cap_pct = CORE_PCT
+            _floor_pct, cap_pct = CORE_PCT
         cap = min(cap_pct * size_base, HARD_NAME_PCT * size_base)
         remaining_event = max(0.0, cap - same_event_cost)
         remaining_cat = max(0.0, settings.max_category_pct * size_base - cat_cost)
         powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
-        if not hedge and powder < 5:
-            return None, "krutt tørt (≤75% deployed)"
-        hard = min(cap, remaining_event, remaining_cat, bankroll, powder)
-        sized = clip_usd(p_hat, cost, size_base, hard)
-        if not probe and sized > 0:
-            sized = min(hard, max(floor_pct * size_base, sized))
-        if probe:
-            sized = min(max(sized, 8.0), 12.0, hard)
-        if sized < 5 or hard < 5:
-            return None, f"size {sized:.2f} for liten (bankroll {bankroll:.0f})"
-
-        shares = sized / cost if cost > 0 else 0
-        if shares < 5:
-            shares = 5.0
-            sized = shares * cost
-            if sized > hard:
-                return None, "min 5 andeler over cap"
-        if book_sz and shares > book_sz / settings.min_book_multiple:
-            shares = book_sz / settings.min_book_multiple
-            sized = shares * cost
-            if sized < 5 or shares < 5:
-                return None, "bok for tynn etter cap"
+        sized, shares, skip_sz = size_ticket(
+            target_pct=cap_pct,
+            size_base=size_base,
+            cost=cost,
+            ask_size=book_sz,
+            cash=bankroll,
+            name_room=min(remaining_event, remaining_cat, cap),
+            deployed_room=powder,
+        )
+        if skip_sz:
+            return None, skip_sz
 
         # Kryss ask så ordren fylles (GTC mid+1¢ blir ofte liggende)
         limit = round(min(0.99, max(0.01, cost)), 2)
@@ -399,12 +466,15 @@ class Risk:
         missing = book_bid <= 0
         mark = bid
         value = shares * mark
-        # Dust/dead SPORTS only — never Fed. Try 0.01 then 0.001, then closed_dust.
-        if sports and (missing or book_bid <= 0.01 or mark <= 0.05):
+        dep = self.store.deposited_usd(0.0)
+        base = sizing_base(dep, bankroll)
+        dust_cut = dust_cutoff(base)
+        # Dust/dead SPORTS only — never Fed. Mark ≤ 0.01 or value < 0.1% of base.
+        if sports and (missing or book_bid <= 0.01 or mark <= 0.01 or (dust_cut > 0 and value < dust_cut)):
             px = min(0.01, book_bid) if book_bid > 0 else 0.01
             return self._exit_ticket(
                 pos, book, shares, px,
-                f"død sports bid={book_bid:.4f} mark={mark:.4f} val={value:.2f}",
+                f"død sports bid={book_bid:.4f} mark={mark:.4f} val={value:.4f}",
                 kind="dust",
                 best_bid=book_bid,
             ), "ok"

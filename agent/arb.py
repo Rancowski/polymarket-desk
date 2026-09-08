@@ -6,7 +6,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent.config import settings
-from agent.risk import CORE_PCT, DEPLOYED_MAX, HARD_NAME_PCT, MAX_SPORTS, Ticket, is_sports
+from agent.risk import (
+    CORE_PCT,
+    DEPLOYED_MAX,
+    HARD_NAME_PCT,
+    MAX_SPORTS,
+    Ticket,
+    is_sports,
+    size_ticket,
+    sizing_base,
+)
 
 log = logging.getLogger("arb")
 
@@ -75,18 +84,31 @@ class Arb:
         market[key] = data
         return data
 
-    def _size_base(self, bankroll: float) -> float:
+    def _size_base(self, bankroll: float, equity: float = 0.0) -> float:
         try:
             deposited = float(self.store.deposited_usd(bankroll) or 0)
         except Exception:
             deposited = 0.0
-        return deposited if deposited >= 1 else bankroll
+        return sizing_base(deposited, equity or bankroll)
+
+    def _leg(self, cost: float, ask_sz: float, size_base: float, cash: float, target_pct: float) -> tuple[float, float, str]:
+        open_cost = sum(float(p["shares"]) * float(p["avg_cost"]) for p in self.store.positions("open"))
+        powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
+        return size_ticket(
+            target_pct=target_pct,
+            size_base=size_base,
+            cost=cost,
+            ask_size=ask_sz,
+            cash=cash,
+            name_room=HARD_NAME_PCT * size_base,
+            deployed_room=powder,
+        )
 
     def scan(self, markets: list[dict], bankroll: float, equity: float = 0.0) -> list[Ticket]:
         from agent.risk import Risk
 
         open_pos = self.store.positions("open")
-        deposited = self._size_base(bankroll)
+        deposited = self._size_base(bankroll, equity)
         block = Risk(self.store).buys_blocked(equity or deposited, deposited)
         if block:
             log.info("Arb: hopper kjøp (%s)", block)
@@ -131,9 +153,7 @@ class Arb:
     ) -> list[Ticket]:
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
-        open_cost = sum(float(p["shares"]) * float(p["avg_cost"]) for p in self.store.positions("open"))
-        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
-        powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
+        cash = bankroll
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
@@ -158,19 +178,14 @@ class Arb:
                 continue
             ysz = float(yb.get("ask_size") or 0)
             nsz = float(nb.get("ask_size") or 0)
-            if ysz < 5 or nsz < 5:
-                continue
-            budget = min(cap, powder, CORE_PCT[1] * size_base)
-            shares = budget / max(0.02, yask + nask)
-            if ysz:
-                shares = min(shares, ysz / max(2, settings.min_book_multiple))
-            if nsz:
-                shares = min(shares, nsz / max(2, settings.min_book_multiple))
-            if shares * (yask + nask) < 6:
+            half = CORE_PCT[1] / 2
+            y_usd, y_sh, ywhy = self._leg(yask, ysz, size_base, cash, half)
+            n_usd, n_sh, nwhy = self._leg(nask, nsz, size_base, cash, half)
+            if ywhy or nwhy:
                 continue
             thesis = f"sum-til-én YES+NO ask {yask+nask:.3f}"
-            out.append(_ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis))
-            out.append(_ticket(m, "NO", m["no_token"], nb, nask, shares, thesis))
+            out.append(_ticket(m, "YES", m["yes_token"], yb, yask, y_sh, thesis))
+            out.append(_ticket(m, "NO", m["no_token"], nb, nask, n_sh, thesis))
             open_ids.add(cid)
             if len(out) >= 4:
                 break
@@ -221,7 +236,6 @@ class Arb:
         now = datetime.now(timezone.utc)
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
-        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
@@ -248,13 +262,8 @@ class Arb:
             if side == "YES" and cost < LOCKED_YES - 0.04:
                 continue
             ask_sz = float(book.get("ask_size") or 0)
-            if ask_sz < 5:
-                continue
-            usd = min(cap, CORE_PCT[1] * size_base)
-            shares = usd / cost
-            if ask_sz:
-                shares = min(shares, ask_sz / max(2, settings.min_book_multiple))
-            if shares * cost < 8:
+            usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])
+            if why:
                 continue
             hours = (now - end).total_seconds() / 3600
             thesis = f"låst utfall {side} mid={yes:.2f} slutt for {hours:.0f}t siden"
@@ -268,7 +277,6 @@ class Arb:
         """Kalshi confirmation ≥ 4 ¢ on a mapped pair. Not locked arb."""
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
-        cap = min(HARD_NAME_PCT * size_base, CORE_PCT[1] * size_base)
         for m in markets:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
@@ -287,13 +295,8 @@ class Arb:
             if cost < 0.22 or cost > 0.82:
                 continue
             ask_sz = float(book.get("ask_size") or 0)
-            if ask_sz < 5:
-                continue
-            usd = min(cap, CORE_PCT[1] * size_base)
-            shares = usd / cost if cost else 0
-            if ask_sz:
-                shares = min(shares, ask_sz / max(2, settings.min_book_multiple))
-            if shares * cost < 8:
+            usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])
+            if why:
                 continue
             thesis = f"Kalshi-bekreftelse {ks.get('yes')} vs Poly {float(m.get('yes_mid') or 0):.2f} gap={gap:+.2f} → {side}"
             out.append(_ticket(m, side, token, book, cost, shares, thesis))

@@ -510,7 +510,12 @@ class Store:
                 shares = float(r.get("shares") or 0)
                 if mtm <= 0 and shares and cur:
                     mtm = shares * cur
-                if mtm < 0.25 or cur <= 0.01:
+                try:
+                    dep = float(self.get_meta("deposited_usd") or 0)
+                except (TypeError, ValueError):
+                    dep = 0.0
+                dust_cut = 0.001 * dep if dep > 0 else 0.0
+                if (dust_cut > 0 and mtm < dust_cut) or cur <= 0.01:
                     continue
                 self.clear_dust(cid, side)
             self.upsert_position(**r)

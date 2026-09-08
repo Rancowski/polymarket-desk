@@ -249,10 +249,10 @@
       if (tab === "rules") {
         el.innerHTML = [
           ["Syklus", "Hvert 5. minutt. Exits + Kalshi + tape først. Grok annenhver runde. FAK. Ingen X/web. Fortsetter å kjøpe når boka er beskjedent rød."],
-          ["Kjøp", "På ask med dybde, hvis én er sann: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen (ikke død 0,01-sports). 3) Kalshi-par gap ≥ 4 ¢ og PM-ask 0,22–0,82. 4) Grok-kant ≥ MIN_NET_EDGE på et likvid navn."],
+          ["Kjøp", "På ask med dybde, hvis én er sann: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen (ikke død sports-bok). 3) Kalshi-par gap ≥ 4 ¢ og PM-ask 0,22–0,82. 4) Grok-kant ≥ MIN_NET_EDGE på et likvid navn."],
           ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Ett event = én tese. Inntil 75 % av innskutt i markedet."],
-          ["Størrelse", "Sports/longshot 6–8 % av innskutt (~13–18 USD). Kjerne (Fed/krypto/politikk) 10–14 % (~22–31). Hard tak 18 % på ett navn."],
-          ["Sports", "Maks 4. Nye sports-kjøp er lov inntil 4 er åpne. Stopp −15 % / bud ≤ 0,03 / mark ≤ 0,05. +22 % så trail 8 % fra topp. Død/umatchet og verdi < 0,25 USD → closed_dust. Aldri Fed."],
+          ["Størrelse", "Alt i prosent av innskutt (ellers egenkapital). Gulv 5 %. Sports/longshot 6–8 %. Kjerne 10–14 %. Hard tak 18 % ett navn. Maks 50 % av ask-dybde og 90 % av kontant. Tynn bok (dybde < 5 %) hoppes. Påfyll kun kjerne ≥ +10 %, aldri average down, aldri rød sports. Aldri stub under 5 %."],
+          ["Sports", "Maks 4. Nye sports-kjøp er lov inntil 4 er åpne. Stopp −15 % / bud ≤ 0,03 / død bok. +22 % så trail 8 % fra topp. Mark ≤ 0,01 eller verdi < 0,1 % av base → closed_dust. Aldri Fed."],
           ["Kjerne-exits", "Stopp −22 %. Ta gevinst bud ≥ 0,90 eller +28 %. Kalshi ≥ 7 ¢ mot kost, eller fersk p_hat ≥ 5 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes."],
           ["Kalshi", "Kun bekreftelse/veto. Navngitte serier. 25 = 25 bps. Ingen par → ignorer. Ikke locked arb. Ingen Kalshi-konto."],
           ["Sikring", "Ingen daglig handelsstopp. Ingen 85 %-halt. Eneste porteføljebrems: egenkapital ≤ 70 % av innskutt → ingen NY sports. Kjerne-kjøp og alle exits kjører."],

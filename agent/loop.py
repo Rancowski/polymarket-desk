@@ -10,7 +10,7 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import MAX_SPORTS, Risk, is_sports
+from agent.risk import MAX_SPORTS, Risk, dust_cutoff, is_sports, sizing_base
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -281,7 +281,7 @@ class Desk:
                 elif status == "unmatched_dust" or (
                     ticket_ex.get("dust")
                     and status in {"resting_sell", "resting"}
-                    and (value < 0.25 or mark <= 0.01)
+                    and (value < dust_cutoff(sizing_base(self.store.deposited_usd(0.0), equity)) or mark <= 0.01)
                 ):
                     px = result.get("attempt_px")
                     self.store.add_fill(
