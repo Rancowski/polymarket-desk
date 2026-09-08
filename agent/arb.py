@@ -11,7 +11,7 @@ from agent.risk import Ticket
 log = logging.getLogger("arb")
 
 # Etter fee: krev minst ~2 ¢ per sett
-COMPLEMENT_MAX_ASK_SUM = 0.980
+COMPLEMENT_MAX_ASK_SUM = 0.975
 EVENT_MAX_ASK_SUM = 0.970
 LOCKED_YES = 0.88
 LOCKED_NO = 0.12
@@ -179,7 +179,7 @@ class Arb:
             side = "YES" if yes >= LOCKED_YES else "NO"
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")
-            cost = float(book.get("best_ask") or yes if side == "YES" else (1 - yes))
+            cost = float(book.get("best_ask") or (yes if side == "YES" else max(0.01, 1.0 - yes)))
             if cost <= 0.01 or cost >= 0.99:
                 continue
             if side == "YES" and cost < LOCKED_YES - 0.04:

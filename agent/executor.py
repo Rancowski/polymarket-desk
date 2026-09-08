@@ -235,7 +235,7 @@ class Executor:
                 dry_run=True,
                 raw=payload,
             )
-            self.store.close_position(order["condition_id"])
+            self.store.close_position(order["condition_id"], order.get("side"))
             return {"status": "paper_sell", "ticket": payload}
 
         client = self._live_client()
@@ -270,5 +270,5 @@ class Executor:
             dry_run=False,
             raw={"order": str(signed), **payload},
         )
-        self.store.close_position(order["condition_id"])
+        self.store.close_position(order["condition_id"], order.get("side"))
         return {"status": "live_sell", "response": signed, "ticket": payload}

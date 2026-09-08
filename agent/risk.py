@@ -198,6 +198,14 @@ class Risk:
         avg = float(pos.get("avg_cost") or 0)
         if shares <= 0 or avg <= 0:
             return None, "tom posisjon"
+        cid = pos.get("condition_id")
+        side = str(pos.get("side") or "YES").upper()
+        counterparts = [
+            p for p in self.store.positions("open")
+            if p.get("condition_id") == cid and str(p.get("side") or "").upper() != side
+        ]
+        if counterparts:
+            return None, "complement-hold"
         mid = float(book.get("mid") or avg)
         best_bid = float(book.get("best_bid") or mid)
         if best_bid <= 0:

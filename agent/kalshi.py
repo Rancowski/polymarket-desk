@@ -79,8 +79,11 @@ def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:
             if n > best_n:
                 best_n = n
                 best = k
-        need = max(3, min(5, len(qtok) // 2))
+        need = max(4, min(6, len(qtok) // 2 + 1))
         if not best or best_n < need:
+            continue
+        denom = max(len(qtok), len(best["tokens"]), 1)
+        if best_n / denom < 0.35:
             continue
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
         gap = round(poly - float(best["yes"]), 3)

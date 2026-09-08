@@ -83,6 +83,7 @@ class Desk:
         arb_tickets = self.arb.scan(markets, bankroll)
         arb_n = 0
         failed_events: set[str] = set()
+        pending_hedge = None
         for ticket in arb_tickets:
             if ticket.event_key in failed_events:
                 continue
@@ -101,9 +102,30 @@ class Desk:
                     payload=result,
                 )
                 bankroll = max(0.0, bankroll - ticket.size_usd)
+                if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
+                    pending_hedge = ticket if pending_hedge is None else None
+                else:
+                    pending_hedge = None
             except Exception as exc:
                 log.exception("Arb-ordre feilet")
                 failed_events.add(ticket.event_key)
+                if pending_hedge and pending_hedge.event_key == ticket.event_key:
+                    try:
+                        self.exec.sell(
+                            {
+                                "condition_id": pending_hedge.condition_id,
+                                "question": pending_hedge.question,
+                                "side": pending_hedge.side,
+                                "token_id": pending_hedge.token_id,
+                                "shares": pending_hedge.shares,
+                                "limit_price": max(0.01, pending_hedge.best_bid or pending_hedge.limit_price),
+                                "size_usd": pending_hedge.size_usd,
+                                "reason": "hedge-rollback",
+                            }
+                        )
+                    except Exception:
+                        log.exception("Hedge-rollback feilet")
+                    pending_hedge = None
                 self.store.log_decision(
                     condition_id=ticket.condition_id,
                     question=ticket.question,

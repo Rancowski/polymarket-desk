@@ -41,17 +41,18 @@ class Store:
                     payload TEXT
                 );
                 CREATE TABLE IF NOT EXISTS positions (
-                    condition_id TEXT PRIMARY KEY,
+                    condition_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
                     question TEXT,
                     category TEXT,
                     event_key TEXT,
-                    side TEXT,
                     token_id TEXT,
                     shares REAL,
                     avg_cost REAL,
                     opened_ts TEXT,
                     last_ts TEXT,
-                    status TEXT
+                    status TEXT,
+                    PRIMARY KEY (condition_id, side)
                 );
                 CREATE TABLE IF NOT EXISTS fills (
                     id INTEGER PRIMARY KEY,
@@ -80,6 +81,42 @@ class Store:
                 """
             )
             self.conn.commit()
+            self._migrate_positions()
+
+    def _migrate_positions(self) -> None:
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+        ).fetchone()
+        sql = (row["sql"] if row else "") or ""
+        if "PRIMARY KEY (condition_id, side)" in sql.replace(" ", ""):
+            return
+        if "PRIMARY KEY(condition_id, side)" in sql.replace(" ", ""):
+            return
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS positions_v2 (
+                condition_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                question TEXT,
+                category TEXT,
+                event_key TEXT,
+                token_id TEXT,
+                shares REAL,
+                avg_cost REAL,
+                opened_ts TEXT,
+                last_ts TEXT,
+                status TEXT,
+                PRIMARY KEY (condition_id, side)
+            );
+            INSERT OR REPLACE INTO positions_v2
+                (condition_id, side, question, category, event_key, token_id, shares, avg_cost, opened_ts, last_ts, status)
+            SELECT condition_id, COALESCE(NULLIF(side,''),'YES'), question, category, event_key, token_id,
+                   shares, avg_cost, opened_ts, last_ts, status FROM positions;
+            DROP TABLE positions;
+            ALTER TABLE positions_v2 RENAME TO positions;
+            """
+        )
+        self.conn.commit()
 
     def log_decision(self, **row: Any) -> None:
         payload = row.pop("payload", {})
@@ -110,12 +147,11 @@ class Store:
                 """
                 INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, opened_ts, last_ts, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(condition_id) DO UPDATE SET
+                ON CONFLICT(condition_id, side) DO UPDATE SET
                     shares=excluded.shares,
                     avg_cost=excluded.avg_cost,
                     last_ts=excluded.last_ts,
                     status=excluded.status,
-                    side=excluded.side,
                     token_id=excluded.token_id
                 """,
                 (
@@ -139,12 +175,18 @@ class Store:
             cur = self.conn.execute("SELECT * FROM positions WHERE status=?", (status,))
             return [dict(r) for r in cur.fetchall()]
 
-    def close_position(self, condition_id: str) -> None:
+    def close_position(self, condition_id: str, side: str | None = None) -> None:
         with self._lock:
-            self.conn.execute(
-                "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=?",
-                (utc_now(), condition_id),
-            )
+            if side:
+                self.conn.execute(
+                    "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=? AND side=?",
+                    (utc_now(), condition_id, side),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=?",
+                    (utc_now(), condition_id),
+                )
             self.conn.commit()
 
     def add_fill(self, **row: Any) -> None:
@@ -176,15 +218,21 @@ class Store:
             self.conn.commit()
 
     def equity_change_since(self, hours: float, current: float) -> float:
-        with self._lock:
-            cur = self.conn.execute(
-                "SELECT equity FROM pnl_marks WHERE ts <= datetime('now', ?) ORDER BY ts DESC LIMIT 1",
-                (f"-{int(hours)} hours",),
-            )
-            row = cur.fetchone()
-        if not row:
+        hist = self.equity_history(400)
+        if not hist:
             return 0.0
-        return current - float(row["equity"])
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        chosen = float(hist[0]["equity"])
+        for row in hist:
+            try:
+                ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts.timestamp() <= cutoff:
+                    chosen = float(row["equity"])
+            except ValueError:
+                continue
+        return current - chosen
 
     def latest_mark(self) -> dict | None:
         with self._lock:
