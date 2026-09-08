@@ -367,6 +367,11 @@ class Executor:
                 break
         if last_err is not None:
             msg = str(last_err)
+            if "restricted in your region" in msg.lower() or "geoblock" in msg.lower():
+                raise RuntimeError(
+                    "Geoblokk: Hetzner-IP er i Tyskland. Polymarket avviser ordre derfra. "
+                    "Flytt VPS til Helsinki (Finland). Norge og Finland er tillatt."
+                ) from last_err
             if "unexpected keyword" not in msg and "order_type" not in msg and "TypeError" not in type(last_err).__name__:
                 self.store.mark_bad_market(ticket.condition_id, msg[:120])
             raise RuntimeError(f"CLOB-ordre feilet: {msg}") from last_err
