@@ -31,6 +31,7 @@ class Desk:
         self.busy = False
         self.last_error: str | None = None
         self.last_cycle: dict | None = None
+        self._cycle_i = 0
         threading.Thread(target=self._bootstrap_portfolio, daemon=True, name="desk-boot").start()
 
     def begin_cycle_async(self) -> bool:
@@ -95,7 +96,7 @@ class Desk:
             if not book or book.get("synthetic"):
                 continue
             mid = float(book.get("mid") or book.get("best_bid") or 0)
-            if not (0.01 < mid < 0.99):
+            if not (0 < mid < 0.99):
                 continue
             p["cur_price"] = mid
             p["current_value"] = float(p.get("shares") or 0) * mid
@@ -126,10 +127,50 @@ class Desk:
         )
         return bankroll, equity, open_pos
 
+    def _upnl(self, p: dict) -> float:
+        cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+        try:
+            mtm = float(p.get("current_value") or 0)
+        except (TypeError, ValueError):
+            mtm = 0.0
+        if mtm <= 0:
+            try:
+                mtm = float(p.get("shares") or 0) * float(p.get("cur_price") or 0)
+            except (TypeError, ValueError):
+                mtm = 0.0
+        return mtm - cost
+
+    def _trim_reasons(self, open_pos: list) -> dict[tuple, str]:
+        force: dict[tuple, str] = {}
+        if not open_pos:
+            return force
+        sports = [p for p in open_pos if is_sports(p)]
+        keep: set[tuple] = set()
+        if sports:
+            best = max(sports, key=self._upnl)
+            keep.add((str(best.get("condition_id")), str(best.get("side") or "YES")))
+        ranked = sorted(open_pos, key=self._upnl, reverse=True)
+        for p in ranked:
+            key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
+            if key in keep:
+                continue
+            if is_sports(p) and any(
+                is_sports(x) for x in open_pos
+                if (str(x.get("condition_id")), str(x.get("side") or "YES")) in keep
+            ):
+                force[key] = "maks 1 sports — trim"
+                continue
+            if len(keep) >= settings.max_open_positions:
+                force[key] = "maks 3 posisjoner — trim"
+                continue
+            keep.add(key)
+        return force
+
     def _run_exits(self, open_pos: list, estimates: dict, by_id: dict) -> tuple[int, list]:
         """Flatten on live bid. Always log hold vs sell. Independent of Grok."""
         sold = 0
         log_rows: list[dict] = []
+        force = self._trim_reasons(open_pos)
         for pos in list(open_pos):
             q = (pos.get("question") or "")[:80]
             token = pos.get("token_id")
@@ -156,12 +197,16 @@ class Desk:
                 )
             if pbook.get("synthetic"):
                 pbook = {"best_bid": 0, "mid": 0, "best_ask": 0, "spread": 0}
+            key = (str(pos.get("condition_id")), str(pos.get("side") or "YES"))
+            mkt = by_id.get(pos.get("condition_id") or "") or {}
             ticket_ex, why = self.risk.evaluate_exit(
                 pos,
                 pbook,
                 estimates.get(pos.get("condition_id") or ""),
                 0.0,
-                kalshi=(by_id.get(pos.get("condition_id") or "") or {}).get("kalshi"),
+                kalshi=mkt.get("kalshi"),
+                force_reason=force.get(key),
+                market=mkt,
             )
             if not ticket_ex:
                 self.store.log_decision(
@@ -230,12 +275,16 @@ class Desk:
             }
             return {"ok": True, "halted": True}
 
+        self._cycle_i += 1
+        run_grok = self._cycle_i % 3 == 1
         log.info(
-            "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s",
+            "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s grok=%s n=%s",
             settings.dry_run,
             bankroll,
             equity,
             len(open_pos),
+            run_grok,
+            self._cycle_i,
         )
 
         markets = self.scout.fetch()
@@ -419,7 +468,11 @@ class Desk:
         try:
             if remaining < 0.05 and extras:
                 batch = extras
-            estimates = self.brain.estimate(batch) if (remaining >= 0.02 or extras) else {}
+            if not run_grok:
+                estimates = {}
+                log.info("Hopper Grok (syklus %s, neste om %s)", self._cycle_i, 3 - (self._cycle_i % 3))
+            else:
+                estimates = self.brain.estimate(batch) if (remaining >= 0.02 or extras) else {}
             usage = getattr(self.brain, "last_usage", {}) or {}
             xai_cycle = float(usage.get("usd") or 0)
             if xai_cycle:
@@ -477,6 +530,8 @@ class Desk:
 
         accepted = 0
         rejected = 0
+        if not run_grok:
+            batch = []
         for m in batch:
             if m.get("_open_only"):
                 continue
@@ -553,8 +608,8 @@ class Desk:
             "ts": datetime.now(timezone.utc).isoformat(),
             "halted": False,
             "scanned": len(markets),
-            "estimated": len(estimates),
-            "grok": len(estimates),
+            "estimated": 0 if not run_grok else len(estimates),
+            "grok": 0 if not run_grok else len(estimates),
             "accepted": accepted,
             "arb": arb_n,
             "kalshi": kalshi_n,

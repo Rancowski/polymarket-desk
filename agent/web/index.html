@@ -37,6 +37,10 @@
     .err-line { color: var(--loss); font-size: .8rem; margin: 0 0 .4rem; min-height: 1.1em; }
     .grid4 { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; margin-top: .75rem; }
     @media (min-width: 640px) { .grid4 { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+    .strip { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; margin-top: .45rem; }
+    @media (min-width: 640px) { .strip { grid-template-columns: repeat(3, minmax(0,1fr)); } }
+    .strip .stat { padding: .55rem .7rem; }
+    .strip strong { font-size: .88rem; }
     .stat { background: var(--surface); border: 1px solid var(--border); border-radius: .85rem; padding: .75rem .85rem; }
     .stat span { display: block; color: var(--muted); font-size: .72rem; }
     .stat strong { display: block; margin-top: .15rem; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
@@ -84,6 +88,7 @@
   </header>
   <main class="wrap">
     <div class="grid4" id="stats"></div>
+    <div class="strip" id="strip"></div>
     <div class="actions">
       <button class="btn primary" id="btnOn" type="button">Slå på</button>
       <button class="btn danger" id="btnOff" type="button">Slå av</button>
@@ -159,7 +164,7 @@
       const c = s && s.last_cycle;
       if (!c || !c.ts) return "—";
       if (s.busy) return "kjører";
-      const next = new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000;
+      const next = new Date(c.ts).getTime() + (s.loop_seconds || 300) * 1000;
       let sec = Math.round((next - Date.now()) / 1000);
       if (sec < 0) sec = 0;
       return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
@@ -184,6 +189,18 @@
         ["xAI igjen", s.xai_remaining == null ? "fyll inn" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
       ];
       $("stats").innerHTML = cards.map(([l, v, c]) =>
+        `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
+      ).join("");
+      const lastFill = (s.fills || []).find((f) => !f.dry_run);
+      const strip = [
+        ["I markedet", `${s.open || 0} · ${usd(st.open_cost || 0)}`, ""],
+        ["Siste fill", lastFill ? `${lastFill.side} ${usd(lastFill.cost)}` : "ingen", ""],
+        ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
+        ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
+        ["Maks DD", `${signed(st.max_dd_usd || 0)} (${pctn(st.max_dd_pct || 0)})`, (st.max_dd_usd || 0) < -0.004 ? "loss" : ""],
+        ["xAI i dag / brukt / igjen", `${usd(st.xai_day || 0)} / ${usd(st.xai_total || 0)} / ${s.xai_remaining == null ? "—" : usd(s.xai_remaining)}`, ""],
+      ];
+      $("strip").innerHTML = strip.map(([l, v, c]) =>
         `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
       ).join("");
     }
@@ -212,7 +229,7 @@
     function cycleLine(s) {
       const c = s.last_cycle;
       if (!c) return "Venter på første syklus.";
-      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0} · xAI ${usd(c.xai_usd || 0)}`;
+      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · arb ${c.arb || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0} · xAI ${usd(c.xai_usd || 0)} · neste ${countdown(s)}`;
     }
     function renderPanel(s) {
       const el = $("panel");
@@ -226,11 +243,11 @@
       }
       if (tab === "rules") {
         el.innerHTML = [
+          ["Syklus", "Hvert 5. minutt. Exits først. Grok maks hver 3. syklus. Tape + Kalshi hver runde."],
           ["Kjøp", "FAK. Complement YES+NO < 0,982, så locked, så Kalshi-gap ≥ 4 ¢, så Grok kun ved netto kant etter gebyr."],
-          ["Sports", "Maks 1 åpen. Pris 0,22–0,78. Stopp bud ≤ 85 % av snitt eller bud ≤ 0,03. Ta gevinst +22 % eller bud ≥ 0,88."],
-          ["Andre", "Stopp −25 %. Ta gevinst bud ≥ 0,93. Selg om Kalshi er ≥ 6 ¢ mot kost, eller fersk p_hat ≥ 3 ¢ under kost."],
-          ["Ikke selg", "Ikke fordi Grok falt til mid. Hedge YES+NO i samme marked holdes."],
-          ["Størrelse", "Av innskutt og ledig CLOB-cash. Ett event, ett ticket."],
+          ["Sports", "Maks 1 åpen, 4–6 % av innskutt, pris 0,22–0,78. Stopp −12 % eller bud ≤ 0,03. +20 % deretter trail 8 % fra topp. Flatten hvis kamp >3 t og mid < 0,15."],
+          ["Andre", "Maks 3 åpne totalt. Kalshi/Fed 10–12 %. Stopp −25 %. Ta gevinst bud ≥ 0,93. Kalshi ≥ 6 ¢ mot kost, eller p_hat ≥ 3 ¢ under kost."],
+          ["Ikke selg", "Ikke fordi Grok falt til mid. Hedge YES+NO i samme marked holdes. Død bok selges på 0,001 — ikke hold som 0 % PnL."],
           ["Kalshi", "Kun navngitte serier. 25 = 25 bps, ikke 4,25 %. 70/30 blend ved gap ≥ 4 ¢."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;

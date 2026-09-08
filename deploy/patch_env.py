@@ -10,7 +10,7 @@ PATCH = {
     "MIN_NET_EDGE": "0.012",
     "MODEL_HAIRCUT": "0",
     "KELLY_FRACTION": "0.25",
-    "MAX_OPEN_POSITIONS": "12",
+    "MAX_OPEN_POSITIONS": "3",
     "MAX_CATEGORY_PCT": "0.40",
     "DAILY_LOSS_HALT_PCT": "0.06",
     "WEEKLY_LOSS_HALT_PCT": "0.15",
@@ -18,7 +18,8 @@ PATCH = {
     "MIN_VOLUME_24H_USD": "500",
     "MIN_BOOK_MULTIPLE": "3",
     "MAX_SPREAD": "0.08",
-    "LOOP_SECONDS": "900",
+    "LOOP_SECONDS": "300",
+    "CYCLE_SECONDS": "300",
     "ESTIMATE_BATCH": "12",
     "LIVE_SEARCH": "false",
 }
