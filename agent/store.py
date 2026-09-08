@@ -328,6 +328,12 @@ class Store:
             row = cur.fetchone()
         return int(row["n"] if row else 0)
 
+    def live_fill_count(self) -> int:
+        with self._lock:
+            cur = self.conn.execute("SELECT COUNT(*) AS n FROM fills WHERE dry_run=0")
+            row = cur.fetchone()
+        return int(row["n"] if row else 0)
+
     def first_mark(self) -> dict | None:
         with self._lock:
             cur = self.conn.execute(

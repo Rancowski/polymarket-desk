@@ -7,8 +7,8 @@ from pathlib import Path
 
 PATCH = {
     "MAX_POSITION_PCT": "0.12",
-    "MIN_NET_EDGE": "0.03",
-    "MODEL_HAIRCUT": "0.02",
+    "MIN_NET_EDGE": "0.02",
+    "MODEL_HAIRCUT": "0.01",
     "KELLY_FRACTION": "0.25",
     "MAX_OPEN_POSITIONS": "12",
     "MAX_CATEGORY_PCT": "0.40",

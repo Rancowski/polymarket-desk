@@ -184,15 +184,29 @@ class Executor:
             side=BUY,
         )
         signed = None
-        if hasattr(client, "create_and_post_order"):
-            signed = client.create_and_post_order(args)
-        elif hasattr(client, "create_order"):
-            order = client.create_order(args)
-            signed = client.post_order(order) if hasattr(client, "post_order") else order
-        else:
-            raise RuntimeError("SDK mangler create/post order")
+        try:
+            from py_clob_client.clob_types import PartialCreateOrderOptions
 
+            options = PartialCreateOrderOptions(tick_size="0.01")
+            if hasattr(client, "create_and_post_order"):
+                signed = client.create_and_post_order(args, options)
+            else:
+                order = client.create_order(args, options)
+                signed = client.post_order(order)
+        except (TypeError, Exception):
+            if hasattr(client, "create_and_post_order"):
+                signed = client.create_and_post_order(args)
+            elif hasattr(client, "create_order"):
+                order = client.create_order(args)
+                signed = client.post_order(order) if hasattr(client, "post_order") else order
+            else:
+                raise RuntimeError("SDK mangler create/post order")
         log.info("LIVE ORDER %s", signed)
+        err = ""
+        if isinstance(signed, dict):
+            err = str(signed.get("error") or signed.get("errorMsg") or signed.get("msg") or "")
+        if err and "success" not in err.lower():
+            raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
         self.store.add_fill(
             condition_id=ticket.condition_id,
             side=ticket.side,

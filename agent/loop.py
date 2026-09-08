@@ -309,6 +309,48 @@ class Desk:
                     action="error",
                     reason=str(exc),
                 )
+
+        if accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
+            best_t = None
+            best_m = None
+            for m in batch:
+                if m.get("_open_only"):
+                    continue
+                est = estimates.get(m["condition_id"])
+                if not est:
+                    continue
+                book = m.get("book") or {}
+                ticket, _why = self.risk.evaluate(
+                    m, book, est, bankroll, equity, min_edge=0.008, probe=True
+                )
+                if ticket and (best_t is None or ticket.edge_net > best_t.edge_net):
+                    best_t, best_m = ticket, m
+            if best_t:
+                try:
+                    result = self.exec.submit(best_t)
+                    accepted += 1
+                    self.store.log_decision(
+                        condition_id=best_t.condition_id,
+                        question=best_t.question,
+                        side=best_t.side,
+                        mid=best_t.mid,
+                        p_hat=best_t.p_hat,
+                        edge_net=best_t.edge_net,
+                        action=result.get("status"),
+                        reason=best_t.thesis,
+                        payload=result,
+                    )
+                    log.info("Probe-kjøp %s %s usd=%.2f", best_t.side, best_t.question[:50], best_t.size_usd)
+                except Exception as exc:
+                    log.exception("Probe-ordre feilet")
+                    self.last_error = str(exc)
+                    self.store.log_decision(
+                        condition_id=best_t.condition_id,
+                        question=best_t.question,
+                        action="error",
+                        reason=str(exc),
+                    )
+
         log.info("Syklus ferdig. Grok-tickets: %s arb: %s exits: %s", accepted, arb_n, exits)
         self.last_cycle = {
             "ts": datetime.now(timezone.utc).isoformat(),

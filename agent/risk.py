@@ -69,6 +69,8 @@ class Risk:
         estimate: dict,
         bankroll: float,
         equity: float,
+        min_edge: float | None = None,
+        probe: bool = False,
     ) -> tuple[Ticket | None, str]:
         halt = self.halted()
         if halt:
@@ -80,7 +82,7 @@ class Risk:
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
         disagreement = abs(p_yes - mid)
-        if conf == "low" and disagreement < 0.08:
+        if conf == "low" and disagreement < (0.04 if probe else 0.05):
             return None, "confidence=low uten stor uenighet"
         spread = float(book.get("spread") or 0)
         if spread > settings.max_spread:
@@ -112,10 +114,10 @@ class Risk:
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
         edge_net = edge_gross - (spread / 2.0) - fee_frac - settings.model_haircut
-        if edge_net < settings.min_net_edge:
-            return None, f"edge_net {edge_net:.3f} < {settings.min_net_edge}"
-        # Favoritt-sone (Thorp/Kelly): dyr kontrakt krever mer edge
-        if cost >= 0.82 and edge_net < max(settings.min_net_edge * 2, 0.06):
+        need = settings.min_net_edge if min_edge is None else min_edge
+        if edge_net < need:
+            return None, f"edge_net {edge_net:.3f} < {need}"
+        if (not probe) and cost >= 0.82 and edge_net < max(need * 2, 0.05):
             return None, f"favoritt-sone kost {cost:.2f} krever mer edge"
 
         open_pos = self.store.positions("open")
@@ -136,10 +138,12 @@ class Risk:
             if p.get("category") == market["category"]
         )
 
-        cap = settings.max_position_pct * bankroll
+        cap = (0.05 if probe else settings.max_position_pct) * bankroll
         remaining_event = max(0.0, cap - same_event_cost)
         remaining_cat = max(0.0, settings.max_category_pct * bankroll - cat_cost)
         sized = min(kelly_usd(p_hat, cost, bankroll), cap, remaining_event, remaining_cat)
+        if probe:
+            sized = min(sized if sized > 0 else 12.0, 12.0, cap, remaining_event, remaining_cat)
         if sized < 5:
             return None, f"size {sized:.2f} for liten"
 
@@ -157,12 +161,10 @@ class Risk:
         if weekly < -settings.weekly_loss_halt_pct * bankroll:
             return None, "ukentlig tap-stopp"
 
-        # Kryss spread når kanten er reell, ellers nær mid
-        if edge_net >= 0.05:
-            limit = round(min(0.99, max(0.01, cost)), 2)
-        else:
-            limit = round(min(cost, max(0.01, mid + 0.01)), 2)
-        limit = min(0.99, max(0.01, limit))
+        # Kryss ask så ordren fylles (GTC mid+1¢ blir ofte liggende)
+        limit = round(min(0.99, max(0.01, cost)), 2)
+        if probe:
+            limit = round(min(0.99, cost + 0.01), 2)
 
         ticket = Ticket(
             condition_id=market["condition_id"],
@@ -179,7 +181,7 @@ class Risk:
             edge_gross=edge_gross,
             edge_net=edge_net,
             confidence=conf,
-            thesis=estimate.get("thesis", ""),
+            thesis=("probe " if probe else "") + estimate.get("thesis", ""),
             limit_price=limit,
             size_usd=sized,
             shares=round(shares, 2),
