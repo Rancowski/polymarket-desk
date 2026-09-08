@@ -78,9 +78,10 @@ class Desk:
         markets = self.scout.fetch()
         try:
             from agent.kalshi import attach as kalshi_attach
-            kalshi_attach(markets)
+            kalshi_n = kalshi_attach(markets)
         except Exception as exc:
             log.warning("Kalshi: %s", exc)
+            kalshi_n = 0
         arb_tickets = self.arb.scan(markets, bankroll)
         arb_n = 0
         failed_events: set[str] = set()
@@ -195,6 +196,26 @@ class Desk:
             usage = getattr(self.brain, "last_usage", {}) or {}
             if usage.get("usd"):
                 self.store.add_api_cost(float(usage["usd"]), str(usage.get("model") or ""), int(usage.get("tokens") or 0))
+            n_blend = 0
+            for m in batch:
+                ks = m.get("kalshi") or {}
+                k_yes = float(ks.get("yes") or 0)
+                if not (0.02 < k_yes < 0.98):
+                    continue
+                cid = m["condition_id"]
+                est = estimates.get(cid) or {}
+                p = est.get("p_yes")
+                blended = round(0.55 * k_yes + 0.45 * float(p), 4) if p is not None else k_yes
+                estimates[cid] = {
+                    **est,
+                    "p_yes": blended,
+                    "skip": False,
+                    "confidence": est.get("confidence") or "medium",
+                    "thesis": ((est.get("thesis") or "") + f" | Kalshi {k_yes} gap {ks.get('gap')}").strip(" |"),
+                }
+                n_blend += 1
+            if n_blend:
+                log.info("Kalshi blend på %s markeder", n_blend)
             self.last_error = None
         except Exception as exc:
             log.exception("Brain krasjet: %s", exc)
@@ -313,59 +334,35 @@ class Desk:
                 )
 
         if accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
-            ranked: list[tuple[float, dict, dict]] = []
-            for m in batch:
-                if m.get("_open_only"):
-                    continue
-                cid = m.get("condition_id") or ""
-                if self.store.is_bad_market(cid):
-                    continue
-                est = estimates.get(cid)
-                if not est or est.get("skip"):
-                    continue
-                mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
-                if mid < 0.15 or mid > 0.85:
-                    continue
-                gap = abs(float(est.get("p_yes") or 0.5) - mid)
-                ranked.append((gap, m, est))
-            ranked.sort(key=lambda x: x[0], reverse=True)
-            for _gap, m, est in ranked[:4]:
-                book = m.get("book") or {}
-                ticket, why = self.risk.evaluate(
-                    m, book, est, bankroll, equity, min_edge=0.0, probe=True
-                )
-                if not ticket:
-                    continue
-                ticket.shares = 5.0
-                ticket.size_usd = round(5.0 * ticket.limit_price, 2)
+            test = self._pipeline_ticket(markets, bankroll)
+            if test:
                 try:
-                    result = self.exec.submit(ticket)
+                    result = self.exec.submit(test)
                     accepted += 1
+                    self.last_error = None
                     self.store.log_decision(
-                        condition_id=ticket.condition_id,
-                        question=ticket.question,
-                        side=ticket.side,
-                        mid=ticket.mid,
-                        p_hat=ticket.p_hat,
-                        edge_net=ticket.edge_net,
+                        condition_id=test.condition_id,
+                        question=test.question,
+                        side=test.side,
+                        mid=test.mid,
+                        p_hat=test.p_hat,
+                        edge_net=test.edge_net,
                         action=result.get("status"),
-                        reason=ticket.thesis,
+                        reason=test.thesis,
                         payload=result,
                     )
-                    log.info("Probe-kjøp %s %s usd=%.2f", ticket.side, ticket.question[:50], ticket.size_usd)
-                    self.last_error = None
-                    break
+                    log.info("Pipeline-test %s usd=%.2f", test.question[:50], test.size_usd)
                 except Exception as exc:
-                    log.exception("Probe-ordre feilet")
+                    log.exception("Pipeline-test feilet")
                     self.last_error = str(exc)
                     self.store.log_decision(
-                        condition_id=ticket.condition_id,
-                        question=ticket.question,
+                        condition_id=test.condition_id,
+                        question=test.question,
                         action="error",
                         reason=str(exc),
                     )
 
-        log.info("Syklus ferdig. Grok-tickets: %s arb: %s exits: %s", accepted, arb_n, exits)
+        log.info("Syklus ferdig. Grok-tickets: %s arb: %s kalshi: %s exits: %s", accepted, arb_n, kalshi_n, exits)
         self.last_cycle = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "halted": False,
@@ -373,12 +370,57 @@ class Desk:
             "estimated": len(estimates),
             "accepted": accepted,
             "arb": arb_n,
+            "kalshi": kalshi_n,
             "rejected": rejected,
             "exits": exits,
             "bankroll": bankroll,
             "equity": equity,
         }
         return {"ok": True, **self.last_cycle}
+
+    def _pipeline_ticket(self, markets: list, bankroll: float):
+        from agent.risk import Ticket
+
+        best = None
+        best_liq = -1.0
+        for m in markets:
+            cid = m.get("condition_id") or ""
+            if self.store.is_bad_market(cid):
+                continue
+            book = m.get("book") or {}
+            ask = float(book.get("best_ask") or 0)
+            spread = float(book.get("spread") or 1)
+            token = str(m.get("yes_token") or "")
+            if not token.isdigit():
+                continue
+            if not (0.25 <= ask <= 0.75) or spread > 0.05:
+                continue
+            liq = float(m.get("liquidity") or 0)
+            if liq <= best_liq:
+                continue
+            shares = max(5.0, round(8.0 / ask, 2))
+            best_liq = liq
+            best = Ticket(
+                condition_id=cid,
+                question=m.get("question") or "",
+                category=m.get("category") or "other",
+                event_key=m.get("event_key") or cid,
+                side="YES",
+                token_id=token,
+                mid=float(book.get("mid") or ask),
+                best_bid=float(book.get("best_bid") or ask),
+                best_ask=ask,
+                spread=spread,
+                p_hat=ask,
+                edge_gross=0.0,
+                edge_net=0.0,
+                confidence="low",
+                thesis="pipeline-test første live-fill",
+                limit_price=round(ask, 2),
+                size_usd=round(shares * ask, 2),
+                shares=shares,
+            )
+        return best
 
     def run_forever(self) -> None:
         log.info("Desk kjører. DRY_RUN=%s interval=%ss", settings.dry_run, settings.loop_seconds)

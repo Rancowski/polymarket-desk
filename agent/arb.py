@@ -214,7 +214,7 @@ class Arb:
             if not cid or cid in open_ids or not ks:
                 continue
             gap = float(ks.get("gap") or 0)
-            if abs(gap) < 0.07:
+            if abs(gap) < 0.04:
                 continue
             # gap = poly_yes - kalshi_yes. Poly dyr YES → kjøp NO.
             side = "NO" if gap > 0 else "YES"

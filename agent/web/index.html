@@ -232,7 +232,7 @@
       const next = c && c.ts ? new Date(new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000) : null;
       const rejects = (st.top_rejects || []).slice(0, 2).map((r) => `${r.n}× ${r.reason}`).join(" · ");
       $("cycle").textContent = c
-        ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
+        ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
         : "Venter på første syklus.";
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;
