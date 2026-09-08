@@ -321,7 +321,15 @@ class Store:
         self.set_meta(f"bad:{condition_id}", reason or "1")
 
     def is_bad_market(self, condition_id: str) -> bool:
-        return bool(condition_id) and bool(self.get_meta(f"bad:{condition_id}"))
+        if not condition_id:
+            return False
+        raw = self.get_meta(f"bad:{condition_id}")
+        if not raw:
+            return False
+        low = raw.lower()
+        if any(x in low for x in ("order_type", "unexpected keyword", "typeerror")):
+            return False
+        return True
 
     def xai_prepaid_usd(self) -> float:
         raw = self.get_meta("xai_prepaid_usd", "")

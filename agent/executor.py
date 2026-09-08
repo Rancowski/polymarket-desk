@@ -29,6 +29,26 @@ def _tick_literal(raw: Any) -> str:
     return "0.01"
 
 
+def _place_limit(client: Any, args: Any, tick_s: str, neg: bool) -> Any:
+    """Kall create_and_post_order med den signaturen denne SDK-versjonen faktisk har."""
+    import inspect
+
+    from py_clob_client.clob_types import PartialCreateOrderOptions
+
+    options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
+    fn = client.create_and_post_order
+    names = list(inspect.signature(fn).parameters)
+    log.info("CLOB create_and_post_order(%s) tick=%s neg=%s", names, tick_s, neg)
+    if "order_type" in names:
+        from py_clob_client.clob_types import OrderType
+
+        return fn(args, options, OrderType.GTC)
+    try:
+        return fn(args, options)
+    except TypeError:
+        return fn(args)
+
+
 def _amount_size(price: float, size: float) -> float:
     """CLOB krever at price*size i 1e6-enheter går opp. 10 andeler på tick-pris er trygt."""
     import math
@@ -235,7 +255,7 @@ class Executor:
             return {"status": "paper", "ticket": payload}
 
         client = self._live_client()
-        from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+        from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import BUY
 
         token = str(ticket.token_id or "").strip()
@@ -274,27 +294,25 @@ class Executor:
         last_err: Exception | None = None
         signed = None
         for nflag in (neg, (not neg)):
-            options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=nflag)
             try:
-                signed = client.create_and_post_order(args, options, OrderType.GTC)
+                signed = _place_limit(client, args, tick_s, nflag)
                 last_err = None
                 log.info("LIVE ORDER ok neg=%s %s", nflag, signed)
                 break
-            except TypeError:
-                try:
-                    signed = client.create_and_post_order(
-                        args, options={"tick_size": tick_s, "neg_risk": nflag}, order_type=OrderType.GTC
-                    )
-                    last_err = None
-                    break
-                except Exception as exc:
-                    last_err = exc
+            except TypeError as exc:
+                last_err = exc
+                log.warning("SDK-signatur: %s", exc)
             except Exception as exc:
                 last_err = exc
                 log.warning("Ordre avvist neg=%s tick=%s: %s", nflag, tick_s, exc)
+                if "invalid order" in str(exc).lower() or "invalid" in str(exc).lower():
+                    continue
+                break
         if last_err is not None:
-            self.store.mark_bad_market(ticket.condition_id, str(last_err)[:120])
-            raise RuntimeError(f"Invalid/avvist ordre: {last_err}") from last_err
+            msg = str(last_err)
+            if "unexpected keyword" not in msg and "order_type" not in msg and "TypeError" not in type(last_err).__name__:
+                self.store.mark_bad_market(ticket.condition_id, msg[:120])
+            raise RuntimeError(f"CLOB-ordre feilet: {msg}") from last_err
         if isinstance(signed, dict):
             err = str(signed.get("error") or signed.get("errorMsg") or signed.get("msg") or "")
             ok = signed.get("success", True)
@@ -307,7 +325,7 @@ class Executor:
             size=size,
             cost=round(price * size, 2),
             dry_run=False,
-            raw={"order": str(signed), **payload, "tick": tick},
+            raw={"order": str(signed), **payload, "tick": tick_s, "neg_risk": neg},
         )
         self.store.upsert_position(
             condition_id=ticket.condition_id,
