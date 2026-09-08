@@ -10,6 +10,40 @@ from agent.store import Store
 log = logging.getLogger("exec")
 
 
+def _as_float(value: Any) -> float:
+    if value is None or value is False:
+        return 0.0
+    try:
+        return float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_balance(raw: Any) -> float:
+    """CLOB returnerer pUSD i wei (1e6) eller allerede i dollar."""
+    if raw is None:
+        return 0.0
+    data: Any = raw
+    if not isinstance(data, dict):
+        if hasattr(raw, "balance"):
+            data = {"balance": getattr(raw, "balance")}
+        else:
+            data = getattr(raw, "__dict__", None) or {}
+    if not isinstance(data, dict):
+        return 0.0
+    candidate: Any = (
+        data.get("balance")
+        or data.get("collateral")
+        or data.get("available")
+    )
+    if candidate in (None, "", 0, "0") and isinstance(data.get("balances"), dict):
+        candidate = data["balances"].get("COLLATERAL")
+    wei = _as_float(candidate)
+    if wei <= 0:
+        return 0.0
+    return wei / 1e6 if wei >= 1000 else wei
+
+
 class Executor:
     def __init__(self, store: Store) -> None:
         self.store = store
@@ -65,22 +99,33 @@ class Executor:
     def bankroll(self) -> float:
         if settings.dry_run or not settings.private_key:
             return settings.paper_bankroll_usd
+        parsed = 0.0
         try:
             client = self._live_client()
             if hasattr(client, "get_balance_allowance"):
-                try:
-                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
-                    bal = client.get_balance_allowance(
-                        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                try:
+                    params = BalanceAllowanceParams(
+                        asset_type=AssetType.COLLATERAL,
+                        signature_type=settings.signature_type,
                     )
-                    if isinstance(bal, dict):
-                        raw = bal.get("balance") or bal.get("collateral") or 0
-                        return float(raw) / (1e6 if float(raw) > 10000 else 1)
-                except Exception:
-                    pass
+                except TypeError:
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                bal = client.get_balance_allowance(params)
+                log.info("Balanse raw=%s", bal)
+                parsed = _parse_balance(bal)
         except Exception as exc:
-            log.warning("Live balanse feilet, bruker paper-bankroll: %s", exc)
+            log.warning("Live balanse feilet: %s", exc)
+        if parsed > 0:
+            log.info("Live bankroll=%.2f pUSD", parsed)
+            return parsed
+        log.warning(
+            "CLOB sa 0 pUSD (du har sannsynligvis feil POLYMARKET_FUNDER — "
+            "bruk innskuddsadressen under Cash/Deposit, ikke Profile «API use only»). "
+            "Bruker PAPER_BANKROLL_USD=%.2f",
+            settings.paper_bankroll_usd,
+        )
         return settings.paper_bankroll_usd
 
     def submit(self, ticket: Ticket) -> dict:
