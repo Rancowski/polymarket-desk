@@ -332,7 +332,7 @@ class Desk:
             for _gap, m, est in ranked[:4]:
                 book = m.get("book") or {}
                 ticket, why = self.risk.evaluate(
-                    m, book, est, bankroll, equity, min_edge=-1.0, probe=True
+                    m, book, est, bankroll, equity, min_edge=0.0, probe=True
                 )
                 if not ticket:
                     continue

@@ -130,10 +130,10 @@ class Risk:
         edge_gross = p_hat - cost
         edge_net = edge_gross - fee_frac - settings.model_haircut
         need = settings.min_net_edge if min_edge is None else min_edge
-        if (not probe) and edge_net < need:
+        if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
-        if (not probe) and cost >= 0.82 and edge_net < max(need * 2, 0.04):
-            return None, f"favoritt-sone kost {cost:.2f} krever mer edge"
+        if cost <= 0.12 or cost >= 0.88:
+            return None, "nær resolusjon"
 
         open_pos = self.store.positions("open")
         if any(p["condition_id"] == market["condition_id"] for p in open_pos):

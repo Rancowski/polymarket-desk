@@ -222,77 +222,32 @@ class Executor:
             return {"status": "paper", "ticket": payload}
 
         client = self._live_client()
-        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+        from py_clob_client.clob_types import OrderArgs
         from py_clob_client.order_builder.constants import BUY
 
-        token = str(ticket.token_id or "")
-        if not token:
-            raise RuntimeError("mangler token_id")
-        tick, neg = _clob_meta(token)
-        tick_s = _tick_str(tick)
-        if hasattr(client, "get_tick_size"):
-            try:
-                raw_tick = client.get_tick_size(token)
-                if raw_tick:
-                    tick_s = str(raw_tick)
-                    tick = float(raw_tick)
-            except Exception:
-                pass
-        if hasattr(client, "get_neg_risk"):
-            try:
-                neg = bool(client.get_neg_risk(token))
-            except Exception:
-                pass
-        fee = 0
-        if hasattr(client, "get_fee_rate_bps"):
-            try:
-                fee = int(client.get_fee_rate_bps(token) or 0)
-            except Exception:
-                pass
+        token = str(ticket.token_id or "").strip()
+        if not token or not token.isdigit():
+            self.store.mark_bad_market(ticket.condition_id, "bad token")
+            raise RuntimeError("ugyldig token_id")
+        tick = 0.01
+        try:
+            if hasattr(client, "get_tick_size"):
+                tick = float(client.get_tick_size(token) or 0.01)
+        except Exception as exc:
+            log.warning("get_tick_size: %s", exc)
         price = _quantize(float(ticket.limit_price), tick)
-        size = round(max(5.0, float(ticket.shares)), 2)
-        log.info("Post ordre token=%s px=%s sz=%s tick=%s neg=%s fee=%s", token[:18], price, size, tick, neg, fee)
-        kwargs: dict[str, Any] = {
-            "token_id": token,
-            "price": price,
-            "size": size,
-            "side": BUY,
-        }
+        size = float(max(5, round(float(ticket.shares), 2)))
+        log.info("CLOB buy token=%s… px=%s sz=%s tick=%s", token[:12], price, size, tick)
         try:
-            args = OrderArgs(**kwargs, fee_rate_bps=fee)
+            args = OrderArgs(token_id=token, price=price, size=size, side=BUY)
         except TypeError:
-            args = OrderArgs(**kwargs)
-        signed = None
-        last_err: Exception | None = None
-        order_type = None
+            args = OrderArgs(token_id=token, price=price, size=size, side="BUY")
         try:
-            from py_clob_client.clob_types import OrderType
-            order_type = OrderType.GTC
-        except Exception:
-            order_type = None
-        for nflag in (neg, (not neg)):
-            try:
-                options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=nflag)
-                if hasattr(client, "create_and_post_order"):
-                    if order_type is not None:
-                        try:
-                            signed = client.create_and_post_order(args, options, order_type)
-                        except TypeError:
-                            signed = client.create_and_post_order(args, options)
-                    else:
-                        signed = client.create_and_post_order(args, options)
-                else:
-                    order = client.create_order(args, options)
-                    signed = client.post_order(order)
-                last_err = None
-                log.info("LIVE ORDER ok neg=%s %s", nflag, signed)
-                break
-            except Exception as exc:
-                last_err = exc
-                log.warning("Ordre avvist neg=%s: %s", nflag, exc)
-        if last_err is not None:
-            self.store.mark_bad_market(ticket.condition_id, str(last_err)[:120])
-            raise RuntimeError(f"Invalid/avvist ordre: {last_err}") from last_err
+            signed = client.create_and_post_order(args)
+        except Exception as exc:
+            self.store.mark_bad_market(ticket.condition_id, str(exc)[:120])
+            raise RuntimeError(f"Invalid/avvist ordre: {exc}") from exc
+        log.info("LIVE ORDER %s", signed)
         if isinstance(signed, dict):
             err = str(signed.get("error") or signed.get("errorMsg") or signed.get("msg") or "")
             ok = signed.get("success", True)
