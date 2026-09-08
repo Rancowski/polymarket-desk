@@ -90,9 +90,43 @@ SPORTS_HINTS = (
     "match winner",
     "gamerlegion",
     "furia",
+    "forti",
+    "map 1",
+    "map 2",
+    "map 3",
+    "bo3",
+    "bo5",
     " vs ",
     "-vs-",
 )
+
+
+def _live_bid(book: dict | None, pos: dict) -> float:
+    """Ekte bud. Aldri avg_cost. Syntetisk bok teller som 0."""
+    book = book or {}
+    if not book.get("synthetic"):
+        try:
+            bid = float(book.get("best_bid") or 0)
+        except (TypeError, ValueError):
+            bid = 0.0
+        if bid > 0:
+            return bid
+    try:
+        cur = float(pos.get("cur_price") or 0)
+    except (TypeError, ValueError):
+        cur = 0.0
+    if 0 < cur < 0.99:
+        return cur
+    try:
+        shares = float(pos.get("shares") or 0)
+        cv = float(pos.get("current_value") or 0)
+        if shares > 0 and cv > 0:
+            implied = cv / shares
+            if 0 < implied < 0.99:
+                return implied
+    except (TypeError, ValueError):
+        pass
+    return 0.0
 
 
 def is_sports(row: dict) -> bool:
@@ -294,34 +328,36 @@ class Risk:
             return None, "tom posisjon"
         cid = pos.get("condition_id")
         side = str(pos.get("side") or "YES").upper()
+        sports = is_sports(pos)
+        bid = _live_bid(book, pos)
+        # Aldri fall tilbake til avg — da ser Forti 0.1¢ ut som 0 % PnL.
+        if bid <= 0.03:
+            px = bid if bid > 0 else 0.001
+            return self._exit_ticket(pos, book, shares, px, f"død / bud {px:.4f}"), "ok"
         counterparts = [
             p for p in self.store.positions("open")
             if p.get("condition_id") == cid and str(p.get("side") or "").upper() != side
         ]
         if counterparts:
             return None, "complement-hold"
-        mid = float(book.get("mid") or avg)
-        best_bid = float(book.get("best_bid") or mid)
-        if best_bid <= 0:
-            return None, "ingen bud"
-        pnl_pct = (best_bid - avg) / avg
-        sports = is_sports(pos)
+        pnl_pct = (bid - avg) / avg if avg else 0.0
+        mid = float((book or {}).get("mid") or bid)
 
-        if sports and pnl_pct <= -0.15:
-            return self._exit_ticket(pos, book, shares, best_bid, f"sports stopp-tap {pnl_pct:.1%}"), "ok"
+        if sports and (bid <= avg * 0.85 or pnl_pct <= -0.15):
+            return self._exit_ticket(pos, book, shares, bid, f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}"), "ok"
         if not sports and pnl_pct <= -0.25:
-            return self._exit_ticket(pos, book, shares, best_bid, f"stopp-tap {pnl_pct:.1%}"), "ok"
-        if sports and (best_bid >= 0.88 or pnl_pct >= 0.22):
-            return self._exit_ticket(pos, book, shares, best_bid, f"sports ta gevinst {pnl_pct:.1%}"), "ok"
-        if not sports and best_bid >= 0.93:
-            return self._exit_ticket(pos, book, shares, best_bid, "nær resolusjon — ta gevinst"), "ok"
+            return self._exit_ticket(pos, book, shares, bid, f"stopp-tap {pnl_pct:.1%} bid {bid:.3f}"), "ok"
+        if sports and (bid >= 0.88 or pnl_pct >= 0.22):
+            return self._exit_ticket(pos, book, shares, bid, f"sports ta gevinst {pnl_pct:.1%} bid {bid:.3f}"), "ok"
+        if not sports and bid >= 0.93:
+            return self._exit_ticket(pos, book, shares, bid, f"ta gevinst bid {bid:.3f}"), "ok"
 
         ks = kalshi or {}
         k_yes = float(ks.get("yes") or 0)
         if 0.02 < k_yes < 0.98:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
             if k_hat + 0.06 < avg:
-                return self._exit_ticket(pos, book, shares, best_bid, f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}"), "ok"
+                return self._exit_ticket(pos, book, shares, bid, f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}"), "ok"
 
         if estimate and not estimate.get("skip"):
             try:
@@ -330,16 +366,21 @@ class Risk:
                 p_yes = None
             if p_yes is not None:
                 p_hat = p_yes if side == "YES" else 1.0 - p_yes
-                # Selg hvis fersk p_hat er ≥3c under kost. Ikke selg bare fordi Grok falt til mid.
                 faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
                 if p_hat + 0.03 <= avg and not faded_to_mid:
                     return self._exit_ticket(
-                        pos, book, shares, best_bid, f"p_hat {p_hat:.2f} ≥3c under kost {avg:.2f}"
+                        pos, book, shares, bid, f"p_hat {p_hat:.2f} ≥3c under kost {avg:.2f}"
                     ), "ok"
-        return None, "hold"
+        return None, f"hold bid {bid:.3f} pnl {pnl_pct:.1%}"
 
     def _exit_ticket(self, pos: dict, book: dict, shares: float, price: float, reason: str) -> dict:
-        px = round(min(0.99, max(0.01, price)), 2)
+        px = float(price or 0)
+        tick = 0.001 if px < 0.10 else 0.01
+        if px < tick:
+            px = tick
+        else:
+            px = int(px / tick) * tick
+        px = round(max(tick, min(0.99, px)), 4)
         return {
             "condition_id": pos["condition_id"],
             "question": pos.get("question"),
@@ -349,7 +390,7 @@ class Risk:
             "token_id": pos.get("token_id"),
             "shares": round(shares, 2),
             "limit_price": px,
-            "size_usd": round(shares * px, 2),
+            "size_usd": round(shares * px, 4),
             "reason": reason,
             "action": "sell",
         }

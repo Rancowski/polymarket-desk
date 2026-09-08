@@ -14,100 +14,91 @@
       --border: color-mix(in oklab, #e8eeea 12%, transparent);
       --gain: #3d9b78; --loss: #c45c4a; --warn: #c4a35a; --primary: #d7e0dc;
     }
-    * { box-sizing: border-box; border-color: var(--border); }
+    * { box-sizing: border-box; }
     html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg);
       font-family: "IBM Plex Sans", system-ui, sans-serif; }
-    button { font: inherit; cursor: pointer; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
     button:disabled { opacity: .45; cursor: not-allowed; }
-    .wrap { max-width: 72rem; margin: 0 auto; padding: 0 1rem 6rem; }
+    .wrap { max-width: 42rem; margin: 0 auto; padding: 0 1rem 5rem; }
     header { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(12px);
       background: color-mix(in oklab, var(--bg) 92%, transparent); border-bottom: 1px solid var(--border); }
     header .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-      gap: .75rem; padding: .85rem 0; }
-    .brand { display: flex; align-items: center; gap: .75rem; min-width: 0; }
-    .mark { width: 2rem; height: 2rem; border-radius: .6rem; background: var(--raised);
-      border: 1px solid var(--border); display: grid; place-items: center; font-weight: 600; }
-    .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: .7rem; letter-spacing: .16em;
+      gap: .5rem; padding: .7rem 0; }
+    h1 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+    .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: .65rem; letter-spacing: .14em;
       text-transform: uppercase; color: var(--muted); margin: 0; }
-    h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
-    .pills { display: flex; flex-wrap: wrap; gap: .4rem; }
-    .pill { font-family: "IBM Plex Mono", monospace; font-size: .72rem; border: 1px solid var(--border);
-      border-radius: 999px; padding: .4rem .75rem; display: inline-flex; align-items: center; gap: .4rem; }
+    .pills { display: flex; flex-wrap: wrap; gap: .35rem; }
+    .pill { font-family: "IBM Plex Mono", monospace; font-size: .7rem; border: 1px solid var(--border);
+      border-radius: 999px; padding: .35rem .7rem; display: inline-flex; align-items: center; gap: .35rem; }
     .dot { width: .4rem; height: .4rem; border-radius: 99px; background: var(--subtle); }
     .on .dot { background: var(--gain); } .off .dot { background: var(--loss); }
-    .on { color: var(--gain); border-color: color-mix(in oklab, var(--gain) 40%, transparent); }
-    .off { color: var(--loss); border-color: color-mix(in oklab, var(--loss) 40%, transparent); }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .5rem; margin-top: 1rem; }
-    @media (min-width: 700px) { .grid { grid-template-columns: repeat(4, minmax(0,1fr)); } }
-    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 1rem; padding: .9rem 1rem; }
-    .stat span { display: block; color: var(--muted); font-size: .75rem; }
-    .stat strong { display: block; margin-top: .2rem; font-size: 1.15rem; font-variant-numeric: tabular-nums; }
-    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; margin-top: 1rem; }
-    @media (min-width: 700px) { .actions { display: flex; flex-wrap: wrap; } }
-    .btn { min-height: 2.75rem; border-radius: .7rem; border: 1px solid var(--border);
+    .on { color: var(--gain); } .off { color: var(--loss); }
+    .err-line { color: var(--loss); font-size: .8rem; margin: 0 0 .4rem; min-height: 1.1em; }
+    .grid4 { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; margin-top: .75rem; }
+    @media (min-width: 640px) { .grid4 { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: .85rem; padding: .75rem .85rem; }
+    .stat span { display: block; color: var(--muted); font-size: .72rem; }
+    .stat strong { display: block; margin-top: .15rem; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; margin-top: .75rem; }
+    @media (min-width: 640px) { .actions { display: flex; flex-wrap: wrap; } }
+    .btn { min-height: 44px; border-radius: .7rem; border: 1px solid var(--border);
       background: var(--raised); color: var(--fg); padding: 0 1rem; font-weight: 500; }
     .btn.primary { background: var(--primary); color: var(--bg); border-color: transparent; }
     .btn.danger { background: color-mix(in oklab, var(--loss) 18%, var(--surface)); color: var(--loss);
       border-color: color-mix(in oklab, var(--loss) 35%, transparent); }
-    .tabs { display: flex; gap: .25rem; margin-top: 1.25rem; border-bottom: 1px solid var(--border); }
-    .tabs button { background: none; border: 0; color: var(--muted); padding: .7rem .9rem; }
-    .tabs button.active { color: var(--fg); box-shadow: inset 0 -2px 0 var(--primary); }
-    .panel { margin-top: 1rem; }
-    .row-item { background: var(--surface); border: 1px solid var(--border); border-radius: .85rem;
-      padding: .85rem 1rem; margin-bottom: .5rem; }
-    .q { font-size: .92rem; margin: 0 0 .35rem; }
-    .meta { font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--muted); }
+    h2 { font-size: .78rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--muted); margin: 1.25rem 0 .5rem; }
+    .pos { background: var(--surface); border: 1px solid var(--border); border-radius: .85rem;
+      padding: .85rem 1rem; margin-bottom: .45rem; }
+    .pos .q { font-size: .95rem; margin: 0 0 .3rem; }
+    .pos .meta { font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--muted); line-height: 1.45; }
     .gain { color: var(--gain); } .loss { color: var(--loss); }
-    .empty { color: var(--muted); padding: 1.5rem 0; }
-    .err { margin-top: .75rem; padding: .75rem 1rem; border-radius: .75rem;
-      border: 1px solid color-mix(in oklab, var(--loss) 30%, transparent);
-      background: color-mix(in oklab, var(--loss) 10%, transparent); color: var(--loss); font-size: .9rem; }
-    svg.spark { width: 100%; height: 88px; margin-top: 1rem; }
-    .note { color: var(--subtle); font-size: .78rem; margin-top: .75rem; line-height: 1.45; }
-    .cap { display: grid; gap: .5rem; grid-template-columns: 1fr; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
-    @media (min-width: 700px) { .cap { grid-template-columns: 1fr 1fr auto; align-items: end; } }
+    .hint { font-size: .75rem; margin-top: .25rem; color: var(--warn); }
+    .empty { color: var(--muted); padding: .5rem 0 1rem; }
+    .cycle { color: var(--subtle); font-size: .75rem; margin: .6rem 0 0; line-height: 1.4; font-family: "IBM Plex Mono", monospace; }
+    .tabs { display: flex; gap: .15rem; margin-top: 1.1rem; border-bottom: 1px solid var(--border); overflow-x: auto; }
+    .tabs button { background: none; border: 0; color: var(--muted); padding: .75rem .85rem; min-height: 44px; }
+    .tabs button.active { color: var(--fg); box-shadow: inset 0 -2px 0 var(--primary); }
+    .row-item { background: var(--surface); border: 1px solid var(--border); border-radius: .75rem;
+      padding: .75rem .9rem; margin-bottom: .4rem; }
+    .cap { display: grid; gap: .5rem; grid-template-columns: 1fr; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+    @media (min-width: 640px) { .cap { grid-template-columns: 1fr 1fr auto; align-items: end; } }
     .cap label { display: block; color: var(--muted); font-size: .75rem; margin-bottom: .25rem; }
-    .rules { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .4rem; margin-top: 1rem; }
-    @media (min-width: 700px) { .rules { grid-template-columns: repeat(4, minmax(0,1fr)); } }
-    .rules div { font-size: .75rem; color: var(--muted); background: var(--surface); border: 1px solid var(--border);
-      border-radius: .75rem; padding: .65rem .8rem; }
-    .rules strong { display: block; color: var(--fg); font-size: .88rem; margin-top: .15rem; font-variant-numeric: tabular-nums; }
+    .cap input { min-height: 44px; width: 100%; border-radius: .6rem; border: 1px solid var(--border);
+      background: var(--raised); color: var(--fg); padding: 0 .7rem; }
   </style>
 </head>
 <body>
   <header>
     <div class="wrap">
       <div class="row">
-        <div class="brand">
-          <div class="mark">F</div>
-          <div>
-            <p class="eyebrow">Prediksjonsdesk</p>
-            <h1>Fjord</h1>
-          </div>
+        <div>
+          <p class="eyebrow">Prediksjonsdesk</p>
+          <h1>Fjord</h1>
         </div>
         <div class="pills" id="pills"></div>
       </div>
+      <p class="err-line" id="errLine"></p>
     </div>
   </header>
   <main class="wrap">
-    <div class="grid" id="stats"></div>
+    <div class="grid4" id="stats"></div>
     <div class="actions">
       <button class="btn primary" id="btnOn" type="button">Slå på</button>
       <button class="btn danger" id="btnOff" type="button">Slå av</button>
       <button class="btn" id="btnOnce" type="button">Kjør én syklus</button>
       <button class="btn" id="btnUpd" type="button">Oppdater agent</button>
     </div>
-    <div id="err"></div>
-    <svg class="spark" id="spark" viewBox="0 0 320 88" preserveAspectRatio="none"></svg>
-    <p class="note" id="cycle"></p>
-    <div class="rules" id="rules"></div>
+    <h2>Posisjoner</h2>
+    <div id="positions"></div>
+    <p class="cycle" id="cycle"></p>
     <div class="tabs">
-      <button class="active" data-tab="pos" type="button">Posisjoner</button>
-      <button data-tab="log" type="button">Logg</button>
+      <button class="active" data-tab="log" type="button">Logg</button>
       <button data-tab="fill" type="button">Fills</button>
       <button data-tab="rules" type="button">Regler</button>
     </div>
-    <div class="panel" id="panel"></div>
+    <div id="panel"></div>
     <form class="cap" id="cap">
       <div>
         <label for="dep">Innskutt på Polymarket (USD)</label>
@@ -121,16 +112,27 @@
     </form>
   </main>
   <script>
-    let tab = "pos";
+    let tab = "log";
     let state = null;
     const tokenKey = "fjord_token";
     const $ = (id) => document.getElementById(id);
     const token = () => sessionStorage.getItem(tokenKey) || new URLSearchParams(location.search).get("token") || "";
     const usd = (n) => (Number(n) || 0).toLocaleString("nb-NO", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+    const signed = (n) => (n > 0.004 ? "+" : n < -0.004 ? "\u2212" : "") + usd(Math.abs(n));
+    const pctn = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)} %`;
     const clock = (iso) => {
       if (!iso) return "—";
       const d = new Date(iso);
       return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("nb-NO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    };
+    const age = (iso) => {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const h = Math.max(0, (Date.now() - d.getTime()) / 3600000);
+      if (h < 1) return `${Math.round(h * 60)} min`;
+      if (h < 48) return `${h.toFixed(1)} t`;
+      return `${Math.round(h / 24)} d`;
     };
     async function api(path, method, body) {
       const headers = {};
@@ -153,20 +155,6 @@
       }
       return data;
     }
-    function pills(s) {
-      const live = s.dry_run ? "Paper" : "Live";
-      const on = !s.halted;
-      const kalshi = s.last_cycle && s.last_cycle.kalshi != null ? s.last_cycle.kalshi : null;
-      const rel = (s.version && s.version.release) || "";
-      $("pills").innerHTML =
-        `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? (s.dry_run ? "Paper på" : "Live") : "Stoppet"}</span>` +
-        `<span class="pill">${live}</span>` +
-        (s.busy ? `<span class="pill">Kjører syklus…</span>` : "") +
-        (kalshi != null ? `<span class="pill">Kalshi ${kalshi}</span>` : "") +
-        (rel ? `<span class="pill">${rel}</span>` : "");
-    }
-    const signed = (n) => (n > 0.004 ? "+" : n < -0.004 ? "\u2212" : "") + usd(Math.abs(n));
-    const pctn = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)} %`;
     function countdown(s) {
       const c = s && s.last_cycle;
       if (!c || !c.ts) return "—";
@@ -174,83 +162,62 @@
       const next = new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000;
       let sec = Math.round((next - Date.now()) / 1000);
       if (sec < 0) sec = 0;
-      const m = Math.floor(sec / 60);
-      const r = sec % 60;
-      return `${m}m ${String(r).padStart(2, "0")}s`;
+      return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
     }
-    function cycleLine(s, rejects) {
-      const c = s.last_cycle;
-      if (!c) return "Venter på første syklus.";
-      const xai = Number(c.xai_usd || 0);
-      const extra = rejects || (s.stats && (s.stats.top_rejects || []).slice(0, 2).map((r) => `${r.n}× ${r.reason}`).join(" · ")) || "";
-      return `Siste ${clock(c.ts)} · neste ${countdown(s)} · skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · arb ${c.arb || 0} · kalshi ${c.kalshi || 0} treff · solgt ${c.exits || 0} · avvist ${c.rejected || 0} · xAI ${usd(xai)}${extra ? " · " + extra : ""}`;
-    }
-    function lastRealFill(s) {
-      const fills = s.fills || [];
-      return fills.find((f) => !f.dry_run) || null;
+    function pills(s) {
+      const on = !s.halted;
+      const mode = s.dry_run ? "Paper" : "Live";
+      const rel = (s.version && s.version.release) || "";
+      $("pills").innerHTML =
+        `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? mode : "Stoppet"}</span>` +
+        (s.busy ? `<span class="pill">Syklus…</span>` : `<span class="pill">neste ${countdown(s)}</span>`) +
+        (rel ? `<span class="pill">${rel}</span>` : "");
     }
     function stats(s) {
       const st = s.stats || {};
+      const pnl = st.total || 0;
       const tone = (n) => (n > 0.004 ? "gain" : n < -0.004 ? "loss" : "");
-      const lastFill = lastRealFill(s);
       const cards = [
         ["Egenkapital", usd(s.equity), ""],
         ["Ledig", usd(st.cash != null ? st.cash : s.bankroll), ""],
-        ["Avkastning", `${signed(st.total || 0)} (${pctn(st.total_pct || 0)})`, tone(st.total || 0)],
-        ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
-        ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
-        ["Etter xAI", signed(st.after_xai || 0), tone(st.after_xai || 0)],
-        ["Maks tap", `${signed(st.max_dd_usd || 0)} (${pctn(st.max_dd_pct || 0)})`, (st.max_dd_usd || 0) < -0.004 ? "loss" : ""],
-        ["Innskutt", usd(st.deposited || 0), ""],
-        ["I markedet", `${s.open} · ${usd(st.open_cost || 0)} kost`, ""],
-        ["Siste fill", lastFill ? `${lastFill.side} ${usd(lastFill.cost)}` : "ingen", ""],
-        ["xAI i dag", usd(st.xai_day || 0), ""],
-        ["xAI brukt", usd(st.xai_total || 0), ""],
-        ["xAI igjen", s.xai_remaining == null ? "fyll inn under" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
+        ["PnL vs innskutt", `${signed(pnl)} (${pctn(st.total_pct || 0)})`, tone(pnl)],
+        ["xAI igjen", s.xai_remaining == null ? "fyll inn" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
       ];
       $("stats").innerHTML = cards.map(([l, v, c]) =>
         `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
       ).join("");
     }
-    function spark(hist) {
-      const el = $("spark");
-      if (!hist || hist.length < 2) { el.innerHTML = ""; return; }
-      const vals = hist.map((h) => Number(h.equity) || 0).filter((v, i, a) => {
-        const med = a[Math.floor(a.length / 2)] || v;
-        return med < 1 || Math.abs(v - med) / med < 0.2;
-      });
-      if (vals.length < 2) { el.innerHTML = ""; return; }
-      const min = Math.min(...vals), max = Math.max(...vals);
-      const span = max - min || 1;
-      const pts = vals.map((v, i) => {
-        const x = (i / (vals.length - 1)) * 320;
-        const y = 80 - ((v - min) / span) * 68;
-        return `${x},${y}`;
-      }).join(" ");
-      el.innerHTML = `<polyline fill="none" stroke="#3d9b78" stroke-width="2" points="${pts}" />`;
+    function renderPositions(s) {
+      const el = $("positions");
+      const rows = (s.positions || []).slice().sort((a, b) => Math.abs(b.upnl || 0) - Math.abs(a.upnl || 0));
+      if (!rows.length) { el.innerHTML = `<p class="empty">Ingen åpne posisjoner.</p>`; return; }
+      el.innerHTML = rows.map((p) => {
+        const shares = Number(p.shares) || 0;
+        const avg = Number(p.avg_cost) || 0;
+        const cost = Number(p.cost) || shares * avg;
+        const mtm = Number(p.current_value);
+        const hasMtm = Number.isFinite(mtm) && mtm > 0;
+        const upnlUsd = p.upnl != null ? Number(p.upnl) : (hasMtm ? mtm - cost : null);
+        const upnlPct = hasMtm && cost > 0 ? (mtm - cost) / cost : null;
+        const mid = Number(p.cur_price);
+        const label = p.outcome && p.outcome !== p.side ? `${p.outcome} (${p.side})` : (p.side || "");
+        const tone = upnlUsd != null ? (upnlUsd > 0.004 ? "gain" : upnlUsd < -0.004 ? "loss" : "") : "";
+        const hint = p.exit_action
+          ? `<div class="hint">${p.exit_action}${p.exit_reason ? " · " + p.exit_reason : ""}</div>`
+          : "";
+        return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
+          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${hint}</div>`;
+      }).join("");
+    }
+    function cycleLine(s) {
+      const c = s.last_cycle;
+      if (!c) return "Venter på første syklus.";
+      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0} · xAI ${usd(c.xai_usd || 0)}`;
     }
     function renderPanel(s) {
       const el = $("panel");
-      if (tab === "pos") {
-        if (!s.positions.length) { el.innerHTML = `<p class="empty">Ingen åpne posisjoner.</p>`; return; }
-        el.innerHTML = s.positions.map((p) => {
-          const shares = Number(p.shares) || 0;
-          const avg = Number(p.avg_cost) || 0;
-          const cost = Number(p.cost) || shares * avg;
-          const mtm = Number(p.current_value);
-          const hasMtm = Number.isFinite(mtm) && mtm > 0;
-          const upnlPct = hasMtm && cost > 0 ? (mtm - cost) / cost : null;
-          const upnlUsd = p.upnl != null ? Number(p.upnl) : (hasMtm ? mtm - cost : null);
-          const mid = Number(p.cur_price);
-          const label = p.outcome && p.outcome !== p.side ? `${p.outcome} (${p.side})` : (p.side || "");
-          const upnlTone = upnlUsd != null ? (upnlUsd > 0.004 ? "gain" : upnlUsd < -0.004 ? "loss" : "") : "";
-          return `<div class="row-item"><p class="q">${p.question || ""}</p>
-           <div class="meta ${upnlTone}">${label} · ${shares.toFixed(2)} andeler · snitt ${avg.toFixed(2)} · mid ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(2) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · uPnL ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${p.category || ""}</div></div>`;
-        }).join("");
-        return;
-      }
       if (tab === "fill") {
-        if (!s.fills.length) { el.innerHTML = `<p class="empty">Ingen fills ennå.</p>`; return; }
+        if (!s.fills.length) { el.innerHTML = `<p class="empty">Ingen fills.</p>`; return; }
         el.innerHTML = s.fills.map((f) =>
           `<div class="row-item"><p class="q">${f.side} ${usd(f.cost)}</p>
            <div class="meta">${clock(f.ts)} · ${Number(f.size).toFixed(2)} @ ${Number(f.price).toFixed(3)} ${f.dry_run ? "· paper" : "· live"}</div></div>`
@@ -258,24 +225,19 @@
         return;
       }
       if (tab === "rules") {
-        const r = s.rules || {};
         el.innerHTML = [
-          ["Modus", r.live ? "Live pUSD" : "Paper"],
-          ["Syklus", `${r.loop_min || 15} min`],
-          ["Min. nettokant", `${((r.min_net_edge || 0) * 100).toFixed(1)} %`],
-          ["Maks posisjon", `${((r.max_pos_pct || 0) * 100).toFixed(0)} % av bankroll`],
-          ["Kelly", String(r.kelly ?? "—")],
-          ["Maks åpne", String(r.max_open ?? "—")],
-          ["Grok", r.grok || "—"],
-          ["Kalshi", r.kalshi ? "På (pris-signal, ingen konto)" : "Av"],
-          ["Signature", String(r.sig ?? "—")],
-          ["Grok-batch", String(r.batch ?? "—")],
+          ["Kjøp", "FAK. Complement YES+NO < 0,982, så locked, så Kalshi-gap ≥ 4 ¢, så Grok kun ved netto kant etter gebyr."],
+          ["Sports", "Maks 1 åpen. Pris 0,22–0,78. Stopp bud ≤ 85 % av snitt eller bud ≤ 0,03. Ta gevinst +22 % eller bud ≥ 0,88."],
+          ["Andre", "Stopp −25 %. Ta gevinst bud ≥ 0,93. Selg om Kalshi er ≥ 6 ¢ mot kost, eller fersk p_hat ≥ 3 ¢ under kost."],
+          ["Ikke selg", "Ikke fordi Grok falt til mid. Hedge YES+NO i samme marked holdes."],
+          ["Størrelse", "Av innskutt og ledig CLOB-cash. Ett event, ett ticket."],
+          ["Kalshi", "Kun navngitte serier. 25 = 25 bps, ikke 4,25 %. 70/30 blend ved gap ≥ 4 ¢."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;
       }
-      if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen beslutninger ennå.</p>`; return; }
+      if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen logg ennå.</p>`; return; }
       el.innerHTML = s.decisions.map((d) => {
-        const tone = (d.action === "live" || d.action === "paper") ? "gain" : "";
+        const tone = (d.action === "sell" || d.action === "live" || d.action === "paper") ? "gain" : (d.action === "error" || d.action === "selling" ? "loss" : "");
         return `<div class="row-item"><p class="q">${d.question || ""}</p>
           <div class="meta ${tone}">${clock(d.ts)} · ${d.action || "—"} · ${d.reason || ""}</div></div>`;
       }).join("");
@@ -284,74 +246,46 @@
       state = s;
       pills(s);
       stats(s);
-      spark(s.equity_history);
-      const r = s.rules || {};
-      $("rules").innerHTML = [
-        ["Modus", r.live ? "Live" : "Paper"],
-        ["Syklus", `${r.loop_min || 15} min`],
-        ["Min. kant", `${((r.min_net_edge || 0) * 100).toFixed(1)} %`],
-        ["Maks pos.", `${((r.max_pos_pct || 0) * 100).toFixed(0)} %`],
-        ["Grok", r.grok || "—"],
-        ["Kalshi", r.kalshi ? "På" : "Av"],
-        ["Kelly", String(r.kelly ?? "—")],
-        ["Signatur", String(r.sig ?? "—")],
-      ].map(([k, v]) => `<div>${k}<strong>${v}</strong></div>`).join("");
+      renderPositions(s);
+      $("cycle").textContent = cycleLine(s);
       const st = s.stats || {};
       const depEl = $("dep");
       const xaiEl = $("xai");
       if (depEl && document.activeElement !== depEl) depEl.value = st.deposited != null ? st.deposited : "";
       if (xaiEl && document.activeElement !== xaiEl) xaiEl.value = st.xai_prepaid != null ? st.xai_prepaid : "";
-      const rejects = (st.top_rejects || []).slice(0, 2).map((r) => `${r.n}× ${r.reason}`).join(" · ");
-      $("cycle").textContent = cycleLine(s, rejects);
       const upd = s.update || {};
-      let errHtml = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
-      if (upd.running) errHtml += `<div class="err" style="color:var(--warn);border-color:color-mix(in oklab, var(--warn) 30%, transparent);background:color-mix(in oklab, var(--warn) 10%, transparent)">Oppdaterer agent… se data/update.log</div>`;
-      else if (upd.ok === false) errHtml += `<div class="err">Oppdatering feilet: ${upd.reason || "se data/update.log"}</div>`;
-      $("err").innerHTML = errHtml;
+      let err = s.last_error || "";
+      if (upd.running) err = err || "Oppdaterer agent…";
+      else if (upd.ok === false) err = `Oppdatering feilet: ${upd.reason || "se data/update.log"}`;
+      $("errLine").textContent = err;
       $("btnOn").disabled = !s.halted;
       $("btnOff").disabled = !!s.halted;
-      if (s.busy) {
-        $("btnOnce").disabled = true;
-        $("btnOnce").textContent = "Kjører…";
-      } else {
-        $("btnOnce").disabled = false;
-        $("btnOnce").textContent = "Kjør én syklus";
-      }
+      $("btnOnce").disabled = !!s.busy;
+      $("btnOnce").textContent = s.busy ? "Kjører…" : "Kjør én syklus";
       renderPanel(s);
     }
     async function refresh() {
       try { paint(await api("/api/state")); }
-      catch (e) { $("err").innerHTML = `<div class="err">Kan ikke nå desken. Er main.py run i gang?</div>`; }
+      catch (e) { $("errLine").textContent = "Kan ikke nå desken."; }
     }
     $("btnOn").onclick = async () => { await api("/api/on", "POST"); refresh(); };
     $("btnOff").onclick = async () => { await api("/api/off", "POST"); refresh(); };
     $("btnOnce").onclick = async () => {
       $("btnOnce").disabled = true;
       $("btnOnce").textContent = "Kjører…";
-      $("cycle").textContent = "Starter syklus…";
       try {
         const res = await api("/api/once", "POST");
-        if (res && res.ok === false) {
-          $("err").innerHTML = `<div class="err">${res.reason || "Kunne ikke starte syklus"}</div>`;
-          $("btnOnce").disabled = false;
-          $("btnOnce").textContent = "Kjør én syklus";
-          return;
-        }
-        $("cycle").textContent = "Syklus i gang (Grok + bøker, 30–90 s)…";
-      } catch (e) {
-        $("err").innerHTML = `<div class="err">${e.message || e}</div>`;
-        $("btnOnce").disabled = false;
-        $("btnOnce").textContent = "Kjør én syklus";
-      }
+        if (res && res.ok === false) $("errLine").textContent = res.reason || "Kunne ikke starte";
+      } catch (e) { $("errLine").textContent = e.message || e; }
     };
     $("btnUpd").onclick = async () => {
       if (!confirm("Hente siste kode og restarte agenten?")) return;
       $("btnUpd").disabled = true;
       try {
-        const res = await api("/api/update", "POST");
-        $("cycle").textContent = (res && res.reason) || "Oppdaterer… se data/update.log. Hard-refresh når desken er tilbake.";
+        await api("/api/update", "POST");
+        $("errLine").textContent = "Oppdaterer… hard-refresh om ~25 s.";
       } catch (e) {
-        $("err").innerHTML = `<div class="err">${e.message || e}</div>`;
+        $("errLine").textContent = e.message || e;
         $("btnUpd").disabled = false;
         return;
       }
@@ -359,9 +293,7 @@
     };
     $("cap").onsubmit = async (e) => {
       e.preventDefault();
-      const deposited_usd = Number($("dep").value);
-      const xai_prepaid_usd = Number($("xai").value);
-      await api("/api/meta", "POST", { deposited_usd, xai_prepaid_usd });
+      await api("/api/meta", "POST", { deposited_usd: Number($("dep").value), xai_prepaid_usd: Number($("xai").value) });
       refresh();
     };
     document.querySelectorAll(".tabs button").forEach((b) => {
@@ -372,11 +304,7 @@
       };
     });
     refresh();
-    setInterval(() => {
-      if (state && $("cycle") && state.last_cycle && !state.busy) {
-        $("cycle").textContent = cycleLine(state);
-      }
-    }, 1000);
+    setInterval(() => { if (state) pills(state); }, 1000);
     (function tick() {
       const wait = state && state.busy ? 1000 : 4000;
       setTimeout(async () => { await refresh(); tick(); }, wait);

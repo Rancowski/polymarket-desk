@@ -126,10 +126,91 @@ class Desk:
         )
         return bankroll, equity, open_pos
 
+    def _run_exits(self, open_pos: list, estimates: dict, by_id: dict) -> tuple[int, list]:
+        """Flatten on live bid. Always log hold vs sell. Independent of Grok."""
+        sold = 0
+        log_rows: list[dict] = []
+        for pos in list(open_pos):
+            q = (pos.get("question") or "")[:80]
+            token = pos.get("token_id")
+            if not token:
+                why = "mangler token_id"
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    side=pos.get("side"),
+                    action="hold",
+                    reason=why,
+                )
+                log_rows.append({"question": q, "action": "hold", "reason": why})
+                continue
+            try:
+                pbook = self.scout.book(str(token))
+            except Exception as exc:
+                pbook = {}
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    action="skip",
+                    reason=f"exit-bok: {exc}",
+                )
+            if pbook.get("synthetic"):
+                pbook = {"best_bid": 0, "mid": 0, "best_ask": 0, "spread": 0}
+            ticket_ex, why = self.risk.evaluate_exit(
+                pos,
+                pbook,
+                estimates.get(pos.get("condition_id") or ""),
+                0.0,
+                kalshi=(by_id.get(pos.get("condition_id") or "") or {}).get("kalshi"),
+            )
+            if not ticket_ex:
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    side=pos.get("side"),
+                    action="hold",
+                    reason=why,
+                )
+                log_rows.append({"question": q, "action": "hold", "reason": why})
+                continue
+            try:
+                result = self.exec.sell(ticket_ex)
+                status = str(result.get("status") or "")
+                action = "sell" if status in {"live_sell", "paper_sell"} else "selling"
+                if action == "sell":
+                    sold += 1
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    side=pos.get("side"),
+                    action=action,
+                    reason=ticket_ex.get("reason") or why,
+                    payload=result,
+                )
+                log_rows.append(
+                    {
+                        "question": q,
+                        "action": action,
+                        "reason": ticket_ex.get("reason") or why,
+                    }
+                )
+            except Exception as exc:
+                log.exception("Salg feilet")
+                self.store.log_decision(
+                    condition_id=pos.get("condition_id"),
+                    question=pos.get("question"),
+                    action="error",
+                    reason=str(exc),
+                )
+                log_rows.append({"question": q, "action": "error", "reason": str(exc)})
+        return sold, log_rows
+
     def _cycle(self) -> dict:
         halt = self.risk.halted()
         self.last_error = None
         bankroll, equity, open_pos = self._refresh_portfolio()
+        exits, exit_log = self._run_exits(open_pos, {}, {})
+        open_pos = self.store.positions("open")
         if halt:
             log.warning("Stoppet: %s", halt)
             self.last_cycle = {
@@ -141,6 +222,8 @@ class Desk:
                 "rejected": 0,
                 "kalshi": 0,
                 "xai_usd": 0.0,
+                "exits": exits,
+                "exit_log": exit_log,
                 "reason": halt,
                 "bankroll": bankroll,
                 "equity": equity,
@@ -304,7 +387,8 @@ class Desk:
                 "estimated": 0,
                 "accepted": 0,
                 "rejected": 0,
-                "exits": 0,
+                "exits": exits,
+                "exit_log": exit_log,
                 "arb": arb_n,
                 "kalshi": kalshi_n,
                 "bankroll": bankroll,
@@ -366,52 +450,28 @@ class Desk:
         except Exception as exc:
             log.exception("Brain krasjet: %s", exc)
             self.last_error = str(exc)
-            return {"ok": False, "reason": str(exc)}
+            self.last_cycle = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "halted": False,
+                "scanned": len(markets),
+                "estimated": 0,
+                "accepted": 0,
+                "arb": arb_n,
+                "kalshi": kalshi_n,
+                "rejected": 0,
+                "exits": exits,
+                "exit_log": exit_log,
+                "xai_usd": round(xai_cycle, 4),
+                "bankroll": bankroll,
+                "equity": equity,
+                "reason": str(exc),
+            }
+            return {"ok": False, "reason": str(exc), **self.last_cycle}
 
-        exits = 0
-        for pos in list(open_pos):
-            token = pos.get("token_id")
-            if not token:
-                continue
-            try:
-                pbook = self.scout.book(token)
-            except Exception as exc:
-                self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
-                    question=pos.get("question"),
-                    action="skip",
-                    reason=f"exit-bok: {exc}",
-                )
-                continue
-            ticket_ex, why = self.risk.evaluate_exit(
-                pos,
-                pbook,
-                estimates.get(pos.get("condition_id")),
-                bankroll,
-                kalshi=(by_id.get(pos.get("condition_id") or "") or {}).get("kalshi"),
-            )
-            if not ticket_ex:
-                continue
-            try:
-                result = self.exec.sell(ticket_ex)
-                exits += 1
-                self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
-                    question=pos.get("question"),
-                    side=pos.get("side"),
-                    action=result.get("status"),
-                    reason=ticket_ex.get("reason") or why,
-                    payload=result,
-                )
-            except Exception as exc:
-                log.exception("Salg feilet")
-                self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
-                    question=pos.get("question"),
-                    action="error",
-                    reason=str(exc),
-                )
-
+        open_pos = self.store.positions("open")
+        more, log2 = self._run_exits(open_pos, estimates, by_id)
+        exits += more
+        exit_log.extend(log2)
         open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
 
@@ -500,6 +560,7 @@ class Desk:
             "kalshi": kalshi_n,
             "rejected": rejected,
             "exits": exits,
+            "exit_log": exit_log,
             "xai_usd": round(xai_cycle, 4),
             "bankroll": bankroll,
             "equity": equity,

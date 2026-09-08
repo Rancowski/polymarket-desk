@@ -670,25 +670,45 @@ class Executor:
             except Exception:
                 side = "SELL"
         tick_s, neg = _clob_meta(token)
-        try:
-            args = OrderArgs(token_id=token, price=price, size=size, side=side, builder_code="")
-        except TypeError:
-            args = OrderArgs(token_id=token, price=price, size=size, side=side)
-        _attach_builder_code(args)
-        signed = _place_limit(client, args, _tick_literal(tick_s), neg, sdk=sdk)
-        log.info("LIVE SELL %s", signed)
-        filled, data = _order_filled(signed)
-        if not filled:
-            log.info("Salg umatchet — holder posisjon til Polymarket-sync")
-            return {"status": "resting_sell", "response": data or signed, "ticket": payload}
-        self.store.add_fill(
-            condition_id=order.get("condition_id"),
-            side=f"SELL_{order.get('side')}",
-            price=order.get("limit_price"),
-            size=order.get("shares"),
-            cost=order.get("size_usd"),
-            dry_run=False,
-            raw={"order": data or str(signed), "status": data.get("status"), "takingAmount": data.get("takingAmount"), **payload},
-        )
-        self.store.close_position(order["condition_id"], order.get("side"))
-        return {"status": "live_sell", "response": data or signed, "ticket": payload}
+        tick_f = float(tick_s)
+        if price < 0.10 and tick_f > 0.001:
+            tick_s, tick_f = "0.001", 0.001
+        px0 = _quantize(min(price, 0.99), tick_f)
+        last_signed: Any = None
+        data: dict = {}
+        for drop in (0, 1, 2):
+            attempt = max(tick_f, round(px0 - drop * tick_f, 6))
+            attempt = _quantize(attempt, tick_f)
+            try:
+                args = OrderArgs(token_id=token, price=attempt, size=size, side=side, builder_code="")
+            except TypeError:
+                args = OrderArgs(token_id=token, price=attempt, size=size, side=side)
+            _attach_builder_code(args)
+            try:
+                signed = _place_limit(client, args, tick_s, neg, sdk=sdk)
+            except Exception as exc:
+                log.warning("SELL %s @ %s: %s", (order.get("question") or "")[:40], attempt, exc)
+                last_signed = {"error": str(exc)}
+                continue
+            log.info("LIVE SELL try @ %s %s", attempt, signed)
+            filled, data = _order_filled(signed)
+            last_signed = signed
+            if filled:
+                self.store.add_fill(
+                    condition_id=order.get("condition_id"),
+                    side=f"SELL_{order.get('side')}",
+                    price=attempt,
+                    size=size,
+                    cost=round(attempt * size, 4),
+                    dry_run=False,
+                    raw={
+                        "order": data or str(signed),
+                        "status": data.get("status"),
+                        "takingAmount": data.get("takingAmount"),
+                        **payload,
+                    },
+                )
+                self.store.close_position(order["condition_id"], order.get("side"))
+                return {"status": "live_sell", "response": data or signed, "ticket": payload}
+        log.info("Salg umatchet etter FAK-retry — ingen fill")
+        return {"status": "resting_sell", "response": data or last_signed, "ticket": payload}

@@ -102,6 +102,43 @@ def _update_status() -> dict[str, Any]:
     return st
 
 
+def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
+    hints = {}
+    for row in (last_cycle or {}).get("exit_log") or []:
+        q = (row.get("question") or "")[:80]
+        hints[q] = row
+    out = []
+    for p in open_pos:
+        cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+        cv = p.get("current_value")
+        try:
+            mtm = float(cv) if cv not in (None, "") else None
+        except (TypeError, ValueError):
+            mtm = None
+        upnl = round(mtm - cost, 2) if mtm is not None else None
+        q = (p.get("question") or "")[:80]
+        hint = hints.get(q) or {}
+        out.append(
+            {
+                "question": p.get("question"),
+                "outcome": p.get("outcome"),
+                "side": p.get("side"),
+                "shares": p.get("shares"),
+                "avg_cost": p.get("avg_cost"),
+                "cur_price": p.get("cur_price"),
+                "current_value": mtm,
+                "cost": round(cost, 2),
+                "upnl": upnl,
+                "category": p.get("category"),
+                "opened_ts": p.get("opened_ts"),
+                "last_ts": p.get("last_ts"),
+                "exit_action": hint.get("action"),
+                "exit_reason": hint.get("reason"),
+            }
+        )
+    return out
+
+
 def _state() -> dict[str, Any]:
     desk = _desk
     mark = desk.store.latest_mark() if desk else None
@@ -148,28 +185,7 @@ def _state() -> dict[str, Any]:
         "max_position_pct": settings.max_position_pct,
         "last_error": desk.last_error if desk else None,
         "last_cycle": desk.last_cycle if desk else None,
-        "positions": [
-            {
-                "question": p.get("question"),
-                "outcome": p.get("outcome"),
-                "side": p.get("side"),
-                "shares": p.get("shares"),
-                "avg_cost": p.get("avg_cost"),
-                "cur_price": p.get("cur_price"),
-                "current_value": p.get("current_value"),
-                "cost": round(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0), 2),
-                "upnl": round(
-                    float(p.get("current_value") or 0)
-                    - float(p.get("shares") or 0) * float(p.get("avg_cost") or 0),
-                    2,
-                )
-                if p.get("current_value") not in (None, "")
-                else None,
-                "category": p.get("category"),
-                "last_ts": p.get("last_ts"),
-            }
-            for p in open_pos
-        ],
+        "positions": _positions_payload(open_pos, desk.last_cycle if desk else None),
         "decisions": desk.store.recent_decisions(60) if desk else [],
         "fills": fills,
         "equity_history": desk.store.equity_history(120) if desk else [],
