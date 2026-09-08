@@ -322,6 +322,8 @@ class Store:
 
     def is_bad_market(self, condition_id: str) -> bool:
         return bool(condition_id) and bool(self.get_meta(f"bad:{condition_id}"))
+
+    def xai_prepaid_usd(self) -> float:
         raw = self.get_meta("xai_prepaid_usd", "")
         try:
             return max(0.0, float(raw))
