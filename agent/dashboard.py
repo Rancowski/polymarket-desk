@@ -6,6 +6,7 @@ import logging
 import socket
 import subprocess
 import threading
+import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,7 @@ from agent.config import settings
 log = logging.getLogger("dash")
 WEB = Path(__file__).resolve().parent / "web"
 _desk = None
+_xai_cache: dict[str, Any] = {"ts": 0.0, "val": None}
 
 
 def lan_ip() -> str:
@@ -33,28 +35,38 @@ def lan_ip() -> str:
 
 
 def _xai_remaining(spent: float) -> float | None:
-    key = settings.xai_management_key
-    if key:
-        try:
-            r = requests.get(
-                f"https://management-api.x.ai/v1/billing/teams/{settings.xai_team_id or 'default'}/prepaid/balance",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=6,
-            )
-            if r.ok:
-                data = r.json() if isinstance(r.json(), dict) else {}
-                for k in ("balance_usd", "available_usd", "balance"):
-                    if k in data:
-                        return float(data[k])
-                if "cents" in data:
-                    return float(data["cents"]) / 100.0
-                if "balance_cents" in data:
-                    return float(data["balance_cents"]) / 100.0
-        except Exception:
-            pass
+    """Aldri blokker /api/state på xAI HTTP. Prepaid i meta er kilden."""
     if settings.xai_prepaid_usd > 0:
         return max(0.0, settings.xai_prepaid_usd - spent)
-    return None
+    key = settings.xai_management_key
+    if not key:
+        return None
+    now = time.time()
+    if now - float(_xai_cache.get("ts") or 0) < 120:
+        return _xai_cache.get("val")
+    try:
+        r = requests.get(
+            f"https://management-api.x.ai/v1/billing/teams/{settings.xai_team_id or 'default'}/prepaid/balance",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=2,
+        )
+        val = None
+        if r.ok:
+            data = r.json() if isinstance(r.json(), dict) else {}
+            for k in ("balance_usd", "available_usd", "balance"):
+                if k in data:
+                    val = float(data[k])
+                    break
+            if val is None and "cents" in data:
+                val = float(data["cents"]) / 100.0
+            if val is None and "balance_cents" in data:
+                val = float(data["balance_cents"]) / 100.0
+        _xai_cache["ts"] = now
+        _xai_cache["val"] = val
+        return val
+    except Exception:
+        _xai_cache["ts"] = now
+        return _xai_cache.get("val")
 
 
 def _state() -> dict[str, Any]:
@@ -62,8 +74,17 @@ def _state() -> dict[str, Any]:
     mark = desk.store.latest_mark() if desk else None
     open_pos = desk.store.positions("open") if desk else []
     locked = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
-    bankroll = float(mark["bankroll"]) if mark else settings.paper_bankroll_usd
-    equity = float(mark["equity"]) if mark else bankroll + locked
+    snap_cash = desk.store.float_meta("last_cash") if desk else None
+    snap_eq = desk.store.float_meta("last_equity") if desk else None
+    if mark:
+        bankroll = float(mark["bankroll"])
+        equity = float(mark["equity"])
+    elif snap_cash is not None:
+        bankroll = snap_cash
+        equity = snap_eq if snap_eq is not None else bankroll + locked
+    else:
+        bankroll = settings.paper_bankroll_usd if settings.dry_run else 0.0
+        equity = bankroll + locked
     halt = settings.halt_file.exists()
     st: dict[str, Any] = {}
     if desk:
@@ -71,21 +92,27 @@ def _state() -> dict[str, Any]:
             st = desk.store.portfolio_stats(equity, bankroll, open_pos)
             if st.get("cash") is not None:
                 bankroll = float(st["cash"])
-            if st.get("open_cost") is not None:
-                equity = bankroll + float(st["open_cost"])
-                st["total"] = round(equity - float(st.get("deposited") or st.get("start_equity") or equity), 2)
-                start = float(st.get("deposited") or st.get("start_equity") or 0) or equity
-                st["total_pct"] = round(st["total"] / start, 4) if start else 0
+            if st.get("equity") is not None:
+                equity = float(st["equity"])
+            else:
+                mtm = float(st.get("open_mtm") or st.get("open_cost") or locked)
+                equity = bankroll + mtm
+            deposited = float(st.get("deposited") or 0)
+            if deposited >= 1:
+                st["total"] = round(equity - deposited, 2)
+                st["total_pct"] = round(st["total"] / deposited, 4)
+                st["after_xai"] = round(st["total"] - float(st.get("xai_total") or 0), 2)
         except Exception as exc:
             log.exception("portfolio_stats: %s", exc)
     spent = float((st or {}).get("xai_total") or 0)
     prepaid = float((st or {}).get("xai_prepaid") or 0)
     remaining = max(0.0, prepaid - spent) if prepaid > 0 else _xai_remaining(spent)
+    fills = desk.store.recent_fills(30, real_only=not settings.dry_run) if desk else []
     return {
         "dry_run": settings.dry_run,
         "halted": halt,
         "busy": bool(desk and desk.busy),
-        "running": True,
+        "running": bool(desk) and not halt,
         "bankroll": bankroll,
         "equity": equity,
         "open": len(open_pos),
@@ -102,13 +129,14 @@ def _state() -> dict[str, Any]:
                 "side": p.get("side"),
                 "shares": p.get("shares"),
                 "avg_cost": p.get("avg_cost"),
+                "current_value": p.get("current_value"),
                 "category": p.get("category"),
                 "last_ts": p.get("last_ts"),
             }
             for p in open_pos
         ],
         "decisions": desk.store.recent_decisions(60) if desk else [],
-        "fills": desk.store.recent_fills(30) if desk else [],
+        "fills": fills,
         "equity_history": desk.store.equity_history(120) if desk else [],
         "stats": st,
         "xai_remaining": remaining,
@@ -189,6 +217,16 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_post()
+        except Exception as exc:
+            log.exception("POST %s", self.path)
+            try:
+                self._json(500, {"ok": False, "reason": str(exc)})
+            except Exception:
+                pass
+
+    def _do_post(self) -> None:
         if not self._authorized():
             self._json(401, {"error": "token required"})
             return
@@ -211,18 +249,9 @@ class Handler(BaseHTTPRequestHandler):
             if settings.halt_file.exists():
                 self._json(400, {"ok": False, "reason": "Agenten er stoppet. Trykk Slå på først."})
                 return
-            if _desk.busy:
+            if not _desk.begin_cycle_async():
                 self._json(409, {"ok": False, "reason": "En syklus kjører allerede — vent til den er ferdig."})
                 return
-            _desk.busy = True
-
-            def _run() -> None:
-                try:
-                    _desk.cycle()
-                finally:
-                    _desk.busy = False
-
-            threading.Thread(target=_run, daemon=True, name="desk-once").start()
             self._json(200, {"ok": True, "started": True})
             return
         if path == "/api/update":
@@ -231,11 +260,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "reason": "deploy/update.sh mangler"})
                 return
             log.warning("Kodeoppdatering fra dashboard")
-            subprocess.Popen(
-                ["bash", str(script)],
-                cwd=str(settings.halt_file.parent),
-                start_new_session=True,
-            )
+            try:
+                subprocess.Popen(
+                    ["bash", str(script)],
+                    cwd=str(settings.halt_file.parent),
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                self._json(500, {"ok": False, "reason": "bash mangler på denne maskinen. På Hetzner: trykk Oppdater agent der."})
+                return
+            except Exception as exc:
+                self._json(500, {"ok": False, "reason": str(exc)})
+                return
             self._json(200, {"ok": True, "reason": "henter kode og restarter"})
             return
         if path == "/api/meta":

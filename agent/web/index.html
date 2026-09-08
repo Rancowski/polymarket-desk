@@ -156,16 +156,23 @@
     function pills(s) {
       const live = s.dry_run ? "Paper" : "Live";
       const on = !s.halted;
+      const kalshi = s.last_cycle && s.last_cycle.kalshi != null ? s.last_cycle.kalshi : null;
       $("pills").innerHTML =
-        `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? "Autopilot på" : "Stoppet"}</span>` +
+        `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? (s.dry_run ? "Paper på" : "Live") : "Stoppet"}</span>` +
         `<span class="pill">${live}</span>` +
-        (s.busy ? `<span class="pill">Kjører syklus…</span>` : "");
+        (s.busy ? `<span class="pill">Kjører syklus…</span>` : "") +
+        (kalshi != null ? `<span class="pill">Kalshi ${kalshi}</span>` : "");
     }
     const signed = (n) => (n > 0.004 ? "+" : n < -0.004 ? "\u2212" : "") + usd(Math.abs(n));
     const pctn = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)} %`;
+    function lastRealFill(s) {
+      const fills = s.fills || [];
+      return fills.find((f) => !f.dry_run) || null;
+    }
     function stats(s) {
       const st = s.stats || {};
       const tone = (n) => (n > 0.004 ? "gain" : n < -0.004 ? "loss" : "");
+      const lastFill = lastRealFill(s);
       const cards = [
         ["Egenkapital", usd(s.equity), ""],
         ["Ledig", usd(st.cash != null ? st.cash : s.bankroll), ""],
@@ -176,7 +183,6 @@
         ["Maks tap", `${signed(st.max_dd_usd || 0)} (${pctn(st.max_dd_pct || 0)})`, (st.max_dd_usd || 0) < -0.004 ? "loss" : ""],
         ["Innskutt", usd(st.deposited || 0), ""],
         ["I markedet", `${s.open} · ${usd(st.open_cost || 0)} kost`, ""],
-        const lastFill = (s.fills || []).find((f) => !f.dry_run);
         ["Siste fill", lastFill ? `${lastFill.side} ${usd(lastFill.cost)}` : "ingen", ""],
         ["xAI i dag", usd(st.xai_day || 0), ""],
         ["xAI brukt", usd(st.xai_total || 0), ""],
@@ -189,10 +195,11 @@
     function spark(hist) {
       const el = $("spark");
       if (!hist || hist.length < 2) { el.innerHTML = ""; return; }
-        const vals = hist.map((h) => Number(h.equity) or 0).filter((v, i, a) => {
-          const med = a[Math.floor(a.length / 2)] || v;
-          return med < 1 || Math.abs(v - med) / med < 0.2;
-        });
+      const vals = hist.map((h) => Number(h.equity) || 0).filter((v, i, a) => {
+        const med = a[Math.floor(a.length / 2)] || v;
+        return med < 1 || Math.abs(v - med) / med < 0.2;
+      });
+      if (vals.length < 2) { el.innerHTML = ""; return; }
       const min = Math.min(...vals), max = Math.max(...vals);
       const span = max - min || 1;
       const pts = vals.map((v, i) => {
@@ -267,8 +274,9 @@
       const c = s.last_cycle;
       const next = c && c.ts ? new Date(new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000) : null;
       const rejects = (st.top_rejects || []).slice(0, 2).map((r) => `${r.n}× ${r.reason}`).join(" · ");
+      const kalshiN = c && c.kalshi != null ? c.kalshi : 0;
       $("cycle").textContent = c
-        ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
+        ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · kalshi ${kalshiN} treff · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
         : "Venter på første syklus.";
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;
@@ -333,7 +341,7 @@
     });
     refresh();
     (function tick() {
-      const wait = state && state.busy ? 1200 : 4000;
+      const wait = state && state.busy ? 1000 : 4000;
       setTimeout(async () => { await refresh(); tick(); }, wait);
     })();
   </script>

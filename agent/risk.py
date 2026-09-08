@@ -53,6 +53,41 @@ def kelly_usd(p_hat: float, cost: float, bankroll: float) -> float:
     return max(0.0, settings.kelly_fraction * f_star * bankroll)
 
 
+SPORTS_HINTS = (
+    "cs2",
+    "counter-strike",
+    "lol",
+    "league of legends",
+    "league-of-legends",
+    "dota",
+    "valorant",
+    "nba",
+    "nfl",
+    "mlb",
+    "nhl",
+    "ufc",
+    "atp",
+    "wta",
+    "soccer",
+    "esport",
+    "gamerlegion",
+    "furia",
+    " vs ",
+    "-vs-",
+)
+
+
+def is_sports(row: dict) -> bool:
+    cat = str(row.get("category") or "").lower()
+    if cat == "sports":
+        return True
+    blob = " ".join(
+        str(row.get(k) or "")
+        for k in ("event_key", "question", "eventSlug", "slug")
+    ).lower()
+    return any(h in blob for h in SPORTS_HINTS)
+
+
 def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
     """Små kontoer: Kelly på 2 ¢ kant er <$5 og ble avvist. Ta et fillbart klipp i stedet."""
     kelly = kelly_usd(p_hat, cost, bankroll)
@@ -94,13 +129,15 @@ class Risk:
         mid = float(book.get("mid") or market.get("mid") or 0.5)
         if mid >= 0.94 or mid <= 0.06:
             return None, "nær resolusjon"
-        if market.get("category") == "sports" and (mid >= 0.88 or mid <= 0.12):
+        if is_sports(market) and (mid >= 0.88 or mid <= 0.12):
             return None, "sports nær avgjort"
         disagreement = abs(p_yes - mid)
         if conf == "low" and disagreement < (0.04 if probe else 0.05):
             return None, "confidence=low uten stor uenighet"
         spread = float(book.get("spread") or 0)
         if book.get("synthetic"):
+            return None, "syntetisk bok"
+        if (market.get("no_book") or {}).get("synthetic"):
             return None, "syntetisk bok"
         if spread > settings.max_spread:
             return None, f"spread {spread:.3f} > max"
@@ -130,23 +167,23 @@ class Risk:
                 spread = float(nb["spread"])
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
-        extra = 0.015 if market.get("category") == "sports" else 0.0
+        extra = 0.015 if is_sports(market) else 0.0
         edge_gross = p_hat - cost
         edge_net = edge_gross - fee_frac - settings.model_haircut - extra
         need = settings.min_net_edge if min_edge is None else min_edge
-        if market.get("category") == "sports":
+        if is_sports(market):
             need = max(need, 0.022)
         if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
         if cost <= 0.15 or cost >= 0.85:
             return None, "nær resolusjon"
-        if market.get("category") == "sports" and (cost <= 0.22 or cost >= 0.78):
+        if is_sports(market) and (cost <= 0.22 or cost >= 0.78):
             return None, "sports ekstrem-pris"
 
         open_pos = self.store.positions("open")
         if any(p["condition_id"] == market["condition_id"] for p in open_pos):
             return None, "allerede i markedet"
-        if market.get("category") == "sports" and any((p.get("category") or "") == "sports" for p in open_pos):
+        if is_sports(market) and any(is_sports(p) for p in open_pos):
             return None, "maks 1 sports-posisjon"
         if len(open_pos) >= settings.max_open_positions:
             return None, "max open positions"
@@ -244,7 +281,7 @@ class Risk:
         if best_bid <= 0:
             return None, "ingen bud"
         pnl_pct = (best_bid - avg) / avg
-        sports = (pos.get("category") or "") == "sports"
+        sports = is_sports(pos)
 
         if sports and pnl_pct <= -0.15:
             return self._exit_ticket(pos, book, shares, best_bid, f"sports stopp-tap {pnl_pct:.1%}"), "ok"
@@ -262,13 +299,7 @@ class Risk:
             if k_hat + 0.06 < avg:
                 return self._exit_ticket(pos, book, shares, best_bid, f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}"), "ok"
 
-        if not estimate or estimate.get("skip"):
-            return None, "hold uten fersk estimat"
-
-        p_yes = float(estimate["p_yes"])
-        p_hat = p_yes if side == "YES" else 1.0 - p_yes
-        if p_hat < avg - 0.03:
-            return self._exit_ticket(pos, book, shares, best_bid, f"p_hat {p_hat:.2f} < kost {avg:.2f}"), "ok"
+        # Ikke selg bare fordi Grok mean-reverter til mid («edge gone»).
         return None, "hold"
 
     def _exit_ticket(self, pos: dict, book: dict, shares: float, price: float, reason: str) -> dict:

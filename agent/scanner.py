@@ -45,12 +45,6 @@ def _token_str(value: Any) -> str:
     if text.isdigit():
         return text
     return text
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _level_px(level: Any) -> float:

@@ -25,9 +25,10 @@ def _theme(text: str) -> set[str]:
     tags: set[str] = set()
     if any(x in t for x in ("fed", "fomc", "federal reserve")):
         tags.add("fed")
-        if re.search(r"\b25\s*(bps|bp|basis)", t) or "25 bps" in t:
+        # «25» kun for 25 bps/bp — aldri fordi tittelen har 4.25 %.
+        if re.search(r"(?<![\d.])25\s*(bps|bp|basis)", t):
             tags.add("25")
-        if re.search(r"\b50\s*(bps|bp|basis)", t):
+        if re.search(r"(?<![\d.])50\s*(bps|bp|basis)", t):
             tags.add("50")
         if any(x in t for x in ("cut", "decrease", "lower", "ease")):
             tags.add("cut")
@@ -35,6 +36,8 @@ def _theme(text: str) -> set[str]:
             tags.add("hike")
         if any(x in t for x in ("no change", "unchanged", "hold", "pause")):
             tags.add("hold")
+        if re.search(r"above\s+\d", t) or "funds rate" in t or "fed funds" in t:
+            tags.add("funds")
     if "bitcoin" in t or re.search(r"\bbtc\b", t):
         tags.add("btc")
     if "ethereum" in t or re.search(r"\beth\b", t):
@@ -85,17 +88,17 @@ HOSTS = (
 
 
 SERIES = (
-    "KXFED",
     "KXFEDHIKE",
+    "KXFEDDECISION",
+    "KXFED",
     "KXBTC",
     "KXBTCD",
     "KXETH",
     "KXETHD",
-    "INX",
     "KXTRUMP",
     "KXHARRIS",
-    "BTC",
-    "ETHD",
+    "KXCPI",
+    "KXGPD",
 )
 
 
@@ -105,6 +108,9 @@ def _rows_to_out(rows: list) -> list[dict]:
         if str(row.get("market_type") or "binary") not in {"binary", ""}:
             continue
         title = str(row.get("title") or row.get("yes_sub_title") or row.get("subtitle") or "")
+        low = title.lower()
+        if any(x in low for x in ("parlay", "combo", "same game", "sgp")):
+            continue
         px = _yes_px(row)
         if not title or not px:
             continue
@@ -122,44 +128,39 @@ def _rows_to_out(rows: list) -> list[dict]:
 
 def fetch_open(limit: int = 200) -> list[dict]:
     last_exc: Exception | None = None
-    host = HOSTS[0]
     collected: list[dict] = []
     seen: set[str] = set()
-    for series in SERIES:
-        try:
-            r = requests.get(
-                f"{host}/markets",
-                params={"limit": 50, "status": "open", "series_ticker": series},
-                timeout=12,
-            )
-            if r.status_code == 429:
-                log.warning("Kalshi 429 på %s — stopper serier", series)
-                break
-            if r.status_code >= 400:
-                continue
-            rows = (r.json() or {}).get("markets") or []
-            chunk = _rows_to_out(rows)
-            for item in chunk:
-                t = str(item.get("ticker") or item["title"])
-                if t in seen:
+    for host in HOSTS:
+        for series in SERIES:
+            try:
+                r = requests.get(
+                    f"{host}/markets",
+                    params={"limit": 50, "status": "open", "series_ticker": series},
+                    timeout=12,
+                )
+                if r.status_code == 429:
+                    log.warning("Kalshi 429 på %s — stopper serier", series)
+                    break
+                if r.status_code >= 400:
                     continue
-                seen.add(t)
-                collected.append(item)
-            log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
-        except Exception as exc:
-            last_exc = exc
-            log.warning("Kalshi %s: %s", series, exc)
-    if not collected:
-        try:
-            r = requests.get(f"{host}/markets", params={"limit": min(limit, 50), "status": "open"}, timeout=12)
-            r.raise_for_status()
-            collected = _rows_to_out((r.json() or {}).get("markets") or [])
-        except Exception as exc:
-            last_exc = exc
-    log.info("Kalshi totalt %s markeder med pris", len(collected))
+                rows = (r.json() or {}).get("markets") or []
+                chunk = _rows_to_out(rows)
+                for item in chunk:
+                    t = str(item.get("ticker") or item["title"])
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    collected.append(item)
+                log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Kalshi %s: %s", series, exc)
+        if collected:
+            break
+    log.info("Kalshi totalt %s markeder med pris (kun navngitte serier)", len(collected))
     if not collected and last_exc:
         log.warning("Kalshi-henting feilet: %s", last_exc)
-    return collected
+    return collected[:limit]
 
 
 def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:
@@ -192,7 +193,20 @@ def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:
             continue
         years = set(re.findall(r"20\d{2}", q))
         kyears = set(re.findall(r"20\d{2}", best["title"]))
-        if years and kyears and not years.issubset(kyears):
+        if years and kyears and not (years & kyears):
+            continue
+        qth = qtheme
+        kth = best["theme"]
+        if ("25" in qth) != ("25" in kth):
+            continue
+        if ("funds" in kth and "hike" in qth) or ("funds" in qth and "hike" in kth):
+            continue
+        for tag in ("hike", "cut", "hold"):
+            if tag in qth or tag in kth:
+                if tag not in qth or tag not in kth:
+                    best = None
+                    break
+        if not best:
             continue
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
         gap = round(poly - float(best["yes"]), 3)

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent.config import settings
-from agent.risk import Ticket
+from agent.risk import Ticket, is_sports
 
 log = logging.getLogger("arb")
 
@@ -70,28 +70,41 @@ class Arb:
             data = self.scout.book(token)
         except Exception:
             return {}
+        if not data or data.get("synthetic"):
+            return {}
         market[key] = data
         return data
 
     def scan(self, markets: list[dict], bankroll: float) -> list[Ticket]:
-        open_ids = {p["condition_id"] for p in self.store.positions("open")}
+        open_pos = self.store.positions("open")
+        open_ids = {p["condition_id"] for p in open_pos}
+        sports_open = any(is_sports(p) for p in open_pos)
         tickets: list[Ticket] = []
-        tickets.extend(self._complements(markets, bankroll, open_ids))
+        tickets.extend(self._complements(markets, bankroll, open_ids, sports_open))
         taken = {t.condition_id for t in tickets}
-        tickets.extend(self._event_sets(markets, bankroll, open_ids | taken))
+        tickets.extend(self._event_sets(markets, bankroll, open_ids | taken, sports_open))
         taken = {t.condition_id for t in tickets}
-        tickets.extend(self._locked(markets, bankroll, open_ids | taken))
+        tickets.extend(self._locked(markets, bankroll, open_ids | taken, sports_open))
         taken = {t.condition_id for t in tickets}
-        tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken))
+        tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken, sports_open))
         log.info("Arb: %s ben (complement/event/låst/kalshi)", len(tickets))
         return tickets
 
-    def _complements(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
+    def _skip_sports(self, market: dict, sports_open: bool, tickets: list[Ticket]) -> bool:
+        if not is_sports(market):
+            return False
+        if sports_open:
+            return True
+        return any(is_sports({"question": t.question, "category": t.category, "event_key": t.event_key}) for t in tickets)
+
+    def _complements(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_open: bool = False) -> list[Ticket]:
         out: list[Ticket] = []
         cap = settings.max_position_pct * bankroll
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
+                continue
+            if self._skip_sports(m, sports_open, out):
                 continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
@@ -123,7 +136,7 @@ class Arb:
                 break
         return out
 
-    def _event_sets(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
+    def _event_sets(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_open: bool = False) -> list[Ticket]:
         groups: dict[str, list[dict]] = {}
         for m in markets:
             key = m.get("event_key") or ""
@@ -135,6 +148,8 @@ class Arb:
             if len(rows) < 3:
                 continue
             if any(r.get("condition_id") in open_ids for r in rows):
+                continue
+            if any(self._skip_sports(r, sports_open, out) for r in rows):
                 continue
             mids = [float(r.get("yes_mid") or 0) for r in rows]
             if not (0.86 <= sum(mids) <= 1.14):
@@ -162,13 +177,15 @@ class Arb:
                 break
         return out
 
-    def _locked(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
+    def _locked(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_open: bool = False) -> list[Ticket]:
         now = datetime.now(timezone.utc)
         out: list[Ticket] = []
         cap = settings.max_position_pct * bankroll
         for m in markets:
             cid = m.get("condition_id")
             if not cid or cid in open_ids:
+                continue
+            if self._skip_sports(m, sports_open, out):
                 continue
             end = _parse_end(m.get("end_date"))
             if not end or (now - end).total_seconds() < 90 * 60:
@@ -204,7 +221,7 @@ class Arb:
                 break
         return out
 
-    def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
+    def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_open: bool = False) -> list[Ticket]:
         """Poly vs Kalshi ≥ 7 ¢: kjøp den billige siden på Polymarket (signal, ikke locked arb)."""
         out: list[Ticket] = []
         cap = settings.max_position_pct * bankroll * 0.7
@@ -212,6 +229,8 @@ class Arb:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
             if not cid or cid in open_ids or not ks:
+                continue
+            if self._skip_sports(m, sports_open, out):
                 continue
             gap = float(ks.get("gap") or 0)
             if abs(gap) < 0.04:

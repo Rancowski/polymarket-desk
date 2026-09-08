@@ -34,35 +34,41 @@ def _tif(sdk: str) -> Any:
         from py_clob_client_v2 import OrderType
     else:
         from py_clob_client.clob_types import OrderType
-    return getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
+    tif = getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None)
+    if tif is None:
+        log.warning("SDK mangler FAK/FOK — nekter GTC som hviler og blir logget som fill")
+    return tif
 
 
 def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1") -> Any:
     import inspect
 
     tif = _tif(sdk)
+    if tif is None:
+        raise RuntimeError("CLOB SDK mangler FAK — avviser ordre i stedet for GTC")
     if sdk == "v2":
         from py_clob_client_v2 import PartialCreateOrderOptions
-
-        options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
-        fn = client.create_and_post_order
-        names = list(inspect.signature(fn).parameters)
-        if "order_type" in names:
-            return fn(args, options, tif)
-        return fn(args, options)
-
-    from py_clob_client.clob_types import PartialCreateOrderOptions
+    else:
+        from py_clob_client.clob_types import PartialCreateOrderOptions
 
     options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
     fn = client.create_and_post_order
     names = list(inspect.signature(fn).parameters)
     log.info("CLOB create_and_post_order(%s) tick=%s neg=%s sdk=%s tif=%s", names, tick_s, neg, sdk, tif)
-    if "order_type" in names:
-        return fn(args, options, tif)
-    try:
-        return fn(args, options)
-    except TypeError:
-        return fn(args)
+    attempts = (
+        lambda: fn(args, options, tif),
+        lambda: fn(args, options, order_type=tif),
+        lambda: fn(args, order_type=tif, options=options),
+        lambda: fn(order=args, options=options, order_type=tif),
+    )
+    last_type: Exception | None = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_type = exc
+            continue
+    raise RuntimeError(f"CLOB create_and_post_order tok ikke FAK order_type: {last_type}")
 
 
 def _amount_size(price: float, size: float) -> float:
@@ -140,6 +146,65 @@ def _parse_balance(raw: Any) -> float:
         return 0.0
     # 221.52 pUSD kommer som 221520000.
     return wei / 1e6 if wei >= 1000 else wei
+
+
+def _as_dict(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    if hasattr(raw, "__dict__"):
+        data = {k: v for k, v in vars(raw).items() if not k.startswith("_")}
+        if data:
+            return data
+    return {}
+
+
+def _order_filled(signed: Any) -> tuple[bool, dict]:
+    """Kun matched/takingAmount > 0 er fill. status=live med tom takingAmount er ikke en posisjon."""
+    data = _as_dict(signed)
+    status = str(data.get("status") or "").lower()
+    taking = str(data.get("takingAmount") if data.get("takingAmount") is not None else "").strip()
+    making = str(data.get("makingAmount") if data.get("makingAmount") is not None else "").strip()
+    if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"}:
+        if taking in {"", "0", "0.0"} and making in {"", "0", "0.0"}:
+            return False, data
+    if status in {"matched", "filled"}:
+        return True, data
+    if taking not in {"", "0", "0.0"} or making not in {"", "0", "0.0"}:
+        return True, data
+    return False, data
+
+
+def _infer_category(p: dict) -> str:
+    slug = str(p.get("eventSlug") or p.get("slug") or p.get("event_key") or "").lower()
+    title = str(p.get("title") or p.get("question") or "").lower()
+    blob = f"{slug} {title}"
+    sports = (
+        "cs2", "counter-strike", "lol", "league-of-legends", "league of legends",
+        "dota", "valorant", "nba", "nfl", "mlb", "nhl", "ufc", "atp", "wta",
+        "soccer", "esport", "gamerlegion", "furia", "-vs-", " vs ",
+    )
+    if any(k in blob for k in sports):
+        return "sports"
+    for key in ("crypto", "politics", "finance", "economics", "geopolitics", "tech"):
+        if key in blob:
+            return key
+    return str(p.get("eventSlug") or "other")[:40]
+
+
+def _attach_builder_code(args: Any) -> Any:
+    if hasattr(args, "builder_code") and getattr(args, "builder_code", None) is None:
+        try:
+            args.builder_code = ""
+        except Exception:
+            pass
+    if not hasattr(args, "builder_code"):
+        try:
+            args.builder_code = ""
+        except Exception:
+            pass
+    return args
 
 
 class Executor:
@@ -258,13 +323,17 @@ class Executor:
         if parsed > 0:
             log.info("Live bankroll=%.2f pUSD", parsed)
             return parsed
+        snap = self.store.float_meta("last_cash")
+        if snap is not None and snap > 0:
+            log.warning("CLOB sa 0 pUSD — bruker siste snapshot cash=%.2f", snap)
+            return snap
         log.warning(
             "CLOB sa 0 pUSD (du har sannsynligvis feil POLYMARKET_FUNDER — "
             "bruk innskuddsadressen under Cash/Deposit, ikke Profile «API use only»). "
             "Bruker PAPER_BANKROLL_USD=%.2f",
             settings.paper_bankroll_usd,
         )
-        return settings.paper_bankroll_usd
+        return settings.paper_bankroll_usd if settings.dry_run else 0.0
 
     def cancel_open(self) -> int:
         """Fjern hvilende GTC som aldri fyltes (forrige «live» uten fill)."""
@@ -307,12 +376,12 @@ class Executor:
             return None
         headers = {"User-Agent": "polymarket-desk/1.0"}
         urls = [
-            f"https://data-api.polymarket.com/positions?user={funder}&sizeThreshold=0",
+            f"https://data-api.polymarket.com/positions?user={funder}&sizeThreshold=0.01",
             f"https://gamma-api.polymarket.com/positions?user={funder}",
         ]
         for url in urls:
             try:
-                r = requests.get(url, headers=headers, timeout=15)
+                r = requests.get(url, headers=headers, timeout=12)
                 if r.status_code != 200:
                     continue
                 data = r.json()
@@ -322,22 +391,36 @@ class Executor:
                     size = float(p.get("size") or p.get("shares") or 0)
                     if size < 0.01:
                         continue
+                    cid = str(p.get("conditionId") or p.get("condition_id") or "").strip()
+                    if not cid:
+                        continue
                     outcome = str(p.get("outcome") or p.get("side") or "Yes")
-                    side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
+                    idx = p.get("outcomeIndex")
+                    if idx is not None:
+                        try:
+                            side = "NO" if int(idx) == 1 else "YES"
+                        except (TypeError, ValueError):
+                            side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
+                    else:
+                        side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
                     if outcome.upper() in {"YES", "NO", "0", "1"}:
                         label = str(p.get("title") or "")[:160]
                     else:
                         label = f"{outcome} · {str(p.get('title') or '')[:140]}"
+                    avg = float(p.get("avgPrice") or p.get("avg_price") or p.get("curPrice") or 0)
+                    cur = float(p.get("curPrice") or p.get("currPrice") or avg)
+                    mtm = float(p.get("currentValue") or (size * cur))
                     out.append(
                         {
-                            "condition_id": str(p.get("conditionId") or p.get("condition_id") or ""),
+                            "condition_id": cid,
                             "question": label,
-                            "category": str(p.get("eventSlug") or "other")[:40],
-                            "event_key": str(p.get("eventSlug") or p.get("conditionId") or ""),
+                            "category": _infer_category(p),
+                            "event_key": str(p.get("eventSlug") or p.get("conditionId") or cid),
                             "side": side,
                             "token_id": str(p.get("asset") or p.get("token_id") or ""),
                             "shares": size,
-                            "avg_cost": float(p.get("avgPrice") or p.get("avg_price") or p.get("curPrice") or 0),
+                            "avg_cost": avg,
+                            "current_value": mtm,
                             "status": "open",
                         }
                     )
@@ -345,6 +428,27 @@ class Executor:
                 return out
             except Exception as exc:
                 log.warning("positions %s: %s", url.split("/")[2], exc)
+        return None
+
+    def fetch_position_value(self) -> float | None:
+        funder = (settings.funder or "").strip()
+        if not funder:
+            return None
+        try:
+            r = requests.get(
+                f"https://data-api.polymarket.com/value?user={funder}",
+                headers={"User-Agent": "polymarket-desk/1.0"},
+                timeout=8,
+            )
+            if not r.ok:
+                return None
+            data = r.json()
+            if isinstance(data, list) and data:
+                return float(data[0].get("value") or 0)
+            if isinstance(data, dict) and "value" in data:
+                return float(data.get("value") or 0)
+        except Exception as exc:
+            log.warning("portfolio value: %s", exc)
         return None
 
     def submit(self, ticket: Ticket) -> dict:
@@ -391,6 +495,8 @@ class Executor:
             )
             return {"status": "paper", "ticket": payload}
 
+        if getattr(ticket, "synthetic", False):
+            raise RuntimeError("live-kjøp avvist: syntetisk bok")
         client = self._live_client()
         sdk = getattr(self, "_sdk", "v1")
         if sdk == "v2":
@@ -436,12 +542,11 @@ class Executor:
         price = _quantize(min(0.99, price + tick_f), tick_f)
         size = _amount_size(price, max(min_sz, float(ticket.shares), 10.0))
         log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s…", price, size, tick_s, neg, token[:14])
-        args = OrderArgs(token_id=token, price=price, size=size, side=side)
-        if not hasattr(args, "builder_code"):
-            try:
-                args.builder_code = None
-            except Exception:
-                pass
+        try:
+            args = OrderArgs(token_id=token, price=price, size=size, side=side, builder_code="")
+        except TypeError:
+            args = OrderArgs(token_id=token, price=price, size=size, side=side)
+        _attach_builder_code(args)
         last_err: Exception | None = None
         signed = None
         for nflag in (neg, (not neg)):
@@ -469,25 +574,26 @@ class Executor:
             if "unexpected keyword" not in msg and "order_type" not in msg and "TypeError" not in type(last_err).__name__:
                 self.store.mark_bad_market(ticket.condition_id, msg[:120])
             raise RuntimeError(f"CLOB-ordre feilet: {msg}") from last_err
-        if isinstance(signed, dict):
-            err = str(signed.get("error") or signed.get("errorMsg") or signed.get("msg") or "")
-            ok = signed.get("success", True)
-            if ok is False or (err and "success" not in err.lower()):
-                raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
-            status = str(signed.get("status") or "").lower()
-            taking = signed.get("takingAmount") or signed.get("makingAmount") or ""
-            filled = status in {"matched", "filled", "delayed"} or (str(taking) not in {"", "0", "0.0"})
-            if not filled:
-                log.info("Ordre hviler umatchet %s", signed.get("orderID"))
-                return {"status": "resting", "response": signed, "ticket": payload}
+        data = _as_dict(signed)
+        err = str(data.get("error") or data.get("errorMsg") or data.get("msg") or "")
+        ok = data.get("success", True)
+        if ok is False or (err and "success" not in err.lower()):
+            raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
+        filled, data = _order_filled(signed if data else signed)
+        if not filled:
+            log.info("Ordre umatchet (ikke fill) %s", data.get("orderID") or signed)
+            return {"status": "resting", "response": data or signed, "ticket": payload}
+        taking = _as_float(data.get("takingAmount"))
+        fill_size = taking if taking > 0 else size
+        fill_px = price
         self.store.add_fill(
             condition_id=ticket.condition_id,
             side=ticket.side,
-            price=price,
-            size=size,
-            cost=round(price * size, 2),
+            price=fill_px,
+            size=fill_size,
+            cost=round(fill_px * fill_size, 2),
             dry_run=False,
-            raw={"order": str(signed), **payload, "tick": tick_s, "neg_risk": neg},
+            raw={"order": data or str(signed), "status": data.get("status"), "takingAmount": data.get("takingAmount"), **payload, "tick": tick_s, "neg_risk": neg},
         )
         self.store.upsert_position(
             condition_id=ticket.condition_id,
@@ -496,11 +602,12 @@ class Executor:
             event_key=ticket.event_key,
             side=ticket.side,
             token_id=ticket.token_id,
-            shares=size,
-            avg_cost=price,
+            shares=fill_size,
+            avg_cost=fill_px,
+            current_value=round(fill_px * fill_size, 4),
             status="open",
         )
-        return {"status": "live", "response": signed, "ticket": payload}
+        return {"status": "live", "response": data or signed, "ticket": payload}
 
     def sell(self, order: dict) -> dict:
         payload = {**order}
@@ -526,28 +633,35 @@ class Executor:
             return {"status": "paper_sell", "ticket": payload}
 
         client = self._live_client()
-        from py_clob_client.clob_types import OrderArgs
+        sdk = getattr(self, "_sdk", "v1")
+        token = str(order.get("token_id") or "").strip()
+        price = float(order["limit_price"])
+        size = float(order["shares"])
+        if sdk == "v2":
+            from py_clob_client_v2 import OrderArgs, Side
 
-        try:
-            from py_clob_client.order_builder.constants import SELL
-            side = SELL
-        except Exception:
-            side = "SELL"
-        args = OrderArgs(
-            token_id=order["token_id"],
-            price=float(order["limit_price"]),
-            size=float(order["shares"]),
-            side=side,
-        )
-        signed = None
-        if hasattr(client, "create_and_post_order"):
-            signed = client.create_and_post_order(args)
-        elif hasattr(client, "create_order"):
-            placed = client.create_order(args)
-            signed = client.post_order(placed) if hasattr(client, "post_order") else placed
+            side = Side.SELL
         else:
-            raise RuntimeError("SDK mangler create/post order")
+            from py_clob_client.clob_types import OrderArgs
+
+            try:
+                from py_clob_client.order_builder.constants import SELL
+
+                side = SELL
+            except Exception:
+                side = "SELL"
+        tick_s, neg = _clob_meta(token)
+        try:
+            args = OrderArgs(token_id=token, price=price, size=size, side=side, builder_code="")
+        except TypeError:
+            args = OrderArgs(token_id=token, price=price, size=size, side=side)
+        _attach_builder_code(args)
+        signed = _place_limit(client, args, _tick_literal(tick_s), neg, sdk=sdk)
         log.info("LIVE SELL %s", signed)
+        filled, data = _order_filled(signed)
+        if not filled:
+            log.info("Salg umatchet — holder posisjon til Polymarket-sync")
+            return {"status": "resting_sell", "response": data or signed, "ticket": payload}
         self.store.add_fill(
             condition_id=order.get("condition_id"),
             side=f"SELL_{order.get('side')}",
@@ -555,7 +669,7 @@ class Executor:
             size=order.get("shares"),
             cost=order.get("size_usd"),
             dry_run=False,
-            raw={"order": str(signed), **payload},
+            raw={"order": data or str(signed), "status": data.get("status"), "takingAmount": data.get("takingAmount"), **payload},
         )
         self.store.close_position(order["condition_id"], order.get("side"))
-        return {"status": "live_sell", "response": signed, "ticket": payload}
+        return {"status": "live_sell", "response": data or signed, "ticket": payload}

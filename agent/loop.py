@@ -31,6 +31,25 @@ class Desk:
         self.busy = False
         self.last_error: str | None = None
         self.last_cycle: dict | None = None
+        threading.Thread(target=self._bootstrap_portfolio, daemon=True, name="desk-boot").start()
+
+    def begin_cycle_async(self) -> bool:
+        if not self.cycle_lock.acquire(blocking=False):
+            return False
+        self.busy = True
+
+        def _run() -> None:
+            try:
+                self._cycle()
+            except Exception as exc:
+                self.last_error = str(exc)
+                log.exception("Syklus krasjet")
+            finally:
+                self.busy = False
+                self.cycle_lock.release()
+
+        threading.Thread(target=_run, daemon=True, name="desk-once").start()
+        return True
 
     def cycle(self) -> dict:
         if not self.cycle_lock.acquire(blocking=False):
@@ -46,23 +65,13 @@ class Desk:
             self.busy = False
             self.cycle_lock.release()
 
-    def _cycle(self) -> dict:
-        halt = self.risk.halted()
-        if halt:
-            log.warning("Stoppet: %s", halt)
-            self.last_cycle = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "halted": True,
-                "scanned": 0,
-                "estimated": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "reason": halt,
-            }
-            return {"ok": True, "halted": True}
+    def _bootstrap_portfolio(self) -> None:
+        try:
+            self._refresh_portfolio()
+        except Exception as exc:
+            log.warning("bootstrap portfolio: %s", exc)
 
-        bankroll = self.exec.bankroll()
-        self.last_error = None
+    def _refresh_portfolio(self) -> tuple[float, float, list]:
         try:
             self.exec.cancel_open()
         except Exception as exc:
@@ -73,10 +82,55 @@ class Desk:
                 self.store.sync_open_positions(live_pos)
         except Exception as exc:
             log.warning("sync posisjoner: %s", exc)
+        bankroll = self.exec.bankroll()
         open_pos = self.store.positions("open")
-        locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
-        equity = bankroll + locked
+        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
+        open_mtm = 0.0
+        for p in open_pos:
+            cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+            cv = p.get("current_value")
+            try:
+                open_mtm += float(cv) if cv not in (None, "") else cost
+            except (TypeError, ValueError):
+                open_mtm += cost
+        api_mtm = None
+        try:
+            api_mtm = self.exec.fetch_position_value()
+        except Exception:
+            api_mtm = None
+        if api_mtm is not None and api_mtm >= 0:
+            open_mtm = api_mtm
+        try:
+            deposited = float(self.store.get_meta("deposited_usd") or 0)
+        except (TypeError, ValueError):
+            deposited = 0.0
+        if deposited >= 1 and open_cost > 1 and abs(bankroll - deposited) < 3:
+            bankroll = max(0.0, bankroll - open_cost)
+        equity = bankroll + open_mtm
         self.store.mark_equity(bankroll, equity)
+        self.store.save_snapshot(bankroll, equity, open_mtm)
+        return bankroll, equity, open_pos
+
+    def _cycle(self) -> dict:
+        halt = self.risk.halted()
+        self.last_error = None
+        bankroll, equity, open_pos = self._refresh_portfolio()
+        if halt:
+            log.warning("Stoppet: %s", halt)
+            self.last_cycle = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "halted": True,
+                "scanned": 0,
+                "estimated": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "kalshi": 0,
+                "reason": halt,
+                "bankroll": bankroll,
+                "equity": equity,
+            }
+            return {"ok": True, "halted": True}
+
         log.info(
             "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s",
             settings.dry_run,
@@ -113,7 +167,8 @@ class Desk:
                     reason=ticket.thesis,
                     payload=result,
                 )
-                bankroll = max(0.0, bankroll - ticket.size_usd)
+                if result.get("status") in {"live", "paper"}:
+                    bankroll = max(0.0, bankroll - ticket.size_usd)
                 if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
                     pending_hedge = ticket if pending_hedge is None else None
                 else:
@@ -200,6 +255,7 @@ class Desk:
                 "rejected": 0,
                 "exits": 0,
                 "arb": arb_n,
+                "kalshi": kalshi_n,
                 "bankroll": bankroll,
                 "equity": equity,
             }
@@ -215,7 +271,11 @@ class Desk:
                     m["no_book"] = self.scout.book(m["no_token"], fallback_mid=no_mid)
             except Exception as exc:
                 log.warning("Bok-feil %s: %s", m.get("question", "")[:40], exc)
-                m["book"] = self.scout._synthetic(float(m.get("yes_mid") or 0))
+                m["book"] = {}
+            if (m.get("book") or {}).get("synthetic"):
+                m["book"] = {}
+            if (m.get("no_book") or {}).get("synthetic"):
+                m["no_book"] = {}
 
         self.scout.enrich(batch)
 
@@ -354,9 +414,10 @@ class Desk:
                     reason=ticket.thesis,
                     payload=result,
                 )
-                bankroll = max(0.0, bankroll - ticket.size_usd)
-                equity = bankroll + locked + ticket.size_usd
-                locked += ticket.size_usd
+                if result.get("status") in {"live", "paper"}:
+                    bankroll = max(0.0, bankroll - ticket.size_usd)
+                    equity = bankroll + locked + ticket.size_usd
+                    locked += ticket.size_usd
             except Exception as exc:
                 log.exception("Ordre feilet")
                 self.last_error = str(exc)
@@ -367,7 +428,7 @@ class Desk:
                     reason=str(exc),
                 )
 
-        if accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
+        if settings.dry_run and accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
             test = self._pipeline_ticket(markets, bankroll)
             if test:
                 try:
@@ -396,6 +457,10 @@ class Desk:
                         reason=str(exc),
                     )
 
+        try:
+            bankroll, equity, _ = self._refresh_portfolio()
+        except Exception:
+            pass
         log.info("Syklus ferdig. Grok-tickets: %s arb: %s kalshi: %s exits: %s", accepted, arb_n, kalshi_n, exits)
         self.last_cycle = {
             "ts": datetime.now(timezone.utc).isoformat(),

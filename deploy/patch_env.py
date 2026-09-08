@@ -20,7 +20,6 @@ PATCH = {
     "MAX_SPREAD": "0.08",
     "LOOP_SECONDS": "900",
     "ESTIMATE_BATCH": "12",
-    "GROK_MODEL": "grok-4.5",
     "LIVE_SEARCH": "false",
 }
 

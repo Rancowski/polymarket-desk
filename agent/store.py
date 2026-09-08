@@ -86,6 +86,8 @@ class Store:
             )
             self.conn.commit()
             self._migrate_positions()
+            self._ensure_column("positions", "current_value", "REAL")
+            self._purge_ghost_fills()
 
     def _migrate_positions(self) -> None:
         row = self.conn.execute(
@@ -122,6 +124,78 @@ class Store:
         )
         self.conn.commit()
 
+    def _ensure_column(self, table: str, col: str, decl: str) -> None:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {str(r[1]) for r in rows}
+        if col not in names:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            self.conn.commit()
+
+    def _raw_is_matched(self, raw: Any) -> bool:
+        data: Any = raw
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {"_text": raw}
+        if not isinstance(data, dict):
+            data = {}
+        order = data.get("order")
+        if isinstance(order, dict):
+            merged = {**data, **order}
+        else:
+            merged = dict(data)
+            if isinstance(order, str):
+                merged["_text"] = (merged.get("_text") or "") + " " + order
+        status = str(merged.get("status") or "").lower()
+        taking = str(merged.get("takingAmount") if merged.get("takingAmount") is not None else "").strip()
+        making = str(merged.get("makingAmount") if merged.get("makingAmount") is not None else "").strip()
+        empty = {"", "0", "0.0", "none", "null"}
+        if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"} and taking.lower() in empty and making.lower() in empty:
+            return False
+        if status in {"matched", "filled"}:
+            return True
+        try:
+            if float(taking) > 0 or float(making) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        text = str(merged.get("_text") or json.dumps(merged, default=str)).lower()
+        if "'status': 'live'" in text or '"status": "live"' in text or '"status":"live"' in text:
+            return False
+        if any(x in text for x in ("'matched'", '"matched"', "'filled'", '"filled"')):
+            return True
+        return False
+
+    def _purge_ghost_fills(self) -> None:
+        try:
+            cur = self.conn.execute("SELECT id, raw, dry_run FROM fills")
+            drop: list[int] = []
+            for row in cur.fetchall():
+                if int(row["dry_run"] or 0) == 1:
+                    continue
+                if not self._raw_is_matched(row["raw"]):
+                    drop.append(int(row["id"]))
+            for fid in drop:
+                self.conn.execute("DELETE FROM fills WHERE id=?", (fid,))
+            if drop:
+                self.conn.commit()
+        except Exception:
+            pass
+
+    def float_meta(self, key: str) -> float | None:
+        raw = self.get_meta(key, "")
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val
+
+    def save_snapshot(self, cash: float, equity: float, mtm: float = 0.0) -> None:
+        self.set_meta("last_cash", f"{cash:.4f}")
+        self.set_meta("last_equity", f"{equity:.4f}")
+        self.set_meta("last_mtm", f"{mtm:.4f}")
+
     def log_decision(self, **row: Any) -> None:
         payload = row.pop("payload", {})
         with self._lock:
@@ -149,14 +223,17 @@ class Store:
         with self._lock:
             self.conn.execute(
                 """
-                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, opened_ts, last_ts, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, current_value, opened_ts, last_ts, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id, side) DO UPDATE SET
                     shares=excluded.shares,
                     avg_cost=excluded.avg_cost,
+                    current_value=excluded.current_value,
                     last_ts=excluded.last_ts,
                     status=excluded.status,
-                    token_id=excluded.token_id
+                    token_id=excluded.token_id,
+                    question=COALESCE(excluded.question, positions.question),
+                    category=COALESCE(excluded.category, positions.category)
                 """,
                 (
                     row["condition_id"],
@@ -167,6 +244,7 @@ class Store:
                     row.get("token_id"),
                     row.get("shares", 0),
                     row.get("avg_cost", 0),
+                    row.get("current_value"),
                     row.get("opened_ts", utc_now()),
                     utc_now(),
                     row.get("status", "open"),
@@ -257,16 +335,31 @@ class Store:
             )
             return [dict(r) for r in cur.fetchall()]
 
-    def recent_fills(self, limit: int = 40) -> list[dict]:
+    def recent_fills(self, limit: int = 40, real_only: bool = False) -> list[dict]:
         with self._lock:
             cur = self.conn.execute(
                 """
-                SELECT ts, condition_id, side, price, size, cost, dry_run
+                SELECT ts, condition_id, side, price, size, cost, dry_run, raw
                 FROM fills ORDER BY id DESC LIMIT ?
                 """,
-                (limit,),
+                (max(limit * 4, 80) if real_only else limit,),
             )
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+        if real_only:
+            out = []
+            for row in rows:
+                if int(row.get("dry_run") or 0) == 1:
+                    continue
+                if not self._raw_is_matched(row.get("raw")):
+                    continue
+                row.pop("raw", None)
+                out.append(row)
+                if len(out) >= limit:
+                    break
+            return out
+        for row in rows:
+            row.pop("raw", None)
+        return rows[:limit]
 
     def equity_history(self, limit: int = 60) -> list[dict]:
         with self._lock:
@@ -301,9 +394,10 @@ class Store:
         except (TypeError, ValueError):
             pass
         first = self.first_sane_equity(equity_fallback)
-        if first >= 1:
+        if first >= 20 and equity_fallback >= 20:
             self.set_meta("deposited_usd", f"{first:.2f}")
-        return first
+            return first
+        return first if first >= 1 else 0.0
 
     def first_sane_equity(self, fallback: float) -> float:
         with self._lock:
@@ -348,19 +442,17 @@ class Store:
         with self._lock:
             cur = self.conn.execute("SELECT raw FROM fills WHERE dry_run=0")
             rows = cur.fetchall()
-        n = 0
-        for row in rows:
-            raw = str(row["raw"] or "")
-            if any(x in raw for x in ('"matched"', "'matched'", '"filled"', "'filled'")):
-                n += 1
-                continue
-            if "takingAmount" in raw and not any(x in raw for x in ('"takingAmount": ""', "'takingAmount': ''", '"takingAmount":"')):
-                n += 1
-        return n
+        return sum(1 for row in rows if self._raw_is_matched(row["raw"]))
 
     def sync_open_positions(self, live: list[dict]) -> None:
         """Erstatt lokale open med det Polymarket faktisk viser."""
-        live_keys = {(str(r.get("condition_id")), str(r.get("side") or "YES").upper()) for r in live}
+        cleaned = []
+        for r in live:
+            cid = str(r.get("condition_id") or "").strip()
+            if not cid:
+                continue
+            cleaned.append(r)
+        live_keys = {(str(r.get("condition_id")), str(r.get("side") or "YES").upper()) for r in cleaned}
         with self._lock:
             cur = self.conn.execute("SELECT condition_id, side FROM positions WHERE status='open'")
             for row in cur.fetchall():
@@ -370,7 +462,8 @@ class Store:
                         "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=? AND side=?",
                         (utc_now(), row["condition_id"], row["side"]),
                     )
-        for r in live:
+            self.conn.commit()
+        for r in cleaned:
             self.upsert_position(**r)
 
     def first_mark(self) -> dict | None:
@@ -383,23 +476,50 @@ class Store:
 
     def portfolio_stats(self, equity: float, bankroll: float, open_pos: list[dict]) -> dict:
         hist = self.equity_history(400)
-        start = self.deposited_usd(equity)
+        start = self.deposited_usd(0.0)
+        open_cost = 0.0
+        open_mtm = 0.0
+        for p in open_pos:
+            cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+            open_cost += cost
+            cv = p.get("current_value")
+            try:
+                mtm = float(cv) if cv not in (None, "") else cost
+            except (TypeError, ValueError):
+                mtm = cost
+            open_mtm += mtm
+        # CLOB viser ofte innskutt/total (221.52), ikke ledig cash (~207).
+        if start >= 1 and open_cost > 1 and abs(bankroll - start) < 3:
+            bankroll = max(0.0, bankroll - open_cost)
+        elif start >= 1 and open_cost > 1 and abs(bankroll + open_cost - start) < 8:
+            pass
+        equity = bankroll + open_mtm
         if start < 1:
-            start = equity if equity >= 1 else 1.0
-        total = equity - start
-        total_pct = total / start
+            start = equity if equity >= 1 else 0.0
+        total = equity - start if start >= 1 else 0.0
+        total_pct = (total / start) if start >= 1 else 0.0
         now = datetime.now(timezone.utc)
+
+        def _sane(eq: float) -> bool:
+            if eq < 1:
+                return False
+            if start >= 1 and abs(eq - start) / start > 0.20:
+                return False
+            return True
 
         def _at(hours: float) -> float:
             cutoff = now.timestamp() - hours * 3600
-            chosen = start
+            chosen = start if start >= 1 else equity
             for row in hist:
                 try:
                     ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
+                    eq = float(row["equity"])
+                    if not _sane(eq):
+                        continue
                     if ts.timestamp() <= cutoff:
-                        chosen = float(row["equity"])
+                        chosen = eq
                 except ValueError:
                     continue
             return chosen
@@ -408,29 +528,26 @@ class Store:
         week_base = _at(24 * 7)
         day = equity - day_base
         week = equity - week_base
-        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
-        if start > 1 and open_cost > 1 and abs(bankroll - start) < 3:
-            bankroll = max(0.0, bankroll - open_cost)
-            equity = bankroll + open_cost
-            total = equity - start
-            total_pct = total / start
-        peak = start if start > 0 else 0.0
+        peak = start if start > 0 else equity
         max_dd = 0.0
         max_dd_usd = 0.0
+        prev = peak
         for row in hist:
             eq = float(row["equity"])
-            if eq < 1:
+            if not _sane(eq):
                 continue
-            if start and abs(eq - start) / start > 0.15:
+            if prev and abs(eq - prev) / max(prev, 1) > 0.12:
                 continue
             peak = max(peak, eq)
             dd_usd = eq - peak
             if peak and dd_usd < max_dd_usd:
                 max_dd_usd = dd_usd
                 max_dd = dd_usd / peak
+            prev = eq
         xai_total = self.api_spend(hours=None)
         return {
-            "start_equity": round(start, 2),
+            "start_equity": round(start, 2) if start >= 1 else 0.0,
+            "equity": round(equity, 2),
             "total": round(total, 2),
             "total_pct": round(total_pct, 4),
             "day": round(day, 2),
@@ -441,11 +558,12 @@ class Store:
             "max_dd_usd": round(max_dd_usd, 2),
             "trades": self.live_fill_count(),
             "open_cost": round(open_cost, 2),
+            "open_mtm": round(open_mtm, 2),
             "cash": round(bankroll, 2),
             "xai_total": round(xai_total, 4),
             "xai_day": round(self.api_spend(hours=24), 4),
             "xai_prepaid": round(self.xai_prepaid_usd(), 2),
-            "deposited": round(start, 2),
+            "deposited": round(start, 2) if start >= 1 else 0.0,
             "after_xai": round(total - xai_total, 2),
             "top_rejects": self.top_rejects(8),
         }
