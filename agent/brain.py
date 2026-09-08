@@ -11,24 +11,29 @@ from agent.config import settings
 
 log = logging.getLogger("brain")
 
-SYSTEM = """Du er en edge-jeger for binære Polymarket-markeder.
-Oppgave: finn der live-informasjon (web + X) avviker fra markedets pris, og estimer P(YES slik resolusjonskilden definerer det).
+SYSTEM = """Du er sannsynlighetsanalytiker for binære Polymarket-markeder.
+Du får KUN Polymarket-data: spørsmål, resolusjonstekst, mid, spread, dybde, 24h-volum,
+likviditet, dagsendring, og søskenmarkeder i samme event. Ingen web. Ingen X.
 
-Regler:
-- JAKT edge. Hvis markedet er feilpriset gitt ferske kilder, si det tydelig.
-- Bruk web_search og x_search aktivt: siste nyheter, offisielle kilder, odds, X-innlegg fra pålitelige kontoer.
-- Ikke default til mid-prisen. Mid er referanse, ikke fasit.
-- confidence=high kun med sterke, ferske kilder. medium ved rimelig dekning. low hvis tynt — men sett likevel ditt beste p_yes.
-- skip=true bare hvis markedet er uleselig (resolusjon udefinert, allerede avgjort, eller rent gambling uten signal).
-- Aldri 0 eller 1. Hold p i [0.02, 0.98].
-- Svar KUN gyldig JSON-array. Ingen markdown.
+Oppgave: estimer P(YES slik resolusjonskilden definerer det) og finn intern feilprising.
 
-Hvert element:
+Jakte edge i:
+- Søskenmarkeder som ikke summerer (~1.0 for uttømmende utfall)
+- Bred spread / tynn bok vs mid
+- Resolusjonstekst vs hva mid antyder
+- Tid til slutt + already-moved price_change_1d
+Ikke finn på nyheter du ikke har. Mangler live-info: hold deg nær mid med mindre mikrostrukturen er feil.
+
+confidence=high ved klar intern inkonsistens. medium ved rimelig signal. low hvis bare støy.
+skip=true bare hvis uleselig eller allerede avgjort.
+Aldri 0 eller 1. p i [0.02, 0.98].
+Svar KUN gyldig JSON-array. Ingen markdown.
+
 {
   "condition_id": "...",
   "p_yes": 0.0-1.0,
   "confidence": "low"|"medium"|"high",
-  "thesis": "en setning med kilden bak avviket",
+  "thesis": "en setning om Polymarket-signalet",
   "skip": false,
   "skip_reason": ""
 }
@@ -48,28 +53,14 @@ def _extract_json(text: str) -> Any:
 
 
 def _response_text(data: dict) -> str:
-    if isinstance(data.get("output_text"), str) and data["output_text"].strip():
-        return data["output_text"]
-    chunks: list[str] = []
-    for item in data.get("output") or []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") == "message":
-            for c in item.get("content") or []:
-                if isinstance(c, dict) and c.get("type") in {"output_text", "text"}:
-                    chunks.append(str(c.get("text") or ""))
-        elif item.get("type") in {"output_text", "text"}:
-            chunks.append(str(item.get("text") or ""))
-    if chunks:
-        return "\n".join(chunks)
     try:
-        return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
         return ""
 
 
 class Brain:
-    """Grok + web/X-søk: sannsynlighet. Ingen ordre."""
+    """Grok på Polymarket-mikrostruktur. Ingen X/web-søk (kostnad)."""
 
     def estimate(self, markets: list[dict]) -> dict[str, dict]:
         if not markets:
@@ -82,21 +73,30 @@ class Brain:
             log.error("XAI_API_KEY ser feil ut. Hopper over estimat.")
             return {}
 
-        payload_markets = [
-            {
-                "condition_id": m["condition_id"],
-                "question": m["question"],
-                "description": m.get("description", "")[:900],
-                "end_date": m.get("end_date"),
-                "category": m.get("category"),
-                "yes_mid": round(m.get("yes_mid") or m.get("mid") or 0.5, 3),
-                "liquidity": int(m.get("liquidity") or 0),
-            }
-            for m in markets
-        ]
+        payload_markets = []
+        for m in markets:
+            book = m.get("book") or {}
+            payload_markets.append(
+                {
+                    "condition_id": m["condition_id"],
+                    "question": m["question"],
+                    "description": (m.get("description") or "")[:700],
+                    "end_date": m.get("end_date"),
+                    "category": m.get("category"),
+                    "yes_mid": round(float(m.get("yes_mid") or m.get("mid") or 0.5), 3),
+                    "liquidity": int(m.get("liquidity") or 0),
+                    "volume_24h": int(m.get("volume_24h") or 0),
+                    "price_change_1d": m.get("price_change_1d"),
+                    "spread": round(float(book.get("spread") or 0), 4),
+                    "best_bid": round(float(book.get("best_bid") or 0), 3),
+                    "best_ask": round(float(book.get("best_ask") or 0), 3),
+                    "bid_size": round(float(book.get("bid_size") or 0), 1),
+                    "ask_size": round(float(book.get("ask_size") or 0), 1),
+                    "siblings": m.get("siblings") or [],
+                }
+            )
         user = (
-            "Søk web og X etter det som flytter disse markedene NÅ. "
-            "Estimer P(YES) uavhengig av mid. Marker edge i thesis.\n"
+            "Estimer P(YES) fra Polymarket-feltene. Marker intern edge i thesis.\n"
             + json.dumps(payload_markets, ensure_ascii=False)
         )
         models = [settings.grok_model, "grok-4.5", "grok-4"]
@@ -121,43 +121,24 @@ class Brain:
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
-        body = {
-            "model": model,
-            "input": [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            "tools": [{"type": "web_search"}, {"type": "x_search"}],
-        }
-        r = requests.post(
-            "https://api.x.ai/v1/responses",
-            headers=headers,
-            json=body,
-            timeout=180,
-        )
-        if r.status_code in {401, 403}:
-            log.error("xAI avviste nøkkelen")
-            r.raise_for_status()
-        if r.ok:
-            return _response_text(r.json())
-        log.warning("Responses API %s: %s — fallback chat", r.status_code, r.text[:240])
-        chat = {
+        body: dict[str, Any] = {
             "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": user},
             ],
-            "tools": [{"type": "web_search"}, {"type": "x_search"}],
+            "temperature": 0.2,
         }
-        r2 = requests.post(
+        r = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers=headers,
-            json=chat,
-            timeout=180,
+            json=body,
+            timeout=90,
         )
-        r2.raise_for_status()
-        data = r2.json()
-        return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        if not r.ok:
+            log.error("xAI HTTP %s: %s", r.status_code, r.text[:400])
+            r.raise_for_status()
+        return _response_text(r.json())
 
     def _parse(self, content: str, markets: list[dict]) -> dict[str, dict]:
         rows = _extract_json(content)
@@ -178,5 +159,5 @@ class Brain:
                 "skip": bool(row.get("skip")),
                 "skip_reason": str(row.get("skip_reason") or ""),
             }
-        log.info("Brain: estimat for %s/%s markeder", len(out), len(markets))
+        log.info("Brain: estimat for %s/%s markeder (ingen live-søk)", len(out), len(markets))
         return out

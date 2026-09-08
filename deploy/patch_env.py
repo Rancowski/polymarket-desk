@@ -18,8 +18,9 @@ PATCH = {
     "MIN_VOLUME_24H_USD": "1000",
     "MIN_BOOK_MULTIPLE": "5",
     "MAX_SPREAD": "0.08",
-    "LOOP_SECONDS": "180",
-    "ESTIMATE_BATCH": "10",
+    "LOOP_SECONDS": "900",
+    "ESTIMATE_BATCH": "12",
+    "LIVE_SEARCH": "false",
 }
 
 

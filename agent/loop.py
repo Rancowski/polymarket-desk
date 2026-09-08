@@ -110,6 +110,19 @@ class Desk:
             }
             return {"ok": True, "scanned": 0}
 
+        for m in batch:
+            try:
+                if m.get("yes_token"):
+                    m["book"] = self.scout.book(m["yes_token"])
+                if m.get("no_token"):
+                    try:
+                        m["no_book"] = self.scout.book(m["no_token"])
+                    except Exception:
+                        m["no_book"] = {}
+            except Exception as exc:
+                log.warning("Bok-feil %s: %s", m.get("question", "")[:40], exc)
+                m["book"] = {}
+
         try:
             estimates = self.brain.estimate(batch)
             self.last_error = None
@@ -177,12 +190,7 @@ class Desk:
                 rejected += 1
                 continue
             try:
-                book = self.scout.book(m["yes_token"])
-                if m.get("no_token"):
-                    try:
-                        m["no_book"] = self.scout.book(m["no_token"])
-                    except Exception:
-                        m["no_book"] = {}
+                book = m.get("book") or self.scout.book(m["yes_token"])
             except Exception as exc:
                 self.store.log_decision(
                     condition_id=m["condition_id"],

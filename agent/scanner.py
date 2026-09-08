@@ -113,6 +113,8 @@ class Scout:
                 "event_key": _event_key(raw),
                 "liquidity": liq,
                 "volume_24h": vol,
+                "price_change_1d": _num(raw.get("oneDayPriceChange") or raw.get("oneHourPriceChange")),
+                "last_trade": _num(raw.get("lastTradePrice")),
                 "yes_token": str(tokens[0]),
                 "no_token": str(tokens[1]),
                 "yes_label": str(outcomes[0]),
@@ -124,6 +126,15 @@ class Scout:
             }
             if item["condition_id"]:
                 out.append(item)
+        by_event: dict[str, list[dict]] = {}
+        for item in out:
+            by_event.setdefault(item["event_key"], []).append(
+                {"q": (item["question"] or "")[:90], "yes": round(float(item.get("yes_mid") or 0), 3)}
+            )
+        for item in out:
+            key = item["event_key"]
+            q = (item["question"] or "")[:90]
+            item["siblings"] = [s for s in by_event.get(key, []) if s["q"] != q][:8]
         log.info("Scout: %s kandidater etter filter", len(out))
         return out
 
