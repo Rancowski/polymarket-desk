@@ -6,14 +6,14 @@ import sys
 from pathlib import Path
 
 PATCH = {
-    "MAX_POSITION_PCT": "0.10",
+    "MAX_POSITION_PCT": "0.18",
     "MIN_NET_EDGE": "0.012",
     "MODEL_HAIRCUT": "0",
     "KELLY_FRACTION": "0.25",
-    "MAX_OPEN_POSITIONS": "6",
+    "MAX_OPEN_POSITIONS": "10",
     "MAX_CATEGORY_PCT": "0.40",
-    "DAILY_LOSS_HALT_PCT": "0.06",
-    "WEEKLY_LOSS_HALT_PCT": "0.15",
+    "DAILY_LOSS_HALT_PCT": "1.00",
+    "WEEKLY_LOSS_HALT_PCT": "1.00",
     "MIN_LIQUIDITY_USD": "1500",
     "MIN_VOLUME_24H_USD": "500",
     "MIN_BOOK_MULTIPLE": "3",

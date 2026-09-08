@@ -10,7 +10,7 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import MAX_SPORTS, Risk, is_primary, is_sports
+from agent.risk import MAX_SPORTS, Risk, is_sports
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -147,17 +147,12 @@ class Desk:
             deposited = float(self.store.deposited_usd(0.0) or 0)
         except (TypeError, ValueError):
             deposited = 0.0
-        if deposited >= 1 and equity > 0 and equity <= 0.85 * deposited:
-            for p in open_pos:
-                if is_sports(p):
-                    key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
-                    force[key] = "equity ≤85% — flatten sports"
         sports = [p for p in open_pos if is_sports(p)]
         if len(sports) > MAX_SPORTS:
             extra = sorted(sports, key=self._upnl)[: len(sports) - MAX_SPORTS]
             for p in extra:
                 key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
-                force[key] = "maks 2 sports — trim"
+                force[key] = "maks 4 sports — trim"
         remaining = [
             p for p in open_pos
             if (str(p.get("condition_id")), str(p.get("side") or "YES")) not in force
@@ -167,7 +162,7 @@ class Desk:
             ranked = sorted(remaining, key=self._upnl)
             for p in ranked[: len(remaining) - cap]:
                 key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
-                force[key] = "maks 6 — trim dårligste"
+                force[key] = "maks 10 — trim dårligste"
         return force
 
     def _market_stubs(self, open_pos: list) -> dict:
@@ -404,7 +399,7 @@ class Desk:
             return {"ok": True, "halted": True}
 
         self._cycle_i += 1
-        run_grok = self._cycle_i % 3 == 1
+        run_grok = self._cycle_i % 2 == 1
         log.info(
             "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s grok=%s n=%s",
             settings.dry_run,
@@ -488,7 +483,7 @@ class Desk:
                 by_id[cid]["kalshi"] = stub["kalshi"]
         for cid, stub in self._market_stubs(open_pos).items():
             by_id.setdefault(cid, stub)
-        ranked = [m for m in markets if not m.get("_open_only") and is_primary(m)]
+        ranked = [m for m in markets if not m.get("_open_only")]
 
         def _prio(m: dict) -> tuple:
             ks = m.get("kalshi") or {}
@@ -563,7 +558,7 @@ class Desk:
                 batch = extras
             if not run_grok:
                 estimates = {}
-                log.info("Hopper Grok (syklus %s, neste om %s)", self._cycle_i, 3 - (self._cycle_i % 3))
+                log.info("Hopper Grok (syklus %s, annenhver)", self._cycle_i)
             else:
                 estimates = self.brain.estimate(batch) if (remaining >= 0.02 or extras) else {}
             usage = getattr(self.brain, "last_usage", {}) or {}
@@ -580,7 +575,7 @@ class Desk:
                 est = estimates.get(cid) or {}
                 p = est.get("p_yes")
                 gap = abs(float(ks.get("gap") or 0))
-                w_k = 0.70 if gap >= 0.05 else 0.55
+                w_k = 0.70 if gap >= 0.04 else 0.55
                 blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
                 estimates[cid] = {
                     **est,

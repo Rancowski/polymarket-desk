@@ -512,7 +512,11 @@ class Executor:
         if getattr(ticket, "synthetic", False):
             raise RuntimeError("live-kjøp avvist: syntetisk bok")
         if is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
-            raise RuntimeError("sports ikke kjerne — ingen nye sports-kjøp")
+            if not (0.22 < float(ticket.limit_price) < 0.82):
+                raise RuntimeError("sports ekstrem-pris")
+            sports_pos = [p for p in self.store.positions("open") if is_sports(p)]
+            if len(sports_pos) >= 4:
+                raise RuntimeError("maks 4 sports")
         client = self._live_client()
         sdk = getattr(self, "_sdk", "v1")
         if sdk == "v2":

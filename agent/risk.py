@@ -161,13 +161,13 @@ PRIMARY_HINTS = (
     "bitcoin", "btc", "ethereum", "eth ", " eth",
     "trump",
 )
-SPORTS_PX = (0.28, 0.72)
-DEPLOYED_MAX = 0.50
-EQUITY_HALT = 0.85
-MAX_SPORTS = 2
-HARD_NAME_PCT = 0.10
-SPORTS_PCT = 0.03
-CORE_PCT = (0.06, 0.08)
+SPORTS_PX = (0.22, 0.82)
+DEPLOYED_MAX = 0.75
+EQUITY_SPORTS_HALT = 0.70
+MAX_SPORTS = 4
+HARD_NAME_PCT = 0.18
+SPORTS_PCT = (0.06, 0.08)
+CORE_PCT = (0.10, 0.14)
 
 
 def is_primary(row: dict) -> bool:
@@ -181,11 +181,11 @@ def is_primary(row: dict) -> bool:
 
 
 def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
-    """Kelly, then a fillable clip. Sports tickets are ~3% (~$7), so min is $5 not $8."""
+    """Kelly, then a fillable clip. Sports tickets are 6–8% (~$13–18)."""
     kelly = kelly_usd(p_hat, cost, bankroll)
     if kelly <= 0:
         return 0.0
-    min_clip = min(cap, max(5.0, 0.03 * bankroll))
+    min_clip = min(cap, max(8.0, 0.06 * bankroll))
     return min(cap, max(kelly, min_clip))
 
 
@@ -199,17 +199,13 @@ class Risk:
         return None
 
     def buys_blocked(self, equity: float, deposited: float) -> str | None:
-        halt = self.halted()
-        if halt:
-            return halt
-        if deposited >= 1 and equity > 0 and equity <= EQUITY_HALT * deposited:
-            return "equity ≤85% av innskutt — ingen nye kjøp"
-        now = datetime.now(timezone.utc)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        hours = max(1.0, (now - start).total_seconds() / 3600.0)
-        day = self.store.equity_change_since(hours, equity)
-        if deposited >= 1 and day <= -settings.daily_loss_halt_pct * deposited:
-            return "daglig tap ≤ −6% av innskutt — ingen nye kjøp"
+        """HALT-fil only. No daily freeze, no 85% desk stop."""
+        _ = (equity, deposited)
+        return self.halted()
+
+    def sports_blocked(self, equity: float, deposited: float) -> str | None:
+        if deposited >= 1 and equity > 0 and equity <= EQUITY_SPORTS_HALT * deposited:
+            return "equity ≤70% — ingen ny sports"
         return None
 
     def evaluate(
@@ -287,10 +283,9 @@ class Risk:
         sports = is_sports(market)
         if sports and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
             return None, "sports ekstrem-pris"
-        if sports:
-            return None, "sports ikke kjerne (kun exits)"
-        if not is_primary(market):
-            return None, "utenfor univers"
+        sport_halt = self.sports_blocked(equity, deposited)
+        if sports and sport_halt:
+            return None, sport_halt
 
         open_pos = self.store.positions("open")
         event = market.get("event_key") or market["condition_id"]
@@ -301,14 +296,10 @@ class Risk:
         if not hedge and any(p.get("event_key") == event and p.get("condition_id") != cid for p in open_pos):
             return None, "ett event en tese"
         if len(open_pos) >= settings.max_open_positions and not hedge:
-            return None, "max 6 åpne (kun hedge)"
+            return None, "max 10 åpne (kun hedge)"
         sports_pos = [p for p in open_pos if is_sports(p)]
-        if sports:
-            if len(sports_pos) >= MAX_SPORTS:
-                return None, "maks 2 sports"
-            losers = sum(1 for p in sports_pos if _row_upnl(p) < -0.25)
-            if losers >= MAX_SPORTS:
-                return None, "2 sports i minus — ingen ny"
+        if sports and len(sports_pos) >= MAX_SPORTS:
+            return None, "maks 4 sports"
         same_event_cost = sum(
             float(p["shares"]) * float(p["avg_cost"])
             for p in open_pos
@@ -324,7 +315,7 @@ class Risk:
         size_base = deposited if deposited >= 1 else bankroll
         longshot = cost <= 0.28
         if sports or longshot:
-            floor_pct, cap_pct = SPORTS_PCT, SPORTS_PCT
+            floor_pct, cap_pct = SPORTS_PCT
         else:
             floor_pct, cap_pct = CORE_PCT
         cap = min(cap_pct * size_base, HARD_NAME_PCT * size_base)
@@ -332,7 +323,7 @@ class Risk:
         remaining_cat = max(0.0, settings.max_category_pct * size_base - cat_cost)
         powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
         if not hedge and powder < 5:
-            return None, "krutt tørt (≤50% deployed)"
+            return None, "krutt tørt (≤75% deployed)"
         hard = min(cap, remaining_event, remaining_cat, bankroll, powder)
         sized = clip_usd(p_hat, cost, size_base, hard)
         if not probe and sized > 0:
@@ -353,14 +344,6 @@ class Risk:
             sized = shares * cost
             if sized < 5 or shares < 5:
                 return None, "bok for tynn etter cap"
-
-        daily = self.store.equity_change_since(24, equity)
-        weekly = self.store.equity_change_since(24 * 7, equity)
-        base = deposited if deposited >= 1 else bankroll
-        if daily < -settings.daily_loss_halt_pct * base:
-            return None, "daglig tap-stopp"
-        if weekly < -settings.weekly_loss_halt_pct * base:
-            return None, "ukentlig tap-stopp"
 
         # Kryss ask så ordren fylles (GTC mid+1¢ blir ofte liggende)
         limit = round(min(0.99, max(0.01, cost)), 2)
@@ -446,23 +429,23 @@ class Risk:
         if bid > hwm:
             hwm = bid
             self.store.set_meta(hwm_key, f"{hwm:.4f}")
-        if sports and (hwm >= avg * 1.18 or pnl_pct >= 0.18) and hwm > 0 and bid <= hwm * 0.92:
+        if sports and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and hwm > 0 and bid <= hwm * 0.92:
             return self._exit_ticket(
                 pos, book, shares, bid, f"sports trail −8% fra topp {hwm:.3f} → {bid:.3f}",
                 kind="tp", best_bid=bid,
             ), "ok"
 
-        if sports and (bid <= avg * 0.88 or pnl_pct <= -0.12 or bid <= 0.04):
+        if sports and (bid <= avg * 0.85 or pnl_pct <= -0.15 or bid <= 0.03):
             return self._exit_ticket(
                 pos, book, shares, max(bid, 0.01), f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
                 kind="stop", best_bid=bid,
             ), "ok"
-        if not sports and pnl_pct <= -0.15:
+        if not sports and pnl_pct <= -0.22:
             return self._exit_ticket(
                 pos, book, shares, bid, f"stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
                 kind="stop", best_bid=bid,
             ), "ok"
-        if not sports and (bid >= 0.92 or pnl_pct >= 0.22):
+        if not sports and (bid >= 0.90 or pnl_pct >= 0.28):
             return self._exit_ticket(
                 pos, book, shares, bid, f"ta gevinst {pnl_pct:.1%} bid {bid:.3f}",
                 kind="tp", best_bid=bid,
@@ -491,7 +474,7 @@ class Risk:
         k_yes = float(ks.get("yes") or 0)
         if 0.02 < k_yes < 0.98:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
-            if k_hat + 0.06 < avg:
+            if k_hat + 0.07 < avg:
                 return self._exit_ticket(
                     pos, book, shares, max(bid, 0.01),
                     f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}",
@@ -506,9 +489,9 @@ class Risk:
             if p_yes is not None:
                 p_hat = p_yes if side == "YES" else 1.0 - p_yes
                 faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
-                if p_hat + 0.04 <= avg and not faded_to_mid:
+                if p_hat + 0.05 <= avg and not faded_to_mid:
                     return self._exit_ticket(
-                        pos, book, shares, bid, f"p_hat {p_hat:.2f} ≥4c under kost {avg:.2f}",
+                        pos, book, shares, bid, f"p_hat {p_hat:.2f} ≥5c under kost {avg:.2f}",
                         kind="stop", best_bid=bid,
                     ), "ok"
         return None, f"hold bid {bid:.3f} pnl {pnl_pct:.1%}"

@@ -288,19 +288,19 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
         }
         m["kalshi"] = payload
         hits += 1
-        action, reason = "skip", f"gap {gap:+.2f} < 5c"
+        action, reason = "skip", f"gap {gap:+.2f} < 4c"
         side = str(m.get("side") or "").upper()
         avg = float(m.get("avg_cost") or 0)
         k_yes = float(best["yes"])
         if 0.02 < k_yes < 0.98 and avg > 0 and side in {"YES", "NO"}:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
-            if k_hat + 0.06 < avg:
-                action, reason = "sell", f"Kalshi {k_hat:.2f} ≥6c mot kost {avg:.2f}"
-            elif abs(gap) >= 0.05:
+            if k_hat + 0.07 < avg:
+                action, reason = "sell", f"Kalshi {k_hat:.2f} ≥7c mot kost {avg:.2f}"
+            elif abs(gap) >= 0.04:
                 action, reason = "skip", "allerede inne"
             else:
-                action, reason = "skip", f"gap {gap:+.2f} < 5c"
-        elif abs(gap) >= 0.05:
+                action, reason = "skip", f"gap {gap:+.2f} < 4c"
+        elif abs(gap) >= 0.04:
             cheap = "NO" if gap > 0 else "YES"
             action, reason = "buy", f"bekreftelse {cheap} gap {gap:+.2f}"
         logs.append(
