@@ -218,3 +218,66 @@ class Store:
             rows = [dict(r) for r in cur.fetchall()]
         rows.reverse()
         return rows
+
+    def fill_count(self) -> int:
+        with self._lock:
+            cur = self.conn.execute("SELECT COUNT(*) AS n FROM fills")
+            row = cur.fetchone()
+        return int(row["n"] if row else 0)
+
+    def first_mark(self) -> dict | None:
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT ts, bankroll, equity FROM pnl_marks ORDER BY id ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def portfolio_stats(self, equity: float, bankroll: float, open_pos: list[dict]) -> dict:
+        hist = self.equity_history(400)
+        first = self.first_mark()
+        start = float(first["equity"]) if first else equity
+        total = equity - start
+        total_pct = (total / start) if start else 0.0
+        now = datetime.now(timezone.utc)
+
+        def _at(hours: float) -> float:
+            cutoff = now.timestamp() - hours * 3600
+            chosen = start
+            for row in hist:
+                try:
+                    ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts.timestamp() <= cutoff:
+                        chosen = float(row["equity"])
+                except ValueError:
+                    continue
+            return chosen
+
+        day_base = _at(24)
+        week_base = _at(24 * 7)
+        day = equity - day_base
+        week = equity - week_base
+        peak = start
+        max_dd = 0.0
+        for row in hist:
+            eq = float(row["equity"])
+            peak = max(peak, eq)
+            if peak:
+                max_dd = min(max_dd, (eq - peak) / peak)
+        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
+        return {
+            "start_equity": round(start, 2),
+            "total": round(total, 2),
+            "total_pct": round(total_pct, 4),
+            "day": round(day, 2),
+            "day_pct": round(day / day_base, 4) if day_base else 0.0,
+            "week": round(week, 2),
+            "week_pct": round(week / week_base, 4) if week_base else 0.0,
+            "max_dd_pct": round(max_dd, 4),
+            "trades": self.fill_count(),
+            "open_cost": round(open_cost, 2),
+            "cash": round(bankroll, 2),
+        }
+

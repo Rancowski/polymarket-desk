@@ -66,7 +66,8 @@ def _state() -> dict[str, Any]:
         ],
         "decisions": desk.store.recent_decisions(60) if desk else [],
         "fills": desk.store.recent_fills(30) if desk else [],
-        "equity_history": desk.store.equity_history(48) if desk else [],
+        "equity_history": desk.store.equity_history(120) if desk else [],
+        "stats": desk.store.portfolio_stats(equity, bankroll, open_pos) if desk else {},
         "auth_required": bool(settings.dashboard_token),
     }
 

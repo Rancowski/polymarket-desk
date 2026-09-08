@@ -130,13 +130,24 @@
         `<span class="pill">${live}</span>` +
         (s.busy ? `<span class="pill">Kjører syklus…</span>` : "");
     }
+    const signed = (n) => (n > 0.004 ? "+" : n < -0.004 ? "\u2212" : "") + usd(Math.abs(n));
+    const pctn = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)} %`;
     function stats(s) {
-      $("stats").innerHTML = [
-        ["Egenkapital", usd(s.equity)],
-        ["Kontanter", usd(s.bankroll)],
-        ["Åpne", `${s.open} / ${s.max_open}`],
-        ["Kant", `${(s.min_net_edge * 100).toFixed(0)}% net`],
-      ].map(([l, v]) => `<div class="stat"><span>${l}</span><strong>${v}</strong></div>`).join("");
+      const st = s.stats || {};
+      const tone = (n) => (n > 0.004 ? "gain" : n < -0.004 ? "loss" : "");
+      const cards = [
+        ["Egenkapital", usd(s.equity), ""],
+        ["Kontanter", usd(s.bankroll), ""],
+        ["Total", `${signed(st.total || 0)} (${pctn(st.total_pct || 0)})`, tone(st.total || 0)],
+        ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
+        ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
+        ["Maks tap", pctn(st.max_dd_pct || 0), (st.max_dd_pct || 0) < -0.001 ? "loss" : ""],
+        ["Åpne / kostnad", `${s.open} / ${usd(st.open_cost || 0)}`, ""],
+        ["Handler", String(st.trades || 0), ""],
+      ];
+      $("stats").innerHTML = cards.map(([l, v, c]) =>
+        `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
+      ).join("");
     }
     function spark(hist) {
       const el = $("spark");
@@ -183,7 +194,7 @@
       spark(s.equity_history);
       const c = s.last_cycle;
       $("cycle").textContent = c
-        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · tatt ${c.accepted || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}`
+        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}`
         : "Venter på første syklus.";
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;

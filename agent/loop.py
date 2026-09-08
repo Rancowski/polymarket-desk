@@ -6,6 +6,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 
+from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
@@ -23,6 +24,7 @@ class Desk:
         self.store = Store()
         self.scout = Scout()
         self.brain = Brain()
+        self.arb = Arb(self.scout, self.store)
         self.risk = Risk(self.store)
         self.exec = Executor(self.store)
         self.cycle_lock = threading.Lock()
@@ -73,6 +75,37 @@ class Desk:
         )
 
         markets = self.scout.fetch()
+        arb_tickets = self.arb.scan(markets, bankroll)
+        arb_n = 0
+        for ticket in arb_tickets:
+            try:
+                result = self.exec.submit(ticket)
+                arb_n += 1
+                self.store.log_decision(
+                    condition_id=ticket.condition_id,
+                    question=ticket.question,
+                    side=ticket.side,
+                    mid=ticket.mid,
+                    p_hat=ticket.p_hat,
+                    edge_net=ticket.edge_net,
+                    action=result.get("status"),
+                    reason=ticket.thesis,
+                    payload=result,
+                )
+                bankroll = max(0.0, bankroll - ticket.size_usd)
+            except Exception as exc:
+                log.exception("Arb-ordre feilet")
+                self.store.log_decision(
+                    condition_id=ticket.condition_id,
+                    question=ticket.question,
+                    action="error",
+                    reason=str(exc),
+                )
+        if arb_n:
+            open_pos = self.store.positions("open")
+            locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
+            equity = bankroll + locked
+
         by_id = {m["condition_id"]: m for m in markets}
         for pos in open_pos:
             cid = pos.get("condition_id")
@@ -105,6 +138,7 @@ class Desk:
                 "accepted": 0,
                 "rejected": 0,
                 "exits": 0,
+                "arb": arb_n,
                 "bankroll": bankroll,
                 "equity": equity,
             }
@@ -241,13 +275,14 @@ class Desk:
                     action="error",
                     reason=str(exc),
                 )
-        log.info("Syklus ferdig. Nye tickets: %s exits: %s", accepted, exits)
+        log.info("Syklus ferdig. Grok-tickets: %s arb: %s exits: %s", accepted, arb_n, exits)
         self.last_cycle = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "halted": False,
             "scanned": len(markets),
             "estimated": len(estimates),
             "accepted": accepted,
+            "arb": arb_n,
             "rejected": rejected,
             "exits": exits,
             "bankroll": bankroll,
