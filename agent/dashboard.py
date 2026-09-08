@@ -106,6 +106,18 @@ def _state() -> dict[str, Any]:
         "stats": st,
         "xai_remaining": remaining,
         "auth_required": bool(settings.dashboard_token),
+        "rules": {
+            "live": not settings.dry_run,
+            "loop_min": round(settings.loop_seconds / 60, 1),
+            "min_net_edge": settings.min_net_edge,
+            "max_pos_pct": settings.max_position_pct,
+            "kelly": settings.kelly_fraction,
+            "max_open": settings.max_open_positions,
+            "grok": settings.grok_model,
+            "kalshi": True,
+            "sig": settings.signature_type,
+            "batch": settings.estimate_batch,
+        },
     }
 
 

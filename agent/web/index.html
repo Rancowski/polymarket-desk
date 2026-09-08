@@ -67,8 +67,11 @@
     .cap { display: grid; gap: .5rem; grid-template-columns: 1fr; margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
     @media (min-width: 700px) { .cap { grid-template-columns: 1fr 1fr auto; align-items: end; } }
     .cap label { display: block; color: var(--muted); font-size: .75rem; margin-bottom: .25rem; }
-    .cap input { width: 100%; min-height: 2.5rem; border-radius: .6rem; border: 1px solid var(--border);
-      background: var(--raised); color: var(--fg); padding: 0 .75rem; font: inherit; }
+    .rules { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .4rem; margin-top: 1rem; }
+    @media (min-width: 700px) { .rules { grid-template-columns: repeat(4, minmax(0,1fr)); } }
+    .rules div { font-size: .75rem; color: var(--muted); background: var(--surface); border: 1px solid var(--border);
+      border-radius: .75rem; padding: .65rem .8rem; }
+    .rules strong { display: block; color: var(--fg); font-size: .88rem; margin-top: .15rem; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -97,10 +100,12 @@
     <div id="err"></div>
     <svg class="spark" id="spark" viewBox="0 0 320 88" preserveAspectRatio="none"></svg>
     <p class="note" id="cycle"></p>
+    <div class="rules" id="rules"></div>
     <div class="tabs">
       <button class="active" data-tab="pos" type="button">Posisjoner</button>
       <button data-tab="log" type="button">Logg</button>
       <button data-tab="fill" type="button">Fills</button>
+      <button data-tab="rules" type="button">Regler</button>
     </div>
     <div class="panel" id="panel"></div>
     <form class="cap" id="cap">
@@ -211,6 +216,22 @@
         ).join("");
         return;
       }
+      if (tab === "rules") {
+        const r = s.rules || {};
+        el.innerHTML = [
+          ["Modus", r.live ? "Live pUSD" : "Paper"],
+          ["Syklus", `${r.loop_min || 15} min`],
+          ["Min. nettokant", `${((r.min_net_edge || 0) * 100).toFixed(1)} %`],
+          ["Maks posisjon", `${((r.max_pos_pct || 0) * 100).toFixed(0)} % av bankroll`],
+          ["Kelly", String(r.kelly ?? "—")],
+          ["Maks åpne", String(r.max_open ?? "—")],
+          ["Grok", r.grok || "—"],
+          ["Kalshi", r.kalshi ? "På (pris-signal, ingen konto)" : "Av"],
+          ["Signature", String(r.sig ?? "—")],
+          ["Grok-batch", String(r.batch ?? "—")],
+        ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
+        return;
+      }
       if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen beslutninger ennå.</p>`; return; }
       el.innerHTML = s.decisions.map((d) => {
         const tone = (d.action === "live" || d.action === "paper") ? "gain" : "";
@@ -223,6 +244,17 @@
       pills(s);
       stats(s);
       spark(s.equity_history);
+      const r = s.rules || {};
+      $("rules").innerHTML = [
+        ["Modus", r.live ? "Live" : "Paper"],
+        ["Syklus", `${r.loop_min || 15} min`],
+        ["Min. kant", `${((r.min_net_edge || 0) * 100).toFixed(1)} %`],
+        ["Maks pos.", `${((r.max_pos_pct || 0) * 100).toFixed(0)} %`],
+        ["Grok", r.grok || "—"],
+        ["Kalshi", r.kalshi ? "På" : "Av"],
+        ["Kelly", String(r.kelly ?? "—")],
+        ["Signatur", String(r.sig ?? "—")],
+      ].map(([k, v]) => `<div>${k}<strong>${v}</strong></div>`).join("");
       const st = s.stats || {};
       const depEl = $("dep");
       const xaiEl = $("xai");

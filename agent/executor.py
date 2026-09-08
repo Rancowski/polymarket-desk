@@ -29,16 +29,25 @@ def _tick_literal(raw: Any) -> str:
     return "0.01"
 
 
-def _place_limit(client: Any, args: Any, tick_s: str, neg: bool) -> Any:
-    """Kall create_and_post_order med den signaturen denne SDK-versjonen faktisk har."""
+def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1") -> Any:
     import inspect
+
+    if sdk == "v2":
+        from py_clob_client_v2 import OrderType, PartialCreateOrderOptions
+
+        options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
+        fn = client.create_and_post_order
+        names = list(inspect.signature(fn).parameters)
+        if "order_type" in names:
+            return fn(args, options, OrderType.GTC)
+        return fn(args, options)
 
     from py_clob_client.clob_types import PartialCreateOrderOptions
 
     options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
     fn = client.create_and_post_order
     names = list(inspect.signature(fn).parameters)
-    log.info("CLOB create_and_post_order(%s) tick=%s neg=%s", names, tick_s, neg)
+    log.info("CLOB create_and_post_order(%s) tick=%s neg=%s sdk=%s", names, tick_s, neg, sdk)
     if "order_type" in names:
         from py_clob_client.clob_types import OrderType
 
@@ -130,53 +139,93 @@ class Executor:
     def __init__(self, store: Store) -> None:
         self.store = store
         self._client = None
+        self._sdk = "v1"
+
+    def _attach_creds(self, client: Any, v2: bool) -> None:
+        if settings.poly_api_key and settings.poly_api_secret:
+            try:
+                if v2:
+                    from py_clob_client_v2 import ApiCreds
+                else:
+                    from py_clob_client.clob_types import ApiCreds
+                creds = ApiCreds(
+                    api_key=settings.poly_api_key,
+                    api_secret=settings.poly_api_secret,
+                    api_passphrase=settings.poly_api_passphrase,
+                )
+                if hasattr(client, "set_api_creds"):
+                    client.set_api_creds(creds)
+            except Exception as exc:
+                log.warning("API-creds: %s", exc)
+            return
+        derive = getattr(client, "create_or_derive_api_creds", None) or getattr(
+            client, "create_or_derive_api_key", None
+        )
+        if derive:
+            creds = derive()
+            if hasattr(client, "set_api_creds"):
+                client.set_api_creds(creds)
+            log.info("API-creds derivert")
 
     def _live_client(self):
         if self._client is not None:
             return self._client
         if not settings.private_key:
             raise RuntimeError("POLYMARKET_PRIVATE_KEY mangler for live")
-        from py_clob_client.client import ClobClient
-
-        kwargs: dict[str, Any] = {
-            "host": settings.clob_host,
-            "key": settings.private_key,
-            "chain_id": settings.chain_id,
-        }
+        funder = settings.funder or None
+        wanted = int(settings.signature_type or 3)
+        # v1 avviser signatureType=3 lokalt med "Invalid order inputs".
+        # Nye Polymarket-kontoer (email/deposit) MÅ bruke v2 + POLY_1271.
         try:
-            self._client = ClobClient(
-                settings.clob_host,
-                key=settings.private_key,
-                chain_id=settings.chain_id,
-                signature_type=settings.signature_type,
-                funder=settings.funder or None,
-            )
-        except TypeError:
-            self._client = ClobClient(**kwargs)
+            from py_clob_client_v2 import ClobClient as C2
 
-        if settings.poly_api_key and settings.poly_api_secret:
+            st: Any = wanted
             try:
-                from py_clob_client.clob_types import ApiCreds
+                from py_clob_client_v2 import SignatureTypeV2
 
-                creds = ApiCreds(
-                    api_key=settings.poly_api_key,
-                    api_secret=settings.poly_api_secret,
-                    api_passphrase=settings.poly_api_passphrase,
-                )
-                if hasattr(self._client, "set_api_creds"):
-                    self._client.set_api_creds(creds)
-            except Exception as exc:
-                log.warning("Kunne ikke sette API-creds direkte: %s", exc)
-        else:
-            derive = getattr(self._client, "create_or_derive_api_creds", None) or getattr(
-                self._client, "create_or_derive_api_key", None
+                st = {
+                    0: SignatureTypeV2.EOA,
+                    1: SignatureTypeV2.POLY_PROXY,
+                    2: SignatureTypeV2.POLY_GNOSIS_SAFE,
+                    3: SignatureTypeV2.POLY_1271,
+                }.get(wanted, SignatureTypeV2.POLY_1271)
+            except Exception:
+                pass
+            client = C2(
+                host=settings.clob_host,
+                chain_id=settings.chain_id,
+                key=settings.private_key,
+                signature_type=st,
+                funder=funder,
             )
-            if derive:
-                creds = derive()
-                if hasattr(self._client, "set_api_creds"):
-                    self._client.set_api_creds(creds)
-                log.info("API-creds derivert. Lagre POLY_API_KEY/SECRET/PASSPHRASE i .env")
-        return self._client
+            self._attach_creds(client, v2=True)
+            self._client = client
+            self._sdk = "v2"
+            log.info("CLOB v2 klar signature_type=%s funder=%s", wanted, (funder or "")[:12])
+            return client
+        except Exception as exc:
+            log.warning("CLOB v2 feilet (%s) — v1 uten type 3", exc)
+
+        from py_clob_client.client import ClobClient as C1
+
+        # v1 order-builder godtar bare 0/1/2. 3 → Invalid order inputs.
+        for st in (1, 2, 0):
+            try:
+                client = C1(
+                    settings.clob_host,
+                    key=settings.private_key,
+                    chain_id=settings.chain_id,
+                    signature_type=st,
+                    funder=funder,
+                )
+                self._attach_creds(client, v2=False)
+                self._client = client
+                self._sdk = "v1"
+                log.info("CLOB v1 klar signature_type=%s", st)
+                return client
+            except Exception as exc:
+                log.warning("CLOB v1 sig %s: %s", st, exc)
+        raise RuntimeError("Kunne ikke lage CLOB-klient")
 
     def bankroll(self) -> float:
         if settings.dry_run or not settings.private_key:
@@ -255,8 +304,16 @@ class Executor:
             return {"status": "paper", "ticket": payload}
 
         client = self._live_client()
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY
+        sdk = getattr(self, "_sdk", "v1")
+        if sdk == "v2":
+            from py_clob_client_v2 import OrderArgs, Side
+
+            side = Side.BUY
+        else:
+            from py_clob_client.clob_types import OrderArgs
+            from py_clob_client.order_builder.constants import BUY
+
+            side = BUY
 
         token = str(ticket.token_id or "").strip()
         if not token or not token.isdigit():
@@ -290,12 +347,12 @@ class Executor:
         price = _quantize(float(ticket.limit_price), tick_f)
         size = _amount_size(price, max(min_sz, float(ticket.shares), 10.0))
         log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s…", price, size, tick_s, neg, token[:14])
-        args = OrderArgs(token_id=token, price=price, size=size, side=BUY)
+        args = OrderArgs(token_id=token, price=price, size=size, side=side)
         last_err: Exception | None = None
         signed = None
         for nflag in (neg, (not neg)):
             try:
-                signed = _place_limit(client, args, tick_s, nflag)
+                signed = _place_limit(client, args, tick_s, nflag, sdk=sdk)
                 last_err = None
                 log.info("LIVE ORDER ok neg=%s %s", nflag, signed)
                 break
