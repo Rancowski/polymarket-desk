@@ -101,7 +101,9 @@
   <script>
     let tab = "pos";
     let state = null;
+    const tokenKey = "fjord_token";
     const $ = (id) => document.getElementById(id);
+    const token = () => sessionStorage.getItem(tokenKey) || new URLSearchParams(location.search).get("token") || "";
     const usd = (n) => (Number(n) || 0).toLocaleString("nb-NO", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
     const clock = (iso) => {
       if (!iso) return "—";
@@ -109,7 +111,14 @@
       return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("nb-NO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
     };
     async function api(path, method) {
-      const r = await fetch(path, { method: method || "GET" });
+      const headers = {};
+      if (token()) headers["X-Dashboard-Token"] = token();
+      const r = await fetch(path, { method: method || "GET", headers, credentials: "same-origin" });
+      if (r.status === 401) {
+        const t = window.prompt("Dashboard-token (DASHBOARD_TOKEN i .env)");
+        if (t) { sessionStorage.setItem(tokenKey, t); return api(path, method); }
+        throw new Error("Ingen tilgang");
+      }
       return r.json();
     }
     function pills(s) {
