@@ -1,5 +1,6 @@
 #!/bin/bash
-# Oppdater kode fra GitHub uten å røre .env-nøkler, deretter restart.
+# Aldri rør data/ (PnL, xAI-kost, innskutt, posisjoner) eller hemmelige nøkler.
+# patch_env.py endrer kun kjente handelsparametre.
 set -euo pipefail
 ROOT="${ROOT:-/opt/polymarket-desk}"
 cd "$ROOT"

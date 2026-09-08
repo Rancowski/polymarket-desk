@@ -78,6 +78,10 @@ class Store:
                     model TEXT,
                     tokens INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS meta (
+                    k TEXT PRIMARY KEY,
+                    v TEXT
+                );
                 """
             )
             self.conn.commit()
@@ -274,6 +278,50 @@ class Store:
         rows.reverse()
         return rows
 
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._lock:
+            cur = self.conn.execute("SELECT v FROM meta WHERE k=?", (key,))
+            row = cur.fetchone()
+        return str(row["v"]) if row and row["v"] is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (key, str(value)),
+            )
+            self.conn.commit()
+
+    def deposited_usd(self, equity_fallback: float) -> float:
+        raw = self.get_meta("deposited_usd", "")
+        try:
+            val = float(raw)
+            if val >= 1:
+                return val
+        except (TypeError, ValueError):
+            pass
+        first = self.first_sane_equity(equity_fallback)
+        if first >= 1:
+            self.set_meta("deposited_usd", f"{first:.2f}")
+        return first
+
+    def first_sane_equity(self, fallback: float) -> float:
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT equity FROM pnl_marks WHERE equity >= 20 ORDER BY id ASC LIMIT 1"
+            )
+            row = cur.fetchone()
+        if row:
+            return float(row["equity"])
+        return float(fallback or 0)
+
+    def xai_prepaid_usd(self) -> float:
+        raw = self.get_meta("xai_prepaid_usd", "")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return float(settings.xai_prepaid_usd or 0)
+
     def fill_count(self) -> int:
         with self._lock:
             cur = self.conn.execute("SELECT COUNT(*) AS n FROM fills")
@@ -290,10 +338,11 @@ class Store:
 
     def portfolio_stats(self, equity: float, bankroll: float, open_pos: list[dict]) -> dict:
         hist = self.equity_history(400)
-        first = self.first_mark()
-        start = float(first["equity"]) if first else equity
+        start = self.deposited_usd(equity)
+        if start < 1:
+            start = equity if equity >= 1 else 1.0
         total = equity - start
-        total_pct = (total / start) if start else 0.0
+        total_pct = total / start
         now = datetime.now(timezone.utc)
 
         def _at(hours: float) -> float:
@@ -336,6 +385,9 @@ class Store:
             "cash": round(bankroll, 2),
             "xai_total": round(self.api_spend(hours=None), 4),
             "xai_day": round(self.api_spend(hours=24), 4),
+            "xai_prepaid": round(self.xai_prepaid_usd(), 2),
+            "deposited": round(start, 2),
+            "after_xai": round(total - self.api_spend(hours=None), 2),
             "top_rejects": self.top_rejects(8),
         }
 

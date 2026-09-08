@@ -63,7 +63,11 @@
       border: 1px solid color-mix(in oklab, var(--loss) 30%, transparent);
       background: color-mix(in oklab, var(--loss) 10%, transparent); color: var(--loss); font-size: .9rem; }
     svg.spark { width: 100%; height: 88px; margin-top: 1rem; }
-    .note { color: var(--subtle); font-size: .78rem; margin-top: .75rem; line-height: 1.45; }
+    .cap { display: grid; gap: .5rem; grid-template-columns: 1fr; margin-top: 1rem; }
+    @media (min-width: 700px) { .cap { grid-template-columns: 1fr 1fr auto; align-items: end; } }
+    .cap label { display: block; color: var(--muted); font-size: .75rem; margin-bottom: .25rem; }
+    .cap input { width: 100%; min-height: 2.5rem; border-radius: .6rem; border: 1px solid var(--border);
+      background: var(--raised); color: var(--fg); padding: 0 .75rem; font: inherit; }
   </style>
 </head>
 <body>
@@ -92,6 +96,17 @@
     <div id="err"></div>
     <svg class="spark" id="spark" viewBox="0 0 320 88" preserveAspectRatio="none"></svg>
     <p class="note" id="cycle"></p>
+    <form class="cap" id="cap">
+      <div>
+        <label for="dep">Innskutt kapital (USD) — avkastning regnes herfra. Oppdater når du setter inn mer.</label>
+        <input id="dep" name="deposited" type="number" min="1" step="0.01" inputmode="decimal" />
+      </div>
+      <div>
+        <label for="xai">xAI-kreditter kjøpt totalt (USD) — du fyller på her. Glemte tall ligger i databasen over oppdateringer.</label>
+        <input id="xai" name="prepaid" type="number" min="0" step="0.01" inputmode="decimal" />
+      </div>
+      <button class="btn" type="submit">Lagre tall</button>
+    </form>
     <div class="tabs">
       <button class="active" data-tab="pos" type="button">Posisjoner</button>
       <button data-tab="log" type="button">Logg</button>
@@ -111,13 +126,19 @@
       const d = new Date(iso);
       return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("nb-NO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
     };
-    async function api(path, method) {
+    async function api(path, method, body) {
       const headers = {};
       if (token()) headers["X-Dashboard-Token"] = token();
-      const r = await fetch(path, { method: method || "GET", headers, credentials: "same-origin" });
+      if (body !== undefined) headers["Content-Type"] = "application/json";
+      const r = await fetch(path, {
+        method: method || "GET",
+        headers,
+        credentials: "same-origin",
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
       if (r.status === 401) {
         const t = window.prompt("Dashboard-token (DASHBOARD_TOKEN i .env)");
-        if (t) { sessionStorage.setItem(tokenKey, t); return api(path, method); }
+        if (t) { sessionStorage.setItem(tokenKey, t); return api(path, method, body); }
         throw new Error("Ingen tilgang");
       }
       return r.json();
@@ -138,15 +159,17 @@
       const cards = [
         ["Egenkapital", usd(s.equity), ""],
         ["Kontanter", usd(s.bankroll), ""],
-        ["Total", `${signed(st.total || 0)} (${pctn(st.total_pct || 0)})`, tone(st.total || 0)],
+        ["Total vs innskutt", `${signed(st.total || 0)} (${pctn(st.total_pct || 0)})`, tone(st.total || 0)],
         ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
         ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
+        ["Etter xAI", `${signed(st.after_xai || 0)}`, tone(st.after_xai || 0)],
         ["Maks tap", pctn(st.max_dd_pct || 0), (st.max_dd_pct || 0) < -0.001 ? "loss" : ""],
+        ["Innskutt", usd(st.deposited || 0), ""],
         ["Åpne / kostnad", `${s.open} / ${usd(st.open_cost || 0)}`, ""],
         ["Handler", String(st.trades || 0), ""],
         ["xAI i dag", usd(st.xai_day || 0), ""],
-        ["xAI totalt", usd(st.xai_total || 0), ""],
-        ["xAI igjen", s.xai_remaining == null ? "sett XAI_PREPAID_USD" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
+        ["xAI brukt totalt", usd(st.xai_total || 0), ""],
+        ["xAI igjen", s.xai_remaining == null ? "fyll inn under" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
       ];
       $("stats").innerHTML = cards.map(([l, v, c]) =>
         `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
@@ -195,6 +218,9 @@
       pills(s);
       stats(s);
       spark(s.equity_history);
+      const st = s.stats || {};
+      if (document.activeElement !== $("dep")) $("dep").value = st.deposited != null ? st.deposited : "";
+      if (document.activeElement !== $("xai")) $("xai").value = st.xai_prepaid != null ? st.xai_prepaid : "";
       const c = s.last_cycle;
       const st = s.stats || {};
       const next = c && c.ts ? new Date(new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000) : null;
@@ -228,6 +254,13 @@
       } finally {
         setTimeout(() => { $("btnUpd").disabled = false; refresh(); }, 20000);
       }
+    };
+    $("cap").onsubmit = async (e) => {
+      e.preventDefault();
+      const deposited_usd = Number($("dep").value);
+      const xai_prepaid_usd = Number($("xai").value);
+      await api("/api/meta", "POST", { deposited_usd, xai_prepaid_usd });
+      refresh();
     };
     document.querySelectorAll(".tabs button").forEach((b) => {
       b.onclick = () => {

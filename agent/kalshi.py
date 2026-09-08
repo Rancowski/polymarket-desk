@@ -87,6 +87,9 @@ def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:
             continue
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
         gap = round(poly - float(best["yes"]), 3)
+        years = set(re.findall(r"20\d{2}", m.get("question") or ""))
+        if years and not years.issubset(set(re.findall(r"20\d{2}", best["title"]))):
+            continue
         m["kalshi"] = {
             "title": best["title"][:90],
             "ticker": best["ticker"],

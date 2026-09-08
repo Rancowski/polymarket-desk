@@ -66,6 +66,9 @@ def _state() -> dict[str, Any]:
     equity = float(mark["equity"]) if mark else bankroll + locked
     halt = settings.halt_file.exists()
     st = desk.store.portfolio_stats(equity, bankroll, open_pos) if desk else {}
+    spent = float((st or {}).get("xai_total") or 0)
+    prepaid = float((st or {}).get("xai_prepaid") or 0)
+    remaining = max(0.0, prepaid - spent) if prepaid > 0 else _xai_remaining(spent)
     return {
         "dry_run": settings.dry_run,
         "halted": halt,
@@ -96,7 +99,7 @@ def _state() -> dict[str, Any]:
         "fills": desk.store.recent_fills(30) if desk else [],
         "equity_history": desk.store.equity_history(120) if desk else [],
         "stats": st,
-        "xai_remaining": _xai_remaining(float((st or {}).get("xai_total") or 0)),
+        "xai_remaining": remaining,
         "auth_required": bool(settings.dashboard_token),
     }
 
@@ -199,6 +202,32 @@ class Handler(BaseHTTPRequestHandler):
                 start_new_session=True,
             )
             self._json(200, {"ok": True, "reason": "henter kode og restarter"})
+            return
+        if path == "/api/meta":
+            if _desk is None:
+                self._json(500, {"ok": False, "reason": "desk ikke klar"})
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n).decode("utf-8") if n else "{}"
+            try:
+                payload = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                self._json(400, {"ok": False, "reason": "ugyldig json"})
+                return
+            if "deposited_usd" in payload:
+                val = float(payload["deposited_usd"])
+                if val < 1:
+                    self._json(400, {"ok": False, "reason": "innskutt må være ≥ 1"})
+                    return
+                _desk.store.set_meta("deposited_usd", f"{val:.2f}")
+            if "xai_prepaid_usd" in payload:
+                val = float(payload["xai_prepaid_usd"])
+                if val < 0:
+                    self._json(400, {"ok": False, "reason": "xAI-kreditt kan ikke være negativ"})
+                    return
+                _desk.store.set_meta("xai_prepaid_usd", f"{val:.2f}")
+            log.info("Meta oppdatert fra dashboard")
+            self._json(200, {"ok": True, "state": _state()})
             return
         self._json(404, {"error": "not found"})
 
