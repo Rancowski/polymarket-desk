@@ -230,7 +230,7 @@
       if (xaiEl && document.activeElement !== xaiEl) xaiEl.value = st.xai_prepaid != null ? st.xai_prepaid : "";
       const c = s.last_cycle;
       const next = c && c.ts ? new Date(new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000) : null;
-      const rejects = (st.top_rejects || []).slice(0, 3).map((r) => `${r.n}× ${r.reason}`).join(" · ");
+      const rejects = (st.top_rejects || []).slice(0, 2).map((r) => `${r.n}× ${r.reason}`).join(" · ");
       $("cycle").textContent = c
         ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
         : "Venter på første syklus.";

@@ -84,12 +84,16 @@ class Risk:
         halt = self.halted()
         if halt:
             return None, halt
-
+        cid = market.get("condition_id") or ""
+        if self.store.is_bad_market(cid):
+            return None, "CLOB-blacklist"
         if estimate.get("skip"):
             return None, estimate.get("skip_reason") or "brain skip"
         conf = str(estimate.get("confidence") or "medium").lower()
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
+        if mid >= 0.92 or mid <= 0.08:
+            return None, "nær resolusjon"
         disagreement = abs(p_yes - mid)
         if conf == "low" and disagreement < (0.04 if probe else 0.05):
             return None, "confidence=low uten stor uenighet"
