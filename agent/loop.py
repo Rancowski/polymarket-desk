@@ -398,7 +398,7 @@ class Desk:
             liq = float(m.get("liquidity") or 0)
             if liq <= best_liq:
                 continue
-            shares = max(5.0, round(8.0 / ask, 2))
+            shares = 10.0
             best_liq = liq
             best = Ticket(
                 condition_id=cid,
