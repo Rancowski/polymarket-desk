@@ -140,6 +140,7 @@ class Desk:
                 "accepted": 0,
                 "rejected": 0,
                 "kalshi": 0,
+                "xai_usd": 0.0,
                 "reason": halt,
                 "bankroll": bankroll,
                 "equity": equity,
@@ -216,8 +217,6 @@ class Desk:
                 )
         if arb_n:
             open_pos = self.store.positions("open")
-            locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
-            equity = bankroll + locked
 
         by_id = {m["condition_id"]: m for m in markets}
         for pos in open_pos:
@@ -243,31 +242,65 @@ class Desk:
             ks = m.get("kalshi") or {}
             gap = abs(float(ks.get("gap") or 0))
             mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
-            locked = 1 if mid >= 0.90 or mid <= 0.10 else 0
+            comp = float(m.get("complement") or ((m.get("yes_mid") or 0) + (m.get("no_mid") or 0)))
+            locked = 0 if mid >= 0.88 or mid <= 0.12 or (0 < comp < 0.982) else 1
             sports = 1 if is_sports(m) else 0
-            cat = str(m.get("category") or "")
-            pref = 0 if cat in {"economics", "finance", "crypto", "politics", "geopolitics"} else 1
             vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
-            return (sports, pref, -gap, locked, -vol)
+            return (sports, -gap, locked, -vol)
 
         ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
+        try:
+            from agent.kalshi import attach as kalshi_attach_open
+            kalshi_attach_open(extras)
+        except Exception:
+            pass
+        prepaid = self.store.xai_prepaid_usd()
+        spent = self.store.api_spend(hours=None)
+        remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
         seen: set[str] = set()
         batch: list = []
-        for m in extras + ranked:
+
+        def _take(m: dict) -> None:
             cid = m.get("condition_id")
             if not cid or cid in seen:
-                continue
+                return
             seen.add(cid)
             batch.append(m)
-            if len(batch) >= max(settings.estimate_batch, len(extras)):
-                break
+
+        for m in extras:
+            _take(m)
+        if remaining >= 0.15:
+            for m in ranked:
+                gap = abs(float((m.get("kalshi") or {}).get("gap") or 0))
+                if gap >= 0.04:
+                    _take(m)
+            for m in ranked:
+                if is_sports(m):
+                    continue
+                cat = str(m.get("category") or "")
+                if cat not in {"economics", "finance", "crypto", "politics", "geopolitics"}:
+                    continue
+                ks = m.get("kalshi") or {}
+                gap = abs(float(ks.get("gap") or 0))
+                chg = abs(float(m.get("price_change_1d") or 0))
+                spread = float((m.get("book") or {}).get("spread") or 0)
+                if gap >= 0.02 or chg >= 0.03 or spread >= 0.03:
+                    _take(m)
+            if remaining >= 0.50:
+                for m in ranked:
+                    if is_sports(m):
+                        continue
+                    _take(m)
+                    if len(batch) >= max(settings.estimate_batch, len(extras)):
+                        break
+        batch = batch[: max(settings.estimate_batch, len(extras))]
         if not batch:
             log.info("Ingen markeder passerte filter")
             self.last_cycle = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "halted": False,
-                "scanned": 0,
+                "scanned": len(markets),
                 "estimated": 0,
                 "accepted": 0,
                 "rejected": 0,
@@ -276,6 +309,7 @@ class Desk:
                 "kalshi": kalshi_n,
                 "bankroll": bankroll,
                 "equity": equity,
+                "xai_usd": 0.0,
             }
             return {"ok": True, "scanned": 0}
 
@@ -297,11 +331,15 @@ class Desk:
 
         self.scout.enrich(batch)
 
+        xai_cycle = 0.0
         try:
-            estimates = self.brain.estimate(batch)
+            if remaining < 0.05 and extras:
+                batch = extras
+            estimates = self.brain.estimate(batch) if (remaining >= 0.02 or extras) else {}
             usage = getattr(self.brain, "last_usage", {}) or {}
-            if usage.get("usd"):
-                self.store.add_api_cost(float(usage["usd"]), str(usage.get("model") or ""), int(usage.get("tokens") or 0))
+            xai_cycle = float(usage.get("usd") or 0)
+            if xai_cycle:
+                self.store.add_api_cost(xai_cycle, str(usage.get("model") or ""), int(usage.get("tokens") or 0))
             n_blend = 0
             for m in batch:
                 ks = m.get("kalshi") or {}
@@ -311,7 +349,7 @@ class Desk:
                 cid = m["condition_id"]
                 est = estimates.get(cid) or {}
                 p = est.get("p_yes")
-                gap = abs(k_yes - float(p if p is not None else k_yes))
+                gap = abs(float(ks.get("gap") or 0))
                 w_k = 0.70 if gap >= 0.04 else 0.55
                 blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
                 estimates[cid] = {
@@ -456,59 +494,17 @@ class Desk:
             "halted": False,
             "scanned": len(markets),
             "estimated": len(estimates),
+            "grok": len(estimates),
             "accepted": accepted,
             "arb": arb_n,
             "kalshi": kalshi_n,
             "rejected": rejected,
             "exits": exits,
+            "xai_usd": round(xai_cycle, 4),
             "bankroll": bankroll,
             "equity": equity,
         }
         return {"ok": True, **self.last_cycle}
-
-    def _pipeline_ticket(self, markets: list, bankroll: float):
-        from agent.risk import Ticket
-
-        best = None
-        best_liq = -1.0
-        for m in markets:
-            cid = m.get("condition_id") or ""
-            if self.store.is_bad_market(cid):
-                continue
-            book = m.get("book") or {}
-            ask = float(book.get("best_ask") or 0)
-            spread = float(book.get("spread") or 1)
-            token = str(m.get("yes_token") or "")
-            if not token.isdigit():
-                continue
-            if not (0.25 <= ask <= 0.75) or spread > 0.05:
-                continue
-            liq = float(m.get("liquidity") or 0)
-            if liq <= best_liq:
-                continue
-            shares = 10.0
-            best_liq = liq
-            best = Ticket(
-                condition_id=cid,
-                question=m.get("question") or "",
-                category=m.get("category") or "other",
-                event_key=m.get("event_key") or cid,
-                side="YES",
-                token_id=token,
-                mid=float(book.get("mid") or ask),
-                best_bid=float(book.get("best_bid") or ask),
-                best_ask=ask,
-                spread=spread,
-                p_hat=ask,
-                edge_gross=0.0,
-                edge_net=0.0,
-                confidence="low",
-                thesis="pipeline-test første live-fill",
-                limit_price=round(ask, 2),
-                size_usd=round(shares * ask, 2),
-                shares=shares,
-            )
-        return best
 
     def run_forever(self) -> None:
         log.info("Desk kjører. DRY_RUN=%s interval=%ss", settings.dry_run, settings.loop_seconds)

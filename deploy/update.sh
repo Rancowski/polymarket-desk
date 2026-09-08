@@ -72,6 +72,24 @@ cp -a "$SRC/requirements.txt" "$ROOT/requirements.txt"
 mkdir -p "$ROOT/deploy"
 cp -a "$SRC/deploy/." "$ROOT/deploy/"
 chmod +x "$ROOT/deploy/update.sh"
+python3 - <<'PY'
+import json, urllib.request
+from pathlib import Path
+import os
+root = os.environ.get("ROOT", "/opt/polymarket-desk")
+sha = "unknown"
+try:
+    req = urllib.request.Request(
+        "https://api.github.com/repos/Rancowski/polymarket-desk/commits/main",
+        headers={"User-Agent": "polymarket-desk"},
+    )
+    with urllib.request.urlopen(req, timeout=12) as r:
+        sha = json.load(r).get("sha", "unknown")[:7]
+except Exception as exc:
+    print("commit sha:", exc)
+Path(root, "agent", "COMMIT").write_text(sha + "\n", encoding="utf-8")
+print("release", sha)
+PY
 if [ -x "$ROOT/.venv/bin/pip" ]; then
   "$ROOT/.venv/bin/pip" install -q -r "$ROOT/requirements.txt"
 fi

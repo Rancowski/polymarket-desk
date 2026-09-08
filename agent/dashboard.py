@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from agent.config import settings
-from agent.version import RELEASE
+from agent.version import release as git_release
 
 log = logging.getLogger("dash")
 WEB = Path(__file__).resolve().parent / "web"
@@ -78,7 +78,7 @@ def _version() -> dict[str, Any]:
     mtime = html.stat().st_mtime if html.exists() else 0.0
     iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat() if mtime else None
     return {
-        "release": RELEASE,
+        "release": git_release(),
         "index_mtime": iso,
         "index_mtime_unix": mtime,
     }
@@ -158,6 +158,13 @@ def _state() -> dict[str, Any]:
                 "cur_price": p.get("cur_price"),
                 "current_value": p.get("current_value"),
                 "cost": round(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0), 2),
+                "upnl": round(
+                    float(p.get("current_value") or 0)
+                    - float(p.get("shares") or 0) * float(p.get("avg_cost") or 0),
+                    2,
+                )
+                if p.get("current_value") not in (None, "")
+                else None,
                 "category": p.get("category"),
                 "last_ts": p.get("last_ts"),
             }

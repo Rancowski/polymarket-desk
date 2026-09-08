@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -91,6 +92,19 @@ def _category(raw: dict) -> str:
     return "other"
 
 
+def _hours_left(raw: Any) -> float | None:
+    if not raw:
+        return None
+    text = str(raw).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return round((dt - datetime.now(timezone.utc)).total_seconds() / 3600.0, 1)
+    except ValueError:
+        return None
+
+
 def _event_key(raw: dict) -> str:
     slug = str(raw.get("eventSlug") or raw.get("groupItemTitle") or raw.get("questionID") or raw.get("conditionId") or "")
     slug = re.sub(r"-game-\d+$", "", slug, flags=re.I)
@@ -154,6 +168,8 @@ class Scout:
                 "yes_mid": yes_px,
                 "no_mid": no_px,
                 "mid": mid,
+                "complement": round(yes_px + no_px, 4) if yes_px and no_px else None,
+                "hours_left": _hours_left(raw.get("endDate") or raw.get("endDateIso")),
                 "url": f"https://polymarket.com/market/{raw.get('slug')}",
             }
             if is_sports(item):

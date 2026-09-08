@@ -12,11 +12,10 @@ from agent.config import settings
 log = logging.getLogger("brain")
 
 SYSTEM = """Du er sannsynlighetsanalytiker for binære Polymarket-markeder.
-Du får KUN gratis markedsdata: Polymarket (resolusjon, mid, spread, dybde, volum,
-likviditet, 1d-historikk, siste prints, søsken i samme event) og ev. CoinGecko-spot for crypto.
-Kalshi-feltet er et annet venues pris. Hvis det finnes: trekk p_yes MOT Kalshi.
-Gap ≥ 4 ¢ mot Kalshi er et ekte signal — ikke ignorer det.
-Ingen web. Ingen X.
+Du får KUN gratis tape: Polymarket-bok (mid, spread, dybde, volum, last trade,
+YES+NO-sum, søsken, tid til resolusjon, 1d-historikk) og ev. CoinGecko-spot.
+Kalshi er et annet venues pris på SAMME kontrakt. Gap ≥ 4 ¢: trekk p_yes hardt MOT Kalshi.
+Ingen web. Ingen X. Ingen live-søk.
 
 Jakte edge i:
 - Kalshi vs Polymarket (samme hendelse, ulik pris)
@@ -90,6 +89,10 @@ class Brain:
                     "end_date": m.get("end_date"),
                     "category": m.get("category"),
                     "yes_mid": round(float(m.get("yes_mid") or m.get("mid") or 0.5), 3),
+                    "no_mid": round(float(m.get("no_mid") or 0), 3),
+                    "complement": m.get("complement"),
+                    "hours_left": m.get("hours_left"),
+                    "last_trade": m.get("last_trade"),
                     "liquidity": int(m.get("liquidity") or 0),
                     "volume_24h": int(m.get("volume_24h") or 0),
                     "price_change_1d": m.get("price_change_1d"),
@@ -103,6 +106,7 @@ class Brain:
                     "siblings": m.get("siblings") or [],
                     "spot": m.get("spot") or {},
                     "kalshi": m.get("kalshi") or {},
+                    "open_position": bool(m.get("_open_only")),
                 }
             )
         user = (

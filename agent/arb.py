@@ -11,7 +11,7 @@ from agent.risk import Ticket, is_sports
 log = logging.getLogger("arb")
 
 # Etter fee: krev minst ~2 ¢ per sett
-COMPLEMENT_MAX_ASK_SUM = 0.975
+COMPLEMENT_MAX_ASK_SUM = 0.982
 EVENT_MAX_ASK_SUM = 0.970
 LOCKED_YES = 0.88
 LOCKED_NO = 0.12

@@ -212,17 +212,23 @@ class Risk:
             for p in open_pos
             if p.get("event_key") == event
         )
+        if same_event_cost > 0.5:
+            return None, "ett event ett ticket"
         cat_cost = sum(
             float(p["shares"]) * float(p["avg_cost"])
             for p in open_pos
             if p.get("category") == market["category"]
         )
 
-        cap = (0.06 if probe else settings.max_position_pct) * bankroll
+        deposited = self.store.deposited_usd(0.0)
+        size_base = bankroll
+        if deposited >= 1:
+            size_base = min(bankroll, deposited)
+        cap = (0.06 if probe else settings.max_position_pct) * size_base
         remaining_event = max(0.0, cap - same_event_cost)
-        remaining_cat = max(0.0, settings.max_category_pct * bankroll - cat_cost)
-        hard = min(cap, remaining_event, remaining_cat)
-        sized = clip_usd(p_hat, cost, bankroll, hard)
+        remaining_cat = max(0.0, settings.max_category_pct * size_base - cat_cost)
+        hard = min(cap, remaining_event, remaining_cat, bankroll)
+        sized = clip_usd(p_hat, cost, size_base, hard)
         if probe:
             sized = min(max(sized, 8.0), 12.0, hard)
         if sized < 5 or hard < 5:
@@ -317,7 +323,19 @@ class Risk:
             if k_hat + 0.06 < avg:
                 return self._exit_ticket(pos, book, shares, best_bid, f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}"), "ok"
 
-        # Ikke selg bare fordi Grok mean-reverter til mid («edge gone»).
+        if estimate and not estimate.get("skip"):
+            try:
+                p_yes = float(estimate["p_yes"])
+            except (TypeError, ValueError, KeyError):
+                p_yes = None
+            if p_yes is not None:
+                p_hat = p_yes if side == "YES" else 1.0 - p_yes
+                # Selg hvis fersk p_hat er ≥3c under kost. Ikke selg bare fordi Grok falt til mid.
+                faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
+                if p_hat + 0.03 <= avg and not faded_to_mid:
+                    return self._exit_ticket(
+                        pos, book, shares, best_bid, f"p_hat {p_hat:.2f} ≥3c under kost {avg:.2f}"
+                    ), "ok"
         return None, "hold"
 
     def _exit_ticket(self, pos: dict, book: dict, shares: float, price: float, reason: str) -> dict:
