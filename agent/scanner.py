@@ -35,6 +35,23 @@ def _num(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _token_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    text = str(value).strip().strip('"')
+    if text.isdigit():
+        return text
+    return text
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _level_px(level: Any) -> float:
     if isinstance(level, dict):
         return _num(level.get("price") or level.get("p"))
@@ -131,8 +148,8 @@ class Scout:
                 "volume_24h": vol,
                 "price_change_1d": _num(raw.get("oneDayPriceChange") or raw.get("oneHourPriceChange")),
                 "last_trade": _num(raw.get("lastTradePrice")),
-                "yes_token": str(tokens[0]),
-                "no_token": str(tokens[1]),
+                "yes_token": _token_str(tokens[0]),
+                "no_token": _token_str(tokens[1]),
                 "yes_label": str(outcomes[0]),
                 "no_label": str(outcomes[1]),
                 "yes_mid": yes_px,

@@ -92,7 +92,7 @@ class Risk:
         conf = str(estimate.get("confidence") or "medium").lower()
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
-        if mid >= 0.92 or mid <= 0.08:
+        if mid >= 0.97 or mid <= 0.03:
             return None, "nær resolusjon"
         disagreement = abs(p_yes - mid)
         if conf == "low" and disagreement < (0.04 if probe else 0.05):
@@ -126,11 +126,13 @@ class Risk:
                 spread = float(nb["spread"])
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
-        edge_net = edge_gross - (spread / 2.0) - fee_frac - settings.model_haircut
+        # Kant mot ASK (det vi faktisk betaler), ikke mot mid minus spread på nytt
+        edge_gross = p_hat - cost
+        edge_net = edge_gross - fee_frac - settings.model_haircut
         need = settings.min_net_edge if min_edge is None else min_edge
-        if edge_net < need:
+        if (not probe) and edge_net < need:
             return None, f"edge_net {edge_net:.3f} < {need}"
-        if (not probe) and cost >= 0.82 and edge_net < max(need * 2, 0.05):
+        if (not probe) and cost >= 0.82 and edge_net < max(need * 2, 0.04):
             return None, f"favoritt-sone kost {cost:.2f} krever mer edge"
 
         open_pos = self.store.positions("open")

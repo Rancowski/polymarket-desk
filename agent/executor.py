@@ -229,10 +229,12 @@ class Executor:
         if not token:
             raise RuntimeError("mangler token_id")
         tick, neg = _clob_meta(token)
+        tick_s = _tick_str(tick)
         if hasattr(client, "get_tick_size"):
             try:
                 raw_tick = client.get_tick_size(token)
                 if raw_tick:
+                    tick_s = str(raw_tick)
                     tick = float(raw_tick)
             except Exception:
                 pass
@@ -270,7 +272,7 @@ class Executor:
             order_type = None
         for nflag in (neg, (not neg)):
             try:
-                options = PartialCreateOrderOptions(tick_size=_tick_str(tick), neg_risk=nflag)
+                options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=nflag)
                 if hasattr(client, "create_and_post_order"):
                     if order_type is not None:
                         try:

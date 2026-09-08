@@ -62,6 +62,7 @@ class Desk:
             return {"ok": True, "halted": True}
 
         bankroll = self.exec.bankroll()
+        self.last_error = None
         open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
         equity = bankroll + locked
@@ -312,42 +313,54 @@ class Desk:
                 )
 
         if accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
-            best_t = None
-            best_m = None
+            ranked: list[tuple[float, dict, dict]] = []
             for m in batch:
                 if m.get("_open_only"):
                     continue
-                est = estimates.get(m["condition_id"])
-                if not est:
+                cid = m.get("condition_id") or ""
+                if self.store.is_bad_market(cid):
                     continue
+                est = estimates.get(cid)
+                if not est or est.get("skip"):
+                    continue
+                mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
+                if mid < 0.15 or mid > 0.85:
+                    continue
+                gap = abs(float(est.get("p_yes") or 0.5) - mid)
+                ranked.append((gap, m, est))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            for _gap, m, est in ranked[:4]:
                 book = m.get("book") or {}
-                ticket, _why = self.risk.evaluate(
-                    m, book, est, bankroll, equity, min_edge=0.008, probe=True
+                ticket, why = self.risk.evaluate(
+                    m, book, est, bankroll, equity, min_edge=-1.0, probe=True
                 )
-                if ticket and (best_t is None or ticket.edge_net > best_t.edge_net):
-                    best_t, best_m = ticket, m
-            if best_t:
+                if not ticket:
+                    continue
+                ticket.shares = 5.0
+                ticket.size_usd = round(5.0 * ticket.limit_price, 2)
                 try:
-                    result = self.exec.submit(best_t)
+                    result = self.exec.submit(ticket)
                     accepted += 1
                     self.store.log_decision(
-                        condition_id=best_t.condition_id,
-                        question=best_t.question,
-                        side=best_t.side,
-                        mid=best_t.mid,
-                        p_hat=best_t.p_hat,
-                        edge_net=best_t.edge_net,
+                        condition_id=ticket.condition_id,
+                        question=ticket.question,
+                        side=ticket.side,
+                        mid=ticket.mid,
+                        p_hat=ticket.p_hat,
+                        edge_net=ticket.edge_net,
                         action=result.get("status"),
-                        reason=best_t.thesis,
+                        reason=ticket.thesis,
                         payload=result,
                     )
-                    log.info("Probe-kjøp %s %s usd=%.2f", best_t.side, best_t.question[:50], best_t.size_usd)
+                    log.info("Probe-kjøp %s %s usd=%.2f", ticket.side, ticket.question[:50], ticket.size_usd)
+                    self.last_error = None
+                    break
                 except Exception as exc:
                     log.exception("Probe-ordre feilet")
                     self.last_error = str(exc)
                     self.store.log_decision(
-                        condition_id=best_t.condition_id,
-                        question=best_t.question,
+                        condition_id=ticket.condition_id,
+                        question=ticket.question,
                         action="error",
                         reason=str(exc),
                     )
