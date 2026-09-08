@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import requests
@@ -96,7 +97,10 @@ def _category(raw: dict) -> str:
 
 
 def _event_key(raw: dict) -> str:
-    return str(raw.get("eventSlug") or raw.get("groupItemTitle") or raw.get("questionID") or raw.get("conditionId") or "")
+    slug = str(raw.get("eventSlug") or raw.get("groupItemTitle") or raw.get("questionID") or raw.get("conditionId") or "")
+    slug = re.sub(r"-game-\d+$", "", slug, flags=re.I)
+    slug = re.sub(r"-g\d+$", "", slug, flags=re.I)
+    return slug
 
 
 class Scout:

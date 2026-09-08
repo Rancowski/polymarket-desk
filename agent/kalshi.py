@@ -45,18 +45,36 @@ def _theme(text: str) -> set[str]:
         tags.add("harris")
     if "israel" in t and any(x in t for x in ("airspace", "air space", "idf")):
         tags.add("israel-air")
+    if any(x in t for x in ("us open", "atp", "wimbledon")):
+        tags.add("tennis")
     tags |= {f"y{y}" for y in re.findall(r"20\d{2}", t)}
     return tags
 
 
+def _as_prob(raw: Any) -> float:
+    try:
+        v = float(str(raw).replace("%", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+    if v > 1.5:  # øre 1–99 eller 1000-scale
+        v = v / 100.0 if v <= 100 else v / 1000.0
+    return v if 0.01 < v < 0.99 else 0.0
+
+
 def _yes_px(row: dict) -> float:
-    for key in ("yes_ask_dollars", "last_price_dollars", "yes_bid_dollars"):
-        try:
-            v = float(row.get(key) or 0)
-            if 0 < v < 1:
-                return v
-        except (TypeError, ValueError):
-            continue
+    for key in (
+        "yes_ask_dollars",
+        "yes_bid_dollars",
+        "last_price_dollars",
+        "yes_ask",
+        "yes_bid",
+        "last_price",
+        "yes_price",
+        "previous_yes_ask",
+    ):
+        px = _as_prob(row.get(key))
+        if px:
+            return px
     return 0.0
 
 
@@ -108,9 +126,9 @@ def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:
             t = len(qtheme & k["theme"])
             score = n + 3 * t
             distinctive = qtheme & k["theme"] & {
-                "fed", "btc", "eth", "trump", "harris", "israel-air",
+                "fed", "btc", "eth", "trump", "harris", "israel-air", "tennis",
             }
-            theme_ok = t >= 2 and bool(distinctive)
+            theme_ok = (t >= 2 and bool(distinctive)) or (t >= 1 and n >= 3 and bool(distinctive))
             tok_need = 3 if distinctive else 4
             if not theme_ok and n < tok_need:
                 continue

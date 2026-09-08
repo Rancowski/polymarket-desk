@@ -92,8 +92,10 @@ class Risk:
         conf = str(estimate.get("confidence") or "medium").lower()
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
-        if mid >= 0.97 or mid <= 0.03:
+        if mid >= 0.94 or mid <= 0.06:
             return None, "nær resolusjon"
+        if market.get("category") == "sports" and (mid >= 0.88 or mid <= 0.12):
+            return None, "sports nær avgjort"
         disagreement = abs(p_yes - mid)
         if conf == "low" and disagreement < (0.04 if probe else 0.05):
             return None, "confidence=low uten stor uenighet"
@@ -126,14 +128,18 @@ class Risk:
                 spread = float(nb["spread"])
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
-        # Kant mot ASK (det vi faktisk betaler), ikke mot mid minus spread på nytt
+        extra = 0.015 if market.get("category") == "sports" else 0.0
         edge_gross = p_hat - cost
-        edge_net = edge_gross - fee_frac - settings.model_haircut
+        edge_net = edge_gross - fee_frac - settings.model_haircut - extra
         need = settings.min_net_edge if min_edge is None else min_edge
+        if market.get("category") == "sports":
+            need = max(need, 0.022)
         if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
-        if cost <= 0.12 or cost >= 0.88:
+        if cost <= 0.15 or cost >= 0.85:
             return None, "nær resolusjon"
+        if market.get("category") == "sports" and (cost <= 0.22 or cost >= 0.78):
+            return None, "sports ekstrem-pris"
 
         open_pos = self.store.positions("open")
         if any(p["condition_id"] == market["condition_id"] for p in open_pos):

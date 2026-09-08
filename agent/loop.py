@@ -205,13 +205,15 @@ class Desk:
                 cid = m["condition_id"]
                 est = estimates.get(cid) or {}
                 p = est.get("p_yes")
-                blended = round(0.55 * k_yes + 0.45 * float(p), 4) if p is not None else k_yes
+                gap = abs(k_yes - float(p if p is not None else k_yes))
+                w_k = 0.70 if gap >= 0.04 else 0.55
+                blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
                 estimates[cid] = {
                     **est,
                     "p_yes": blended,
                     "skip": False,
-                    "confidence": est.get("confidence") or "medium",
-                    "thesis": ((est.get("thesis") or "") + f" | Kalshi {k_yes} gap {ks.get('gap')}").strip(" |"),
+                    "confidence": "high" if gap >= 0.04 else (est.get("confidence") or "medium"),
+                    "thesis": ((est.get("thesis") or "") + f" | Kalshi {k_yes:.2f} (w={w_k}) gap {ks.get('gap')}").strip(" |"),
                 }
                 n_blend += 1
             if n_blend:
