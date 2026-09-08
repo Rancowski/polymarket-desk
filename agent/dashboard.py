@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import socket
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from agent.config import settings
+from agent.version import RELEASE
 
 log = logging.getLogger("dash")
 WEB = Path(__file__).resolve().parent / "web"
@@ -69,34 +73,55 @@ def _xai_remaining(spent: float) -> float | None:
         return _xai_cache.get("val")
 
 
+def _version() -> dict[str, Any]:
+    html = WEB / "index.html"
+    mtime = html.stat().st_mtime if html.exists() else 0.0
+    iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat() if mtime else None
+    return {
+        "release": RELEASE,
+        "index_mtime": iso,
+        "index_mtime_unix": mtime,
+    }
+
+
+def _update_status() -> dict[str, Any]:
+    path = settings.data_dir / "update.status"
+    log_path = settings.data_dir / "update.log"
+    st: dict[str, Any] = {"ok": None, "running": False, "ts": None, "reason": "", "log_tail": ""}
+    if path.exists():
+        try:
+            st.update(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    if log_path.exists():
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            st["log_tail"] = "\n".join(lines[-12:])
+        except Exception:
+            pass
+    return st
+
+
 def _state() -> dict[str, Any]:
     desk = _desk
     mark = desk.store.latest_mark() if desk else None
     open_pos = desk.store.positions("open") if desk else []
-    locked = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
     snap_cash = desk.store.float_meta("last_cash") if desk else None
-    snap_eq = desk.store.float_meta("last_equity") if desk else None
     if mark:
-        bankroll = float(mark["bankroll"])
-        equity = float(mark["equity"])
+        raw_cash = float(mark["bankroll"])
     elif snap_cash is not None:
-        bankroll = snap_cash
-        equity = snap_eq if snap_eq is not None else bankroll + locked
+        raw_cash = snap_cash
     else:
-        bankroll = settings.paper_bankroll_usd if settings.dry_run else 0.0
-        equity = bankroll + locked
+        raw_cash = settings.paper_bankroll_usd if settings.dry_run else 0.0
     halt = settings.halt_file.exists()
     st: dict[str, Any] = {}
+    bankroll = raw_cash
+    equity = raw_cash
     if desk:
         try:
-            st = desk.store.portfolio_stats(equity, bankroll, open_pos)
-            if st.get("cash") is not None:
-                bankroll = float(st["cash"])
-            if st.get("equity") is not None:
-                equity = float(st["equity"])
-            else:
-                mtm = float(st.get("open_mtm") or st.get("open_cost") or locked)
-                equity = bankroll + mtm
+            st = desk.store.portfolio_stats(raw_cash, raw_cash, open_pos)
+            bankroll = float(st.get("cash") if st.get("cash") is not None else raw_cash)
+            equity = float(st.get("equity") if st.get("equity") is not None else bankroll)
             deposited = float(st.get("deposited") or 0)
             if deposited >= 1:
                 st["total"] = round(equity - deposited, 2)
@@ -126,10 +151,13 @@ def _state() -> dict[str, Any]:
         "positions": [
             {
                 "question": p.get("question"),
+                "outcome": p.get("outcome"),
                 "side": p.get("side"),
                 "shares": p.get("shares"),
                 "avg_cost": p.get("avg_cost"),
+                "cur_price": p.get("cur_price"),
                 "current_value": p.get("current_value"),
+                "cost": round(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0), 2),
                 "category": p.get("category"),
                 "last_ts": p.get("last_ts"),
             }
@@ -153,6 +181,8 @@ def _state() -> dict[str, Any]:
             "sig": settings.signature_type,
             "batch": settings.estimate_batch,
         },
+        "version": _version(),
+        "update": _update_status(),
     }
 
 
@@ -214,6 +244,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._json(200, _state())
             return
+        if path == "/api/version":
+            self._json(200, _version())
+            return
+        if path == "/api/update":
+            self._json(200, _update_status())
+            return
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -255,24 +291,104 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "started": True})
             return
         if path == "/api/update":
-            script = settings.halt_file.parent / "deploy" / "update.sh"
+            root = settings.halt_file.parent
+            script = root / "deploy" / "update.sh"
             if not script.exists():
                 self._json(500, {"ok": False, "reason": "deploy/update.sh mangler"})
                 return
+            settings.data_dir.mkdir(parents=True, exist_ok=True)
+            log_path = settings.data_dir / "update.log"
+            status_path = settings.data_dir / "update.status"
+            staged = Path("/tmp/polymarket-desk-update.sh")
             log.warning("Kodeoppdatering fra dashboard")
             try:
-                subprocess.Popen(
-                    ["bash", str(script)],
-                    cwd=str(settings.halt_file.parent),
-                    start_new_session=True,
-                )
-            except FileNotFoundError:
-                self._json(500, {"ok": False, "reason": "bash mangler på denne maskinen. På Hetzner: trykk Oppdater agent der."})
-                return
+                shutil.copy2(script, staged)
+                staged.chmod(0o755)
             except Exception as exc:
-                self._json(500, {"ok": False, "reason": str(exc)})
+                self._json(500, {"ok": False, "reason": f"kunne ikke stage update.sh: {exc}"})
                 return
-            self._json(200, {"ok": True, "reason": "henter kode og restarter"})
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "ok": None,
+                        "running": True,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "reason": "henter kode",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def _run() -> None:
+                env = os.environ.copy()
+                env["ROOT"] = str(root)
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n==== dashboard {datetime.now(timezone.utc).isoformat()} ====\n")
+                    fh.flush()
+                    try:
+                        if shutil.which("systemd-run"):
+                            cmd = [
+                                "systemd-run",
+                                "--no-block",
+                                "--collect",
+                                f"--setenv=ROOT={root}",
+                                "/bin/bash",
+                                str(staged),
+                            ]
+                            subprocess.run(cmd, cwd=str(root), stdout=fh, stderr=subprocess.STDOUT, check=False)
+                            return
+                        proc = subprocess.run(
+                            ["bash", str(staged)],
+                            cwd=str(root),
+                            stdout=fh,
+                            stderr=subprocess.STDOUT,
+                            env=env,
+                            start_new_session=True,
+                        )
+                        if proc.returncode != 0:
+                            status_path.write_text(
+                                json.dumps(
+                                    {
+                                        "ok": False,
+                                        "running": False,
+                                        "ts": datetime.now(timezone.utc).isoformat(),
+                                        "reason": f"exit {proc.returncode}",
+                                    }
+                                )
+                                + "\n",
+                                encoding="utf-8",
+                            )
+                    except FileNotFoundError:
+                        status_path.write_text(
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "running": False,
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "reason": "bash mangler",
+                                }
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    except Exception as exc:
+                        log.exception("update.sh")
+                        status_path.write_text(
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "running": False,
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "reason": str(exc),
+                                }
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+
+            threading.Thread(target=_run, daemon=True, name="desk-update").start()
+            self._json(200, {"ok": True, "reason": "henter kode og restarter", "log": str(log_path)})
             return
         if path == "/api/meta":
             if _desk is None:

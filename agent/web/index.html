@@ -157,11 +157,13 @@
       const live = s.dry_run ? "Paper" : "Live";
       const on = !s.halted;
       const kalshi = s.last_cycle && s.last_cycle.kalshi != null ? s.last_cycle.kalshi : null;
+      const rel = (s.version && s.version.release) || "";
       $("pills").innerHTML =
         `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? (s.dry_run ? "Paper på" : "Live") : "Stoppet"}</span>` +
         `<span class="pill">${live}</span>` +
         (s.busy ? `<span class="pill">Kjører syklus…</span>` : "") +
-        (kalshi != null ? `<span class="pill">Kalshi ${kalshi}</span>` : "");
+        (kalshi != null ? `<span class="pill">Kalshi ${kalshi}</span>` : "") +
+        (rel ? `<span class="pill">${rel}</span>` : "");
     }
     const signed = (n) => (n > 0.004 ? "+" : n < -0.004 ? "\u2212" : "") + usd(Math.abs(n));
     const pctn = (n) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(1)} %`;
@@ -213,10 +215,17 @@
       const el = $("panel");
       if (tab === "pos") {
         if (!s.positions.length) { el.innerHTML = `<p class="empty">Ingen åpne posisjoner.</p>`; return; }
-        el.innerHTML = s.positions.map((p) =>
-          `<div class="row-item"><p class="q">${p.question || ""}</p>
-           <div class="meta">${p.side} · ${Number(p.shares).toFixed(2)} andeler · snitt ${Number(p.avg_cost).toFixed(2)} · kost ${usd(Number(p.shares)*Number(p.avg_cost))} · ${p.category || ""}</div></div>`
-        ).join("");
+        el.innerHTML = s.positions.map((p) => {
+          const shares = Number(p.shares) || 0;
+          const avg = Number(p.avg_cost) || 0;
+          const cost = Number(p.cost) || shares * avg;
+          const mtm = Number(p.current_value);
+          const hasMtm = Number.isFinite(mtm) && mtm > 0;
+          const upnl = hasMtm && cost > 0 ? (mtm - cost) / cost : null;
+          const label = p.outcome && p.outcome !== p.side ? `${p.outcome} (${p.side})` : (p.side || "");
+          return `<div class="row-item"><p class="q">${p.question || ""}</p>
+           <div class="meta">${label} · ${shares.toFixed(2)} @ ${avg.toFixed(2)} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnl == null ? "—" : pctn(upnl)} · ${p.category || ""}</div></div>`;
+        }).join("");
         return;
       }
       if (tab === "fill") {
@@ -278,7 +287,11 @@
       $("cycle").textContent = c
         ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · kalshi ${kalshiN} treff · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
         : "Venter på første syklus.";
-      $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
+      const upd = s.update || {};
+      let errHtml = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
+      if (upd.running) errHtml += `<div class="err" style="color:var(--warn);border-color:color-mix(in oklab, var(--warn) 30%, transparent);background:color-mix(in oklab, var(--warn) 10%, transparent)">Oppdaterer agent… se data/update.log</div>`;
+      else if (upd.ok === false) errHtml += `<div class="err">Oppdatering feilet: ${upd.reason || "se data/update.log"}</div>`;
+      $("err").innerHTML = errHtml;
       $("btnOn").disabled = !s.halted;
       $("btnOff").disabled = !!s.halted;
       if (s.busy) {
@@ -319,11 +332,14 @@
       if (!confirm("Hente siste kode og restarte agenten?")) return;
       $("btnUpd").disabled = true;
       try {
-        await api("/api/update", "POST");
-        $("cycle").textContent = "Oppdaterer… dashboard kommer tilbake om ~20 s.";
-      } finally {
-        setTimeout(() => { $("btnUpd").disabled = false; refresh(); }, 20000);
+        const res = await api("/api/update", "POST");
+        $("cycle").textContent = (res && res.reason) || "Oppdaterer… se data/update.log. Hard-refresh når desken er tilbake.";
+      } catch (e) {
+        $("err").innerHTML = `<div class="err">${e.message || e}</div>`;
+        $("btnUpd").disabled = false;
+        return;
       }
+      setTimeout(() => { $("btnUpd").disabled = false; refresh(); }, 25000);
     };
     $("cap").onsubmit = async (e) => {
       e.preventDefault();

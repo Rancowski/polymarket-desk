@@ -106,6 +106,10 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_open, out):
                 continue
+            if is_sports(m):
+                ym = float(m.get("yes_mid") or 0)
+                if ym <= 0.22 or ym >= 0.78:
+                    continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
             if yes_m <= 0.02 or no_m <= 0.02:
@@ -187,6 +191,8 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_open, out):
                 continue
+            if is_sports(m):
+                continue
             end = _parse_end(m.get("end_date"))
             if not end or (now - end).total_seconds() < 90 * 60:
                 continue
@@ -232,6 +238,10 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_open, out):
                 continue
+            if is_sports(m):
+                cost_chk = float((self._book(m, "yes") or {}).get("best_ask") or m.get("yes_mid") or 0)
+                if cost_chk <= 0.22 or cost_chk >= 0.78:
+                    continue
             gap = float(ks.get("gap") or 0)
             if abs(gap) < 0.04:
                 continue

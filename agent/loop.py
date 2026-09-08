@@ -10,7 +10,7 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import Risk
+from agent.risk import Risk, is_sports
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -84,31 +84,46 @@ class Desk:
             log.warning("sync posisjoner: %s", exc)
         bankroll = self.exec.bankroll()
         open_pos = self.store.positions("open")
-        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
-        open_mtm = 0.0
         for p in open_pos:
-            cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
-            cv = p.get("current_value")
+            token = str(p.get("token_id") or "")
+            if not token:
+                continue
             try:
-                open_mtm += float(cv) if cv not in (None, "") else cost
-            except (TypeError, ValueError):
-                open_mtm += cost
+                book = self.scout.book(token)
+            except Exception:
+                continue
+            if not book or book.get("synthetic"):
+                continue
+            mid = float(book.get("mid") or book.get("best_bid") or 0)
+            if not (0.01 < mid < 0.99):
+                continue
+            p["cur_price"] = mid
+            p["current_value"] = float(p.get("shares") or 0) * mid
+            try:
+                self.store.upsert_position(**p)
+            except Exception:
+                pass
+        open_pos = self.store.positions("open")
         api_mtm = None
         try:
             api_mtm = self.exec.fetch_position_value()
         except Exception:
             api_mtm = None
-        if api_mtm is not None and api_mtm >= 0:
+        cash, equity, open_cost, open_mtm = self.store.split_cash_equity(bankroll, open_pos)
+        if api_mtm is not None and api_mtm > 0 and abs(api_mtm - open_cost) > 0.05:
             open_mtm = api_mtm
-        try:
-            deposited = float(self.store.get_meta("deposited_usd") or 0)
-        except (TypeError, ValueError):
-            deposited = 0.0
-        if deposited >= 1 and open_cost > 1 and abs(bankroll - deposited) < 3:
-            bankroll = max(0.0, bankroll - open_cost)
-        equity = bankroll + open_mtm
+            equity = cash + open_mtm
+        bankroll = cash
         self.store.mark_equity(bankroll, equity)
         self.store.save_snapshot(bankroll, equity, open_mtm)
+        log.info(
+            "Portfolio cash=%.2f mtm=%.2f cost=%.2f equity=%.2f open=%s",
+            bankroll,
+            open_mtm,
+            open_cost,
+            equity,
+            len(open_pos),
+        )
         return bankroll, equity, open_pos
 
     def _cycle(self) -> dict:
@@ -229,8 +244,11 @@ class Desk:
             gap = abs(float(ks.get("gap") or 0))
             mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
             locked = 1 if mid >= 0.90 or mid <= 0.10 else 0
+            sports = 1 if is_sports(m) else 0
+            cat = str(m.get("category") or "")
+            pref = 0 if cat in {"economics", "finance", "crypto", "politics", "geopolitics"} else 1
             vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
-            return (-gap, locked, -vol)
+            return (sports, pref, -gap, locked, -vol)
 
         ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
@@ -427,35 +445,6 @@ class Desk:
                     action="error",
                     reason=str(exc),
                 )
-
-        if settings.dry_run and accepted == 0 and arb_n == 0 and self.store.live_fill_count() == 0:
-            test = self._pipeline_ticket(markets, bankroll)
-            if test:
-                try:
-                    result = self.exec.submit(test)
-                    accepted += 1
-                    self.last_error = None
-                    self.store.log_decision(
-                        condition_id=test.condition_id,
-                        question=test.question,
-                        side=test.side,
-                        mid=test.mid,
-                        p_hat=test.p_hat,
-                        edge_net=test.edge_net,
-                        action=result.get("status"),
-                        reason=test.thesis,
-                        payload=result,
-                    )
-                    log.info("Pipeline-test %s usd=%.2f", test.question[:50], test.size_usd)
-                except Exception as exc:
-                    log.exception("Pipeline-test feilet")
-                    self.last_error = str(exc)
-                    self.store.log_decision(
-                        condition_id=test.condition_id,
-                        question=test.question,
-                        action="error",
-                        reason=str(exc),
-                    )
 
         try:
             bankroll, equity, _ = self._refresh_portfolio()

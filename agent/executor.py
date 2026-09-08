@@ -6,7 +6,7 @@ from typing import Any
 import requests
 
 from agent.config import settings
-from agent.risk import Ticket
+from agent.risk import Ticket, is_sports
 from agent.store import Store
 
 log = logging.getLogger("exec")
@@ -177,20 +177,43 @@ def _order_filled(signed: Any) -> tuple[bool, dict]:
 
 
 def _infer_category(p: dict) -> str:
-    slug = str(p.get("eventSlug") or p.get("slug") or p.get("event_key") or "").lower()
-    title = str(p.get("title") or p.get("question") or "").lower()
-    blob = f"{slug} {title}"
-    sports = (
-        "cs2", "counter-strike", "lol", "league-of-legends", "league of legends",
-        "dota", "valorant", "nba", "nfl", "mlb", "nhl", "ufc", "atp", "wta",
-        "soccer", "esport", "gamerlegion", "furia", "-vs-", " vs ",
-    )
-    if any(k in blob for k in sports):
+    row = {
+        "question": p.get("title") or p.get("question") or "",
+        "event_key": p.get("eventSlug") or p.get("event_key") or "",
+        "category": p.get("category") or "",
+        "eventSlug": p.get("eventSlug") or "",
+        "slug": p.get("slug") or "",
+    }
+    if is_sports(row):
         return "sports"
+    blob = " ".join(str(row.get(k) or "") for k in ("event_key", "question", "slug")).lower()
     for key in ("crypto", "politics", "finance", "economics", "geopolitics", "tech"):
         if key in blob:
             return key
     return str(p.get("eventSlug") or "other")[:40]
+
+
+def _side_and_label(p: dict) -> tuple[str, str, str]:
+    outcome = str(p.get("outcome") or "").strip()
+    title = str(p.get("title") or "")
+    idx = p.get("outcomeIndex")
+    ou = outcome.upper()
+    if ou in {"YES", "Y", "1"}:
+        return "YES", title[:160], "YES"
+    if ou in {"NO", "N", "0"} or ou.startswith("NO "):
+        return "NO", title[:160], "NO"
+    side = "YES"
+    if idx is not None:
+        try:
+            side = "NO" if int(idx) == 1 else "YES"
+        except (TypeError, ValueError):
+            side = "YES"
+    elif " vs " in title.lower() and outcome:
+        right = title.lower().split(" vs ", 1)[-1]
+        if right.startswith(outcome.lower()[:4]):
+            side = "NO"
+    label = f"{outcome} · {title[:140]}" if outcome else title[:160]
+    return side, label, outcome or side
 
 
 def _attach_builder_code(args: Any) -> Any:
@@ -394,33 +417,24 @@ class Executor:
                     cid = str(p.get("conditionId") or p.get("condition_id") or "").strip()
                     if not cid:
                         continue
-                    outcome = str(p.get("outcome") or p.get("side") or "Yes")
-                    idx = p.get("outcomeIndex")
-                    if idx is not None:
-                        try:
-                            side = "NO" if int(idx) == 1 else "YES"
-                        except (TypeError, ValueError):
-                            side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
-                    else:
-                        side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
-                    if outcome.upper() in {"YES", "NO", "0", "1"}:
-                        label = str(p.get("title") or "")[:160]
-                    else:
-                        label = f"{outcome} · {str(p.get('title') or '')[:140]}"
-                    avg = float(p.get("avgPrice") or p.get("avg_price") or p.get("curPrice") or 0)
-                    cur = float(p.get("curPrice") or p.get("currPrice") or avg)
-                    mtm = float(p.get("currentValue") or (size * cur))
+                    side, label, outcome = _side_and_label(p)
+                    avg = float(p.get("avgPrice") or p.get("avg_price") or 0)
+                    cur = float(p.get("curPrice") or p.get("currPrice") or 0)
+                    api_val = p.get("currentValue")
+                    mtm = float(api_val) if api_val not in (None, "") else (size * cur if cur else 0)
                     out.append(
                         {
                             "condition_id": cid,
                             "question": label,
+                            "outcome": outcome,
                             "category": _infer_category(p),
                             "event_key": str(p.get("eventSlug") or p.get("conditionId") or cid),
                             "side": side,
                             "token_id": str(p.get("asset") or p.get("token_id") or ""),
                             "shares": size,
                             "avg_cost": avg,
-                            "current_value": mtm,
+                            "cur_price": cur if cur else None,
+                            "current_value": mtm if mtm else None,
                             "status": "open",
                         }
                     )
@@ -497,6 +511,11 @@ class Executor:
 
         if getattr(ticket, "synthetic", False):
             raise RuntimeError("live-kjøp avvist: syntetisk bok")
+        if is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
+            if not (0.22 < float(ticket.limit_price) < 0.78):
+                raise RuntimeError("sports ekstrem-pris")
+            if any(is_sports(p) for p in self.store.positions("open")):
+                raise RuntimeError("maks 1 sports-posisjon")
         client = self._live_client()
         sdk = getattr(self, "_sdk", "v1")
         if sdk == "v2":

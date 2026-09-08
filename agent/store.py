@@ -87,6 +87,8 @@ class Store:
             self.conn.commit()
             self._migrate_positions()
             self._ensure_column("positions", "current_value", "REAL")
+            self._ensure_column("positions", "cur_price", "REAL")
+            self._ensure_column("positions", "outcome", "TEXT")
             self._purge_ghost_fills()
 
     def _migrate_positions(self) -> None:
@@ -223,12 +225,14 @@ class Store:
         with self._lock:
             self.conn.execute(
                 """
-                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, current_value, opened_ts, last_ts, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, current_value, cur_price, outcome, opened_ts, last_ts, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id, side) DO UPDATE SET
                     shares=excluded.shares,
                     avg_cost=excluded.avg_cost,
                     current_value=excluded.current_value,
+                    cur_price=excluded.cur_price,
+                    outcome=COALESCE(excluded.outcome, positions.outcome),
                     last_ts=excluded.last_ts,
                     status=excluded.status,
                     token_id=excluded.token_id,
@@ -245,6 +249,8 @@ class Store:
                     row.get("shares", 0),
                     row.get("avg_cost", 0),
                     row.get("current_value"),
+                    row.get("cur_price"),
+                    row.get("outcome"),
                     row.get("opened_ts", utc_now()),
                     utc_now(),
                     row.get("status", "open"),
@@ -474,28 +480,49 @@ class Store:
             row = cur.fetchone()
         return dict(row) if row else None
 
+    def position_cost(self, p: dict) -> float:
+        return float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+
+    def position_mtm(self, p: dict) -> float:
+        """Live value = shares * mid. Never fall back to cost (that double-counts vs available cash)."""
+        shares = float(p.get("shares") or 0)
+        cost = self.position_cost(p)
+        cur = p.get("cur_price")
+        try:
+            if cur not in (None, "") and 0.01 < float(cur) < 0.99:
+                return shares * float(cur)
+        except (TypeError, ValueError):
+            pass
+        cv = p.get("current_value")
+        try:
+            if cv not in (None, "") and abs(float(cv) - cost) > 0.05:
+                return float(cv)
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def split_cash_equity(self, clob_cash: float, open_pos: list[dict]) -> tuple[float, float, float, float]:
+        deposited = 0.0
+        try:
+            deposited = float(self.get_meta("deposited_usd") or 0)
+        except (TypeError, ValueError):
+            deposited = 0.0
+        open_cost = sum(self.position_cost(p) for p in open_pos)
+        open_mtm = sum(self.position_mtm(p) for p in open_pos)
+        if deposited >= 1 and open_cost > 1 and abs(float(clob_cash) - deposited) < 3:
+            cash = max(0.0, deposited - open_cost)
+        else:
+            cash = max(0.0, float(clob_cash or 0))
+        equity = cash + open_mtm
+        return cash, equity, open_cost, open_mtm
+
     def portfolio_stats(self, equity: float, bankroll: float, open_pos: list[dict]) -> dict:
         hist = self.equity_history(400)
         start = self.deposited_usd(0.0)
-        open_cost = 0.0
-        open_mtm = 0.0
-        for p in open_pos:
-            cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
-            open_cost += cost
-            cv = p.get("current_value")
-            try:
-                mtm = float(cv) if cv not in (None, "") else cost
-            except (TypeError, ValueError):
-                mtm = cost
-            open_mtm += mtm
-        # CLOB viser ofte innskutt/total (221.52), ikke ledig cash (~207).
-        if start >= 1 and open_cost > 1 and abs(bankroll - start) < 3:
-            bankroll = max(0.0, bankroll - open_cost)
-        elif start >= 1 and open_cost > 1 and abs(bankroll + open_cost - start) < 8:
-            pass
-        equity = bankroll + open_mtm
+        cash, equity, open_cost, open_mtm = self.split_cash_equity(bankroll, open_pos)
+        bankroll = cash
         if start < 1:
-            start = equity if equity >= 1 else 0.0
+            start = 0.0
         total = equity - start if start >= 1 else 0.0
         total_pct = (total / start) if start >= 1 else 0.0
         now = datetime.now(timezone.utc)
@@ -503,7 +530,10 @@ class Store:
         def _sane(eq: float) -> bool:
             if eq < 1:
                 return False
-            if start >= 1 and abs(eq - start) / start > 0.20:
+            # Ghost spike: cash+cost (~239) while deposited is 221.
+            if start >= 1 and abs(eq - start) / start > 0.08:
+                return False
+            if open_cost > 1 and abs(eq - (bankroll + open_cost)) < 0.6:
                 return False
             return True
 

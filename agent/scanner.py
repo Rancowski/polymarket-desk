@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from agent.config import SKIP_QUESTION_PATTERNS, settings
+from agent.risk import is_sports
 
 log = logging.getLogger("scout")
 
@@ -155,6 +156,8 @@ class Scout:
                 "mid": mid,
                 "url": f"https://polymarket.com/market/{raw.get('slug')}",
             }
+            if is_sports(item):
+                item["category"] = "sports"
             if item["condition_id"]:
                 out.append(item)
         by_event: dict[str, list[dict]] = {}
