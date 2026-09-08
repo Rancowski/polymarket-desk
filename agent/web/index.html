@@ -142,7 +142,11 @@
         if (t) { sessionStorage.setItem(tokenKey, t); return api(path, method, body); }
         throw new Error("Ingen tilgang");
       }
-      return r.json();
+      const data = await r.json();
+      if (!r.ok && r.status !== 409 && r.status !== 400) {
+        throw new Error(data.reason || data.error || r.statusText);
+      }
+      return data;
     }
     function pills(s) {
       const live = s.dry_run ? "Paper" : "Live";
@@ -233,6 +237,13 @@
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;
       $("btnOff").disabled = !!s.halted;
+      if (s.busy) {
+        $("btnOnce").disabled = true;
+        $("btnOnce").textContent = "Kjører…";
+      } else {
+        $("btnOnce").disabled = false;
+        $("btnOnce").textContent = "Kjør én syklus";
+      }
       renderPanel(s);
     }
     async function refresh() {
@@ -244,8 +255,21 @@
     $("btnOnce").onclick = async () => {
       $("btnOnce").disabled = true;
       $("btnOnce").textContent = "Kjører…";
-      try { await api("/api/once", "POST"); }
-      finally { $("btnOnce").disabled = false; $("btnOnce").textContent = "Kjør én syklus"; refresh(); }
+      $("cycle").textContent = "Starter syklus…";
+      try {
+        const res = await api("/api/once", "POST");
+        if (res && res.ok === false) {
+          $("err").innerHTML = `<div class="err">${res.reason || "Kunne ikke starte syklus"}</div>`;
+          $("btnOnce").disabled = false;
+          $("btnOnce").textContent = "Kjør én syklus";
+          return;
+        }
+        $("cycle").textContent = "Syklus i gang (Grok + bøker, 30–90 s)…";
+      } catch (e) {
+        $("err").innerHTML = `<div class="err">${e.message || e}</div>`;
+        $("btnOnce").disabled = false;
+        $("btnOnce").textContent = "Kjør én syklus";
+      }
     };
     $("btnUpd").onclick = async () => {
       if (!confirm("Hente siste kode og restarte agenten?")) return;

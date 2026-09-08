@@ -189,11 +189,22 @@ class Handler(BaseHTTPRequestHandler):
             if _desk is None:
                 self._json(500, {"ok": False, "reason": "desk ikke klar"})
                 return
-            if _desk.busy:
-                self._json(409, {"ok": False, "reason": "syklus kjører"})
+            if settings.halt_file.exists():
+                self._json(400, {"ok": False, "reason": "Agenten er stoppet. Trykk Slå på først."})
                 return
-            result = _desk.cycle()
-            self._json(200, result)
+            if _desk.busy:
+                self._json(409, {"ok": False, "reason": "En syklus kjører allerede — vent til den er ferdig."})
+                return
+            _desk.busy = True
+
+            def _run() -> None:
+                try:
+                    _desk.cycle()
+                finally:
+                    _desk.busy = False
+
+            threading.Thread(target=_run, daemon=True, name="desk-once").start()
+            self._json(200, {"ok": True, "started": True})
             return
         if path == "/api/update":
             script = settings.halt_file.parent / "deploy" / "update.sh"
