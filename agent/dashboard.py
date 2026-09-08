@@ -107,6 +107,9 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
     for row in (last_cycle or {}).get("exit_log") or []:
         q = (row.get("question") or "")[:80]
         hints[q] = row
+        cid = row.get("condition_id")
+        if cid:
+            hints[f"{cid}:{row.get('side') or ''}"] = row
     out = []
     for p in open_pos:
         cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
@@ -117,7 +120,8 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
             mtm = None
         upnl = round(mtm - cost, 2) if mtm is not None else None
         q = (p.get("question") or "")[:80]
-        hint = hints.get(q) or {}
+        cid = p.get("condition_id")
+        hint = hints.get(f"{cid}:{p.get('side') or ''}") or hints.get(q) or {}
         out.append(
             {
                 "question": p.get("question"),

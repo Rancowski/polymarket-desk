@@ -141,6 +141,20 @@ def is_sports(row: dict) -> bool:
     return any(h in blob for h in SPORTS_HINTS)
 
 
+def _row_upnl(p: dict) -> float:
+    cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+    try:
+        mtm = float(p.get("current_value") or 0)
+    except (TypeError, ValueError):
+        mtm = 0.0
+    if mtm <= 0:
+        try:
+            mtm = float(p.get("shares") or 0) * float(p.get("cur_price") or 0)
+        except (TypeError, ValueError):
+            mtm = 0.0
+    return mtm - cost
+
+
 def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
     """Små kontoer: Kelly på 2 ¢ kant er <$5 og ble avvist. Ta et fillbart klipp i stedet."""
     kelly = kelly_usd(p_hat, cost, bankroll)
@@ -234,21 +248,25 @@ class Risk:
             return None, "sports ekstrem-pris"
 
         open_pos = self.store.positions("open")
-        if any(p["condition_id"] == market["condition_id"] for p in open_pos):
-            return None, "allerede i markedet"
-        if is_sports(market) and any(is_sports(p) for p in open_pos):
-            return None, "maks 1 sports-posisjon"
-        if len(open_pos) >= settings.max_open_positions:
-            return None, "max 3 open positions"
-
         event = market.get("event_key") or market["condition_id"]
+        same_cid = [p for p in open_pos if p.get("condition_id") == cid]
+        if any(str(p.get("side") or "").upper() == side for p in same_cid):
+            return None, "allerede i markedet"
+        hedge = bool(same_cid) and not any(str(p.get("side") or "").upper() == side for p in same_cid)
+        if not hedge and any(p.get("event_key") == event and p.get("condition_id") != cid for p in open_pos):
+            return None, "ett event en tese"
+        if len(open_pos) >= settings.max_open_positions and not hedge:
+            return None, "max 12 åpne (kun hedge)"
+        sports_pos = [p for p in open_pos if is_sports(p)]
+        if is_sports(market) and len(sports_pos) >= 3:
+            losers = sum(1 for p in sports_pos if _row_upnl(p) < -0.25)
+            if losers >= 3:
+                return None, "3 sports i minus — ingen 4."
         same_event_cost = sum(
             float(p["shares"]) * float(p["avg_cost"])
             for p in open_pos
             if p.get("event_key") == event
         )
-        if same_event_cost > 0.5:
-            return None, "ett event ett ticket"
         cat_cost = sum(
             float(p["shares"]) * float(p["avg_cost"])
             for p in open_pos
@@ -261,15 +279,16 @@ class Risk:
             size_base = min(bankroll, deposited)
         sports = is_sports(market)
         ks = market.get("kalshi") or {}
-        if sports:
-            floor_pct, cap_pct = 0.04, 0.06
+        longshot = cost <= 0.28
+        if sports or longshot:
+            floor_pct, cap_pct = 0.03, 0.06
         elif abs(float(ks.get("gap") or 0)) >= 0.04 or str(market.get("category") or "") in {
             "economics", "finance", "crypto", "politics", "geopolitics",
         }:
-            floor_pct, cap_pct = 0.10, 0.12
-        else:
             floor_pct, cap_pct = 0.06, 0.10
-        cap = (0.06 if probe else cap_pct) * size_base
+        else:
+            floor_pct, cap_pct = 0.04, 0.08
+        cap = min((0.06 if probe else cap_pct) * size_base, 0.12 * size_base)
         remaining_event = max(0.0, cap - same_event_cost)
         remaining_cat = max(0.0, settings.max_category_pct * size_base - cat_cost)
         hard = min(cap, remaining_event, remaining_cat, bankroll)
@@ -352,10 +371,18 @@ class Risk:
                 book_bid = 0.0
         bid = _live_bid(book, pos)
         missing = book_bid <= 0
-        if missing and bid <= 0.03:
-            return self._exit_ticket(pos, book, shares, 0.001, "død bok (mangler bud) → tick 0.001"), "ok"
-        if bid <= 0.03:
-            return self._exit_ticket(pos, book, shares, 0.001, f"død bud {bid:.4f} → tick 0.001"), "ok"
+        # Sports: empty book is a flatten even if gamma mid is stale (Map2/Forti).
+        # Other: missing CLOB must not look like 0% PnL — use fallback bid for stop/tp;
+        # only flatten when that bid is itself dead.
+        if sports and (missing or book_bid <= 0.03 or bid <= 0.05):
+            return self._exit_ticket(
+                pos, book, shares, 0.001,
+                f"død bok/mark bid={bid:.4f} missing={int(missing)} → tick 0.001",
+            ), "ok"
+        if not sports and bid <= 0.03:
+            return self._exit_ticket(
+                pos, book, shares, 0.001, f"død bud {bid:.4f} → tick 0.001"
+            ), "ok"
         if force_reason:
             return self._exit_ticket(pos, book, shares, max(bid, 0.001), force_reason), "ok"
         counterparts = [
@@ -382,12 +409,12 @@ class Risk:
 
         if sports and (bid <= avg * 0.88 or pnl_pct <= -0.12):
             return self._exit_ticket(pos, book, shares, bid, f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}"), "ok"
-        if not sports and pnl_pct <= -0.25:
+        if not sports and pnl_pct <= -0.18:
             return self._exit_ticket(pos, book, shares, bid, f"stopp-tap {pnl_pct:.1%} bid {bid:.3f}"), "ok"
         if sports and bid >= 0.88:
             return self._exit_ticket(pos, book, shares, bid, f"sports ta gevinst bid {bid:.3f}"), "ok"
-        if not sports and bid >= 0.93:
-            return self._exit_ticket(pos, book, shares, bid, f"ta gevinst bid {bid:.3f}"), "ok"
+        if not sports and (bid >= 0.93 or pnl_pct >= 0.25):
+            return self._exit_ticket(pos, book, shares, bid, f"ta gevinst {pnl_pct:.1%} bid {bid:.3f}"), "ok"
 
         hours_open = 0.0
         raw_ts = pos.get("opened_ts") or pos.get("last_ts")

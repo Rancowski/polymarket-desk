@@ -514,8 +514,16 @@ class Executor:
         if is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
             if not (0.22 < float(ticket.limit_price) < 0.78):
                 raise RuntimeError("sports ekstrem-pris")
-            if any(is_sports(p) for p in self.store.positions("open")):
-                raise RuntimeError("maks 1 sports-posisjon")
+            sports_pos = [p for p in self.store.positions("open") if is_sports(p)]
+            if len(sports_pos) >= 3:
+                losers = 0
+                for p in sports_pos:
+                    cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+                    mtm = float(p.get("current_value") or 0)
+                    if mtm < cost - 0.25:
+                        losers += 1
+                if losers >= 3:
+                    raise RuntimeError("3 sports i minus — ingen 4.")
         client = self._live_client()
         sdk = getattr(self, "_sdk", "v1")
         if sdk == "v2":

@@ -141,68 +141,88 @@ class Desk:
         return mtm - cost
 
     def _trim_reasons(self, open_pos: list) -> dict[tuple, str]:
+        """Only flatten overflow above 12. Do not cut extra sports."""
         force: dict[tuple, str] = {}
-        if not open_pos:
+        cap = settings.max_open_positions
+        if len(open_pos) <= cap:
             return force
-        sports = [p for p in open_pos if is_sports(p)]
-        keep: set[tuple] = set()
-        if sports:
-            best = max(sports, key=self._upnl)
-            keep.add((str(best.get("condition_id")), str(best.get("side") or "YES")))
-        ranked = sorted(open_pos, key=self._upnl, reverse=True)
-        for p in ranked:
+        ranked = sorted(open_pos, key=self._upnl)  # worst first
+        for p in ranked[: len(open_pos) - cap]:
             key = (str(p.get("condition_id")), str(p.get("side") or "YES"))
-            if key in keep:
-                continue
-            if is_sports(p) and any(
-                is_sports(x) for x in open_pos
-                if (str(x.get("condition_id")), str(x.get("side") or "YES")) in keep
-            ):
-                force[key] = "maks 1 sports — trim"
-                continue
-            if len(keep) >= settings.max_open_positions:
-                force[key] = "maks 3 posisjoner — trim"
-                continue
-            keep.add(key)
+            force[key] = "maks 12 — trim dårligste"
         return force
 
+    def _market_stubs(self, open_pos: list) -> dict:
+        by_id: dict = {}
+        for pos in open_pos:
+            cid = pos.get("condition_id")
+            if not cid or cid in by_id:
+                continue
+            by_id[cid] = {
+                "condition_id": cid,
+                "question": pos.get("question") or "",
+                "description": "",
+                "end_date": None,
+                "category": pos.get("category") or "other",
+                "event_key": pos.get("event_key") or cid,
+                "yes_token": pos.get("token_id") if pos.get("side") == "YES" else "",
+                "no_token": pos.get("token_id") if pos.get("side") == "NO" else "",
+                "yes_mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
+                "mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
+                "liquidity": 0,
+                "_open_only": True,
+            }
+        return by_id
+
     def _run_exits(self, open_pos: list, estimates: dict, by_id: dict) -> tuple[int, list]:
-        """Flatten on live bid. Always log hold vs sell. Independent of Grok."""
+        """Flatten on live bid. Always log hold | selling | sold | reject. Independent of Grok."""
         sold = 0
         log_rows: list[dict] = []
         force = self._trim_reasons(open_pos)
         for pos in list(open_pos):
             q = (pos.get("question") or "")[:80]
+            cid = pos.get("condition_id")
+            side = pos.get("side")
             token = pos.get("token_id")
+
+            def _row(action: str, reason: str) -> dict:
+                return {
+                    "question": q,
+                    "condition_id": cid,
+                    "side": side,
+                    "action": action,
+                    "reason": reason,
+                }
+
             if not token:
                 why = "mangler token_id"
                 self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
+                    condition_id=cid,
                     question=pos.get("question"),
-                    side=pos.get("side"),
+                    side=side,
                     action="hold",
                     reason=why,
                 )
-                log_rows.append({"question": q, "action": "hold", "reason": why})
+                log_rows.append(_row("hold", why))
                 continue
             try:
                 pbook = self.scout.book(str(token))
             except Exception as exc:
                 pbook = {}
                 self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
+                    condition_id=cid,
                     question=pos.get("question"),
                     action="skip",
                     reason=f"exit-bok: {exc}",
                 )
             if pbook.get("synthetic"):
                 pbook = {"best_bid": 0, "mid": 0, "best_ask": 0, "spread": 0}
-            key = (str(pos.get("condition_id")), str(pos.get("side") or "YES"))
-            mkt = by_id.get(pos.get("condition_id") or "") or {}
+            key = (str(cid), str(side or "YES"))
+            mkt = by_id.get(cid or "") or {}
             ticket_ex, why = self.risk.evaluate_exit(
                 pos,
                 pbook,
-                estimates.get(pos.get("condition_id") or ""),
+                estimates.get(cid or ""),
                 0.0,
                 kalshi=mkt.get("kalshi"),
                 force_reason=force.get(key),
@@ -210,51 +230,61 @@ class Desk:
             )
             if not ticket_ex:
                 self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
+                    condition_id=cid,
                     question=pos.get("question"),
-                    side=pos.get("side"),
+                    side=side,
                     action="hold",
                     reason=why,
                 )
-                log_rows.append({"question": q, "action": "hold", "reason": why})
+                log_rows.append(_row("hold", why))
                 continue
             try:
                 result = self.exec.sell(ticket_ex)
                 status = str(result.get("status") or "")
-                action = "sell" if status in {"live_sell", "paper_sell"} else "selling"
-                if action == "sell":
+                reason = ticket_ex.get("reason") or why
+                if status in {"live_sell", "paper_sell"}:
+                    action = "sold"
                     sold += 1
+                elif status in {"resting_sell", "resting"}:
+                    action = "reject"
+                    err = ""
+                    resp = result.get("response") or {}
+                    if isinstance(resp, dict):
+                        err = str(resp.get("error") or resp.get("errorMsg") or resp.get("msg") or "")
+                    reason = f"FAK unmatched{(': ' + err) if err else ''} · {reason}"
+                else:
+                    action = "selling"
                 self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
+                    condition_id=cid,
                     question=pos.get("question"),
-                    side=pos.get("side"),
+                    side=side,
                     action=action,
-                    reason=ticket_ex.get("reason") or why,
+                    reason=reason,
                     payload=result,
                 )
-                log_rows.append(
-                    {
-                        "question": q,
-                        "action": action,
-                        "reason": ticket_ex.get("reason") or why,
-                    }
-                )
+                log_rows.append(_row(action, reason))
             except Exception as exc:
                 log.exception("Salg feilet")
                 self.store.log_decision(
-                    condition_id=pos.get("condition_id"),
+                    condition_id=cid,
                     question=pos.get("question"),
-                    action="error",
+                    action="reject",
                     reason=str(exc),
                 )
-                log_rows.append({"question": q, "action": "error", "reason": str(exc)})
+                log_rows.append(_row("reject", str(exc)))
         return sold, log_rows
 
     def _cycle(self) -> dict:
         halt = self.risk.halted()
         self.last_error = None
         bankroll, equity, open_pos = self._refresh_portfolio()
-        exits, exit_log = self._run_exits(open_pos, {}, {})
+        by_open = self._market_stubs(open_pos)
+        try:
+            from agent.kalshi import attach as kalshi_attach_open
+            kalshi_attach_open(list(by_open.values()))
+        except Exception as exc:
+            log.warning("Kalshi (åpne): %s", exc)
+        exits, exit_log = self._run_exits(open_pos, {}, by_open)
         open_pos = self.store.positions("open")
         if halt:
             log.warning("Stoppet: %s", halt)
@@ -351,34 +381,21 @@ class Desk:
             open_pos = self.store.positions("open")
 
         by_id = {m["condition_id"]: m for m in markets}
-        for pos in open_pos:
-            cid = pos.get("condition_id")
-            if cid and cid not in by_id:
-                by_id[cid] = {
-                    "condition_id": cid,
-                    "question": pos.get("question") or "",
-                    "description": "",
-                    "end_date": None,
-                    "category": pos.get("category") or "other",
-                    "event_key": pos.get("event_key") or cid,
-                    "yes_token": pos.get("token_id") if pos.get("side") == "YES" else "",
-                    "no_token": pos.get("token_id") if pos.get("side") == "NO" else "",
-                    "yes_mid": float(pos.get("avg_cost") or 0.5),
-                    "mid": float(pos.get("avg_cost") or 0.5),
-                    "liquidity": 0,
-                    "_open_only": True,
-                }
+        for cid, stub in self._market_stubs(open_pos).items():
+            by_id.setdefault(cid, stub)
         ranked = [m for m in markets if not m.get("_open_only")]
 
         def _prio(m: dict) -> tuple:
             ks = m.get("kalshi") or {}
             gap = abs(float(ks.get("gap") or 0))
             mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
-            comp = float(m.get("complement") or ((m.get("yes_mid") or 0) + (m.get("no_mid") or 0)))
-            locked = 0 if mid >= 0.88 or mid <= 0.12 or (0 < comp < 0.982) else 1
-            sports = 1 if is_sports(m) else 0
+            yes = float(m.get("yes_mid") or 0)
+            no = float(m.get("no_mid") or (1 - yes if yes else 0))
+            comp = yes + no if yes else float(m.get("complement") or 0)
+            resid = max(0.0, 0.982 - comp) if 0 < comp < 1.2 else 0.0
+            locked = 0 if mid >= 0.88 or mid <= 0.12 else 1
             vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
-            return (sports, -gap, locked, -vol)
+            return (-gap, -resid, locked, -vol)
 
         ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
@@ -522,10 +539,11 @@ class Desk:
             return {"ok": False, "reason": str(exc), **self.last_cycle}
 
         open_pos = self.store.positions("open")
-        more, log2 = self._run_exits(open_pos, estimates, by_id)
-        exits += more
-        exit_log.extend(log2)
-        open_pos = self.store.positions("open")
+        if estimates:
+            more, log2 = self._run_exits(open_pos, estimates, by_id)
+            exits += more
+            exit_log.extend(log2)
+            open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
 
         accepted = 0

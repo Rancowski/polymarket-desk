@@ -42,7 +42,7 @@ class Settings:
     xai_prepaid_usd: float = _f("XAI_PREPAID_USD", 0)
     xai_management_key: str = os.getenv("XAI_MANAGEMENT_KEY", "").strip()
     xai_team_id: str = os.getenv("XAI_TEAM_ID", "default").strip()
-    max_open_positions: int = _i("MAX_OPEN_POSITIONS", 3)
+    max_open_positions: int = _i("MAX_OPEN_POSITIONS", 12)
     max_category_pct: float = _f("MAX_CATEGORY_PCT", 0.40)
     daily_loss_halt_pct: float = _f("DAILY_LOSS_HALT_PCT", 0.06)
     weekly_loss_halt_pct: float = _f("WEEKLY_LOSS_HALT_PCT", 0.15)

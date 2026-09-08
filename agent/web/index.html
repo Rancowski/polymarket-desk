@@ -176,7 +176,8 @@
       $("pills").innerHTML =
         `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? mode : "Stoppet"}</span>` +
         (s.busy ? `<span class="pill">Syklus…</span>` : `<span class="pill">neste ${countdown(s)}</span>`) +
-        (rel ? `<span class="pill">${rel}</span>` : "");
+        (rel ? `<span class="pill">${rel}</span>` : "") +
+        `<span class="pill">maks ${s.max_open || 12} · ${Math.round((s.loop_seconds || 300) / 60)} min</span>`;
     }
     function stats(s) {
       const st = s.stats || {};
@@ -243,18 +244,19 @@
       }
       if (tab === "rules") {
         el.innerHTML = [
-          ["Syklus", "Hvert 5. minutt. Exits først. Grok maks hver 3. syklus. Tape + Kalshi hver runde."],
-          ["Kjøp", "FAK. Complement YES+NO < 0,982, så locked, så Kalshi-gap ≥ 4 ¢, så Grok kun ved netto kant etter gebyr."],
-          ["Sports", "Maks 1 åpen, 4–6 % av innskutt, pris 0,22–0,78. Stopp −12 % eller bud ≤ 0,03. +20 % deretter trail 8 % fra topp. Flatten hvis kamp >3 t og mid < 0,15."],
-          ["Andre", "Maks 3 åpne totalt. Kalshi/Fed 10–12 %. Stopp −25 %. Ta gevinst bud ≥ 0,93. Kalshi ≥ 6 ¢ mot kost, eller p_hat ≥ 3 ¢ under kost."],
-          ["Ikke selg", "Ikke fordi Grok falt til mid. Hedge YES+NO i samme marked holdes. Død bok selges på 0,001 — ikke hold som 0 % PnL."],
-          ["Kalshi", "Kun navngitte serier. 25 = 25 bps, ikke 4,25 %. 70/30 blend ved gap ≥ 4 ¢."],
+          ["Syklus", "Hvert 5. minutt. Exits først, deretter tape/Kalshi, Grok maks hver 3. runde. FAK. Ingen X/web."],
+          ["Kjøp-rekkefølge", "1) YES+NO-ask < 0,982. 2) Låst/feilpris. 3) Kalshi-gap ≥ 4 ¢. 4) Søsken-stige. 5) Grok kun ved netto kant etter gebyr."],
+          ["12 seter", "Maks 12 åpne. Ved 12: kun exits og hedge (YES+NO samme marked). Ett event = én tese, hedge teller to linjer."],
+          ["Størrelse", "Sports/longshot 3–6 % av innskutt (~7–13 USD). Fed/Kalshi/complement 6–10 % (~13–22). Hard tak 12 % på ett navn."],
+          ["Sports", "Flere av 12 er lov, men små. Ny sports 0,22–0,78. Ikke 4. sports hvis tre allerede taper. Stopp −12 % / bud ≤ 0,03 / mark ≤ 0,05. +20 % så trail 8 % fra topp. Tom bok flatten."],
+          ["Andre exits", "Stopp −18 %. Ta gevinst bud ≥ 0,93 eller +25 %. Kalshi ≥ 6 ¢ mot kost, eller fersk p_hat ≥ 3 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes."],
+          ["Kalshi", "Kun navngitte serier. 25 = 25 bps, aldri 4,25 %. 70/30 blend ved gap ≥ 4 ¢."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;
       }
       if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen logg ennå.</p>`; return; }
       el.innerHTML = s.decisions.map((d) => {
-        const tone = (d.action === "sell" || d.action === "live" || d.action === "paper") ? "gain" : (d.action === "error" || d.action === "selling" ? "loss" : "");
+        const tone = (d.action === "sell" || d.action === "sold" || d.action === "live" || d.action === "paper") ? "gain" : (d.action === "error" || d.action === "reject" || d.action === "selling" ? "loss" : "");
         return `<div class="row-item"><p class="q">${d.question || ""}</p>
           <div class="meta ${tone}">${clock(d.ts)} · ${d.action || "—"} · ${d.reason || ""}</div></div>`;
       }).join("");

@@ -489,7 +489,7 @@ class Store:
         cost = self.position_cost(p)
         cur = p.get("cur_price")
         try:
-            if cur not in (None, "") and 0.01 < float(cur) < 0.99:
+            if cur not in (None, "") and 0 < float(cur) < 0.99:
                 return shares * float(cur)
         except (TypeError, ValueError):
             pass
