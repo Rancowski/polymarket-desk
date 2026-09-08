@@ -408,6 +408,12 @@ class Store:
         week_base = _at(24 * 7)
         day = equity - day_base
         week = equity - week_base
+        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
+        if start > 1 and open_cost > 1 and abs(bankroll - start) < 3:
+            bankroll = max(0.0, bankroll - open_cost)
+            equity = bankroll + open_cost
+            total = equity - start
+            total_pct = total / start
         peak = start if start > 0 else 0.0
         max_dd = 0.0
         max_dd_usd = 0.0
@@ -415,12 +421,13 @@ class Store:
             eq = float(row["equity"])
             if eq < 1:
                 continue
+            if start and abs(eq - start) / start > 0.15:
+                continue
             peak = max(peak, eq)
             dd_usd = eq - peak
             if peak and dd_usd < max_dd_usd:
                 max_dd_usd = dd_usd
                 max_dd = dd_usd / peak
-        open_cost = sum(float(p.get("shares") or 0) * float(p.get("avg_cost") or 0) for p in open_pos)
         xai_total = self.api_spend(hours=None)
         return {
             "start_equity": round(start, 2),
@@ -432,7 +439,7 @@ class Store:
             "week_pct": round(week / week_base, 4) if week_base else 0.0,
             "max_dd_pct": round(max_dd, 4),
             "max_dd_usd": round(max_dd_usd, 2),
-            "trades": self.fill_count(),
+            "trades": self.live_fill_count(),
             "open_cost": round(open_cost, 2),
             "cash": round(bankroll, 2),
             "xai_total": round(xai_total, 4),

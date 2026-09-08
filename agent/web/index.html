@@ -168,14 +168,14 @@
       const tone = (n) => (n > 0.004 ? "gain" : n < -0.004 ? "loss" : "");
       const cards = [
         ["Egenkapital", usd(s.equity), ""],
-        ["Kontanter", usd(s.bankroll), ""],
+        ["Ledig", usd(st.cash != null ? st.cash : s.bankroll), ""],
         ["Avkastning", `${signed(st.total || 0)} (${pctn(st.total_pct || 0)})`, tone(st.total || 0)],
         ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
         ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
         ["Etter xAI", signed(st.after_xai || 0), tone(st.after_xai || 0)],
         ["Maks tap", `${signed(st.max_dd_usd || 0)} (${pctn(st.max_dd_pct || 0)})`, (st.max_dd_usd || 0) < -0.004 ? "loss" : ""],
         ["Innskutt", usd(st.deposited || 0), ""],
-        ["I markedet", `${s.open} · ${usd(st.open_cost || 0)}`, ""],
+        ["I markedet", `${s.open} · ${usd(st.open_cost || 0)} kost`, ""],
         ["Handler", String(st.trades || 0), ""],
         ["xAI i dag", usd(st.xai_day || 0), ""],
         ["xAI brukt", usd(st.xai_total || 0), ""],
@@ -188,7 +188,10 @@
     function spark(hist) {
       const el = $("spark");
       if (!hist || hist.length < 2) { el.innerHTML = ""; return; }
-      const vals = hist.map((h) => Number(h.equity) || 0);
+        const vals = hist.map((h) => Number(h.equity) or 0).filter((v, i, a) => {
+          const med = a[Math.floor(a.length / 2)] || v;
+          return med < 1 || Math.abs(v - med) / med < 0.2;
+        });
       const min = Math.min(...vals), max = Math.max(...vals);
       const span = max - min || 1;
       const pts = vals.map((v, i) => {
@@ -204,7 +207,7 @@
         if (!s.positions.length) { el.innerHTML = `<p class="empty">Ingen åpne posisjoner.</p>`; return; }
         el.innerHTML = s.positions.map((p) =>
           `<div class="row-item"><p class="q">${p.question || ""}</p>
-           <div class="meta">${p.side} · ${Number(p.shares).toFixed(2)} andeler · snitt ${usd(p.avg_cost)} · ${p.category || ""}</div></div>`
+           <div class="meta">${p.side} · ${Number(p.shares).toFixed(2)} andeler · snitt ${Number(p.avg_cost).toFixed(2)} · kost ${usd(Number(p.shares)*Number(p.avg_cost))} · ${p.category || ""}</div></div>`
         ).join("");
         return;
       }

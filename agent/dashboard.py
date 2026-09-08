@@ -69,6 +69,13 @@ def _state() -> dict[str, Any]:
     if desk:
         try:
             st = desk.store.portfolio_stats(equity, bankroll, open_pos)
+            if st.get("cash") is not None:
+                bankroll = float(st["cash"])
+            if st.get("open_cost") is not None:
+                equity = bankroll + float(st["open_cost"])
+                st["total"] = round(equity - float(st.get("deposited") or st.get("start_equity") or equity), 2)
+                start = float(st.get("deposited") or st.get("start_equity") or 0) or equity
+                st["total_pct"] = round(st["total"] / start, 4) if start else 0
         except Exception as exc:
             log.exception("portfolio_stats: %s", exc)
     spent = float((st or {}).get("xai_total") or 0)

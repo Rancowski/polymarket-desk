@@ -322,12 +322,16 @@ class Executor:
                     size = float(p.get("size") or p.get("shares") or 0)
                     if size < 0.01:
                         continue
-                    outcome = str(p.get("outcome") or p.get("side") or "Yes").upper()
-                    side = "NO" if outcome.startswith("NO") or outcome == "0" else "YES"
+                    outcome = str(p.get("outcome") or p.get("side") or "Yes")
+                    side = "NO" if outcome.upper().startswith("NO") or outcome.upper() == "0" else "YES"
+                    if outcome.upper() in {"YES", "NO", "0", "1"}:
+                        label = str(p.get("title") or "")[:160]
+                    else:
+                        label = f"{outcome} · {str(p.get('title') or '')[:140]}"
                     out.append(
                         {
                             "condition_id": str(p.get("conditionId") or p.get("condition_id") or ""),
-                            "question": str(p.get("title") or p.get("question") or "")[:160],
+                            "question": label,
                             "category": str(p.get("eventSlug") or "other")[:40],
                             "event_key": str(p.get("eventSlug") or p.get("conditionId") or ""),
                             "side": side,
@@ -433,6 +437,11 @@ class Executor:
         size = _amount_size(price, max(min_sz, float(ticket.shares), 10.0))
         log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s…", price, size, tick_s, neg, token[:14])
         args = OrderArgs(token_id=token, price=price, size=size, side=side)
+        if not hasattr(args, "builder_code"):
+            try:
+                args.builder_code = None
+            except Exception:
+                pass
         last_err: Exception | None = None
         signed = None
         for nflag in (neg, (not neg)):
