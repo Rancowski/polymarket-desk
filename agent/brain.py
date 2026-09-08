@@ -137,7 +137,7 @@ class Brain:
             "https://api.x.ai/v1/chat/completions",
             headers=headers,
             json=body,
-            timeout=90,
+            timeout=40,
         )
         if not r.ok:
             log.error("xAI HTTP %s: %s", r.status_code, r.text[:400])

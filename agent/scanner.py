@@ -186,6 +186,7 @@ class Scout:
                     existing.add((m.get("question") or "")[:90])
                     more = [s for s in extra if s.get("q") not in existing]
                     m["siblings"] = (m.get("siblings") or []) + more[:8]
+        log.info("Enrich: historikk/prints på %s markeder spot=%s", len(markets), bool(spots))
 
     def _history(self, token_id: str) -> dict:
         try:
