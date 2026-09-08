@@ -266,6 +266,40 @@ class Executor:
         )
         return settings.paper_bankroll_usd
 
+    def cancel_open(self) -> int:
+        """Fjern hvilende GTC som aldri fyltes (forrige «live» uten fill)."""
+        if settings.dry_run or not settings.private_key:
+            return 0
+        n = 0
+        try:
+            client = self._live_client()
+            for name in ("cancel_all", "cancel_all_orders"):
+                fn = getattr(client, name, None)
+                if callable(fn):
+                    fn()
+                    log.info("CLOB %s kjørt", name)
+                    return 1
+            get = getattr(client, "get_orders", None) or getattr(client, "get_open_orders", None)
+            cancel = getattr(client, "cancel", None) or getattr(client, "cancel_order", None)
+            if get and cancel:
+                orders = get() or []
+                if isinstance(orders, dict):
+                    orders = orders.get("orders") or orders.get("data") or []
+                for o in orders:
+                    oid = None
+                    if isinstance(o, dict):
+                        oid = o.get("id") or o.get("orderID") or o.get("order_id")
+                    if oid:
+                        try:
+                            cancel(oid)
+                            n += 1
+                        except Exception:
+                            pass
+                log.info("Kansellerte %s åpne CLOB-ordre", n)
+        except Exception as exc:
+            log.warning("cancel_open: %s", exc)
+        return n
+
     def submit(self, ticket: Ticket) -> dict:
         payload = {
             "condition_id": ticket.condition_id,
