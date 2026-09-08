@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import requests
+
 from agent.config import settings
 from agent.risk import Ticket
 from agent.store import Store
@@ -17,6 +19,52 @@ def _as_float(value: Any) -> float:
         return float(str(value).strip().replace(",", ""))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _tick_str(tick: float) -> str:
+    if tick >= 0.1:
+        return "0.1"
+    if tick >= 0.01:
+        return "0.01"
+    if tick >= 0.001:
+        return "0.001"
+    return "0.0001"
+
+
+def _quantize(price: float, tick: float) -> float:
+    tick = tick if tick > 0 else 0.01
+    steps = round(float(price) / tick)
+    px = steps * tick
+    px = min(1.0 - tick, max(tick, px))
+    decimals = len(_tick_str(tick).split(".")[-1])
+    return round(px, decimals)
+
+
+def _clob_meta(token_id: str) -> tuple[float, bool]:
+    tick, neg = 0.01, False
+    try:
+        r = requests.get(
+            f"{settings.clob_host}/tick-size",
+            params={"token_id": token_id},
+            timeout=8,
+        )
+        if r.ok:
+            data = r.json() or {}
+            tick = float(data.get("minimum_tick_size") or data.get("tick_size") or 0.01)
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            f"{settings.clob_host}/neg-risk",
+            params={"token_id": token_id},
+            timeout=8,
+        )
+        if r.ok:
+            data = r.json() or {}
+            neg = bool(data.get("neg_risk"))
+    except Exception:
+        pass
+    return tick, neg
 
 
 def _parse_balance(raw: Any) -> float:
@@ -174,47 +222,54 @@ class Executor:
             return {"status": "paper", "ticket": payload}
 
         client = self._live_client()
-        from py_clob_client.clob_types import OrderArgs
+        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
         from py_clob_client.order_builder.constants import BUY
 
-        args = OrderArgs(
-            token_id=ticket.token_id,
-            price=float(ticket.limit_price),
-            size=float(ticket.shares),
-            side=BUY,
-        )
+        token = str(ticket.token_id or "")
+        if not token:
+            raise RuntimeError("mangler token_id")
+        tick, neg = _clob_meta(token)
+        price = _quantize(float(ticket.limit_price), tick)
+        size = round(max(5.0, float(ticket.shares)), 2)
+        args = OrderArgs(token_id=token, price=price, size=size, side=BUY)
         signed = None
-        try:
-            from py_clob_client.clob_types import PartialCreateOrderOptions
-
-            options = PartialCreateOrderOptions(tick_size="0.01")
-            if hasattr(client, "create_and_post_order"):
-                signed = client.create_and_post_order(args, options)
-            else:
-                order = client.create_order(args, options)
-                signed = client.post_order(order)
-        except (TypeError, Exception):
-            if hasattr(client, "create_and_post_order"):
-                signed = client.create_and_post_order(args)
-            elif hasattr(client, "create_order"):
-                order = client.create_order(args)
-                signed = client.post_order(order) if hasattr(client, "post_order") else order
-            else:
-                raise RuntimeError("SDK mangler create/post order")
-        log.info("LIVE ORDER %s", signed)
-        err = ""
+        last_err: Exception | None = None
+        for nflag in (neg, (not neg)):
+            try:
+                options = PartialCreateOrderOptions(tick_size=_tick_str(tick), neg_risk=nflag)
+                if hasattr(client, "create_and_post_order"):
+                    signed = client.create_and_post_order(args, options)
+                else:
+                    order = client.create_order(args, options)
+                    signed = client.post_order(order)
+                last_err = None
+                log.info("LIVE ORDER neg_risk=%s tick=%s px=%s sz=%s → %s", nflag, tick, price, size, signed)
+                break
+            except TypeError:
+                try:
+                    signed = client.create_and_post_order(args)
+                    last_err = None
+                    break
+                except Exception as exc:
+                    last_err = exc
+            except Exception as exc:
+                last_err = exc
+                log.warning("Ordre avvist neg_risk=%s: %s", nflag, exc)
+        if last_err is not None:
+            raise RuntimeError(f"Invalid/avvist ordre: {last_err}") from last_err
         if isinstance(signed, dict):
             err = str(signed.get("error") or signed.get("errorMsg") or signed.get("msg") or "")
-        if err and "success" not in err.lower():
-            raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
+            ok = signed.get("success", True)
+            if ok is False or (err and "success" not in err.lower()):
+                raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
         self.store.add_fill(
             condition_id=ticket.condition_id,
             side=ticket.side,
-            price=ticket.limit_price,
-            size=ticket.shares,
-            cost=ticket.size_usd,
+            price=price,
+            size=size,
+            cost=round(price * size, 2),
             dry_run=False,
-            raw={"order": str(signed), **payload},
+            raw={"order": str(signed), **payload, "tick": tick},
         )
         self.store.upsert_position(
             condition_id=ticket.condition_id,
@@ -223,8 +278,8 @@ class Executor:
             event_key=ticket.event_key,
             side=ticket.side,
             token_id=ticket.token_id,
-            shares=ticket.shares,
-            avg_cost=ticket.limit_price,
+            shares=size,
+            avg_cost=price,
             status="open",
         )
         return {"status": "live", "response": signed, "ticket": payload}
