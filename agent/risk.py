@@ -100,6 +100,8 @@ class Risk:
         if conf == "low" and disagreement < (0.04 if probe else 0.05):
             return None, "confidence=low uten stor uenighet"
         spread = float(book.get("spread") or 0)
+        if book.get("synthetic"):
+            return None, "syntetisk bok"
         if spread > settings.max_spread:
             return None, f"spread {spread:.3f} > max"
 

@@ -78,35 +78,49 @@ def _yes_px(row: dict) -> float:
     return 0.0
 
 
+HOSTS = (
+    "https://api.elections.kalshi.com/trade-api/v2",
+    "https://external-api.kalshi.com/trade-api/v2",
+)
+
+
 def fetch_open(limit: int = 200) -> list[dict]:
-    try:
-        r = requests.get(
-            f"{HOST}/markets",
-            params={"limit": limit, "status": "open"},
-            timeout=12,
-        )
-        r.raise_for_status()
-        rows = (r.json() or {}).get("markets") or []
-        out = []
-        for row in rows:
-            title = str(row.get("title") or row.get("yes_sub_title") or "")
-            px = _yes_px(row)
-            if not title or not px:
-                continue
-            out.append(
-                {
-                    "title": title,
-                    "ticker": row.get("ticker"),
-                    "yes": px,
-                    "tokens": _tokens(title),
-                    "theme": _theme(title),
-                }
+    last_exc: Exception | None = None
+    for host in HOSTS:
+        try:
+            r = requests.get(
+                f"{host}/markets",
+                params={"limit": limit, "status": "open"},
+                timeout=12,
             )
-        log.info("Kalshi: %s åpne markeder", len(out))
-        return out
-    except Exception as exc:
-        log.warning("Kalshi-henting feilet: %s", exc)
-        return []
+            if r.status_code >= 400:
+                r = requests.get(f"{host}/markets", params={"limit": limit}, timeout=12)
+            r.raise_for_status()
+            rows = (r.json() or {}).get("markets") or []
+            out = []
+            for row in rows:
+                title = str(row.get("title") or row.get("yes_sub_title") or row.get("subtitle") or "")
+                px = _yes_px(row)
+                if not title or not px:
+                    continue
+                out.append(
+                    {
+                        "title": title,
+                        "ticker": row.get("ticker"),
+                        "yes": px,
+                        "tokens": _tokens(title),
+                        "theme": _theme(title),
+                    }
+                )
+            log.info("Kalshi %s: %s rader, %s med pris", host.split("/")[2], len(rows), len(out))
+            if out:
+                return out
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Kalshi %s: %s", host, exc)
+    if last_exc:
+        log.warning("Kalshi-henting feilet: %s", last_exc)
+    return []
 
 
 def attach(markets: list[dict], kalshi: list[dict] | None = None) -> int:

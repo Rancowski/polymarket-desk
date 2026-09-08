@@ -29,17 +29,26 @@ def _tick_literal(raw: Any) -> str:
     return "0.01"
 
 
+def _tif(sdk: str) -> Any:
+    if sdk == "v2":
+        from py_clob_client_v2 import OrderType
+    else:
+        from py_clob_client.clob_types import OrderType
+    return getattr(OrderType, "FAK", None) or getattr(OrderType, "FOK", None) or OrderType.GTC
+
+
 def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1") -> Any:
     import inspect
 
+    tif = _tif(sdk)
     if sdk == "v2":
-        from py_clob_client_v2 import OrderType, PartialCreateOrderOptions
+        from py_clob_client_v2 import PartialCreateOrderOptions
 
         options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
         fn = client.create_and_post_order
         names = list(inspect.signature(fn).parameters)
         if "order_type" in names:
-            return fn(args, options, OrderType.GTC)
+            return fn(args, options, tif)
         return fn(args, options)
 
     from py_clob_client.clob_types import PartialCreateOrderOptions
@@ -47,11 +56,9 @@ def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1"
     options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
     fn = client.create_and_post_order
     names = list(inspect.signature(fn).parameters)
-    log.info("CLOB create_and_post_order(%s) tick=%s neg=%s sdk=%s", names, tick_s, neg, sdk)
+    log.info("CLOB create_and_post_order(%s) tick=%s neg=%s sdk=%s tif=%s", names, tick_s, neg, sdk, tif)
     if "order_type" in names:
-        from py_clob_client.clob_types import OrderType
-
-        return fn(args, options, OrderType.GTC)
+        return fn(args, options, tif)
     try:
         return fn(args, options)
     except TypeError:
@@ -380,6 +387,12 @@ class Executor:
             ok = signed.get("success", True)
             if ok is False or (err and "success" not in err.lower()):
                 raise RuntimeError(f"CLOB avviste ordre: {err[:240]}")
+            status = str(signed.get("status") or "").lower()
+            taking = signed.get("takingAmount") or signed.get("makingAmount") or ""
+            filled = status in {"matched", "filled", "delayed"} or (str(taking) not in {"", "0", "0.0"})
+            if not filled:
+                log.info("Ordre hviler umatchet %s", signed.get("orderID"))
+                return {"status": "resting", "response": signed, "ticket": payload}
         self.store.add_fill(
             condition_id=ticket.condition_id,
             side=ticket.side,

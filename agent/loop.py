@@ -158,9 +158,27 @@ class Desk:
                     "_open_only": True,
                 }
         ranked = [m for m in markets if not m.get("_open_only")]
+
+        def _prio(m: dict) -> tuple:
+            ks = m.get("kalshi") or {}
+            gap = abs(float(ks.get("gap") or 0))
+            mid = float(m.get("yes_mid") or m.get("mid") or 0.5)
+            locked = 1 if mid >= 0.90 or mid <= 0.10 else 0
+            vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
+            return (-gap, locked, -vol)
+
+        ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
-        batch = extras + ranked
-        batch = batch[: max(settings.estimate_batch, len(extras))]
+        seen: set[str] = set()
+        batch: list = []
+        for m in extras + ranked:
+            cid = m.get("condition_id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            batch.append(m)
+            if len(batch) >= max(settings.estimate_batch, len(extras)):
+                break
         if not batch:
             log.info("Ingen markeder passerte filter")
             self.last_cycle = {
