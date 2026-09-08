@@ -176,7 +176,8 @@
         ["Maks tap", `${signed(st.max_dd_usd || 0)} (${pctn(st.max_dd_pct || 0)})`, (st.max_dd_usd || 0) < -0.004 ? "loss" : ""],
         ["Innskutt", usd(st.deposited || 0), ""],
         ["I markedet", `${s.open} · ${usd(st.open_cost || 0)} kost`, ""],
-        ["Handler", String(st.trades || 0), ""],
+        const lastFill = (s.fills || []).find((f) => !f.dry_run);
+        ["Siste fill", lastFill ? `${lastFill.side} ${usd(lastFill.cost)}` : "ingen", ""],
         ["xAI i dag", usd(st.xai_day || 0), ""],
         ["xAI brukt", usd(st.xai_total || 0), ""],
         ["xAI igjen", s.xai_remaining == null ? "fyll inn under" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
@@ -331,7 +332,10 @@
       };
     });
     refresh();
-    setInterval(refresh, 4000);
+    (function tick() {
+      const wait = state && state.busy ? 1200 : 4000;
+      setTimeout(async () => { await refresh(); tick(); }, wait);
+    })();
   </script>
 </body>
 </html>

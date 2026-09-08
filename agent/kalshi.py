@@ -25,9 +25,9 @@ def _theme(text: str) -> set[str]:
     tags: set[str] = set()
     if any(x in t for x in ("fed", "fomc", "federal reserve")):
         tags.add("fed")
-        if "25" in t:
+        if re.search(r"\b25\s*(bps|bp|basis)", t) or "25 bps" in t:
             tags.add("25")
-        if "50" in t:
+        if re.search(r"\b50\s*(bps|bp|basis)", t):
             tags.add("50")
         if any(x in t for x in ("cut", "decrease", "lower", "ease")):
             tags.add("cut")
@@ -86,6 +86,7 @@ HOSTS = (
 
 SERIES = (
     "KXFED",
+    "KXFEDHIKE",
     "KXBTC",
     "KXBTCD",
     "KXETH",
@@ -93,6 +94,8 @@ SERIES = (
     "INX",
     "KXTRUMP",
     "KXHARRIS",
+    "BTC",
+    "ETHD",
 )
 
 

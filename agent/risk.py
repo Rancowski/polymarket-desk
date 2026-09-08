@@ -146,6 +146,8 @@ class Risk:
         open_pos = self.store.positions("open")
         if any(p["condition_id"] == market["condition_id"] for p in open_pos):
             return None, "allerede i markedet"
+        if market.get("category") == "sports" and any((p.get("category") or "") == "sports" for p in open_pos):
+            return None, "maks 1 sports-posisjon"
         if len(open_pos) >= settings.max_open_positions:
             return None, "max open positions"
 
@@ -223,8 +225,8 @@ class Risk:
         book: dict,
         estimate: dict | None,
         bankroll: float,
+        kalshi: dict | None = None,
     ) -> tuple[dict | None, str]:
-        """Selg når edge er borte, p̂ har falt gjennom kost, eller uRealisert ≤ −25 %."""
         shares = float(pos.get("shares") or 0)
         avg = float(pos.get("avg_cost") or 0)
         if shares <= 0 or avg <= 0:
@@ -242,20 +244,31 @@ class Risk:
         if best_bid <= 0:
             return None, "ingen bud"
         pnl_pct = (best_bid - avg) / avg
-        if pnl_pct <= -0.25:
+        sports = (pos.get("category") or "") == "sports"
+
+        if sports and pnl_pct <= -0.15:
+            return self._exit_ticket(pos, book, shares, best_bid, f"sports stopp-tap {pnl_pct:.1%}"), "ok"
+        if not sports and pnl_pct <= -0.25:
             return self._exit_ticket(pos, book, shares, best_bid, f"stopp-tap {pnl_pct:.1%}"), "ok"
+        if sports and (best_bid >= 0.88 or pnl_pct >= 0.22):
+            return self._exit_ticket(pos, book, shares, best_bid, f"sports ta gevinst {pnl_pct:.1%}"), "ok"
+        if not sports and best_bid >= 0.93:
+            return self._exit_ticket(pos, book, shares, best_bid, "nær resolusjon — ta gevinst"), "ok"
+
+        ks = kalshi or {}
+        k_yes = float(ks.get("yes") or 0)
+        if 0.02 < k_yes < 0.98:
+            k_hat = k_yes if side == "YES" else 1.0 - k_yes
+            if k_hat + 0.06 < avg:
+                return self._exit_ticket(pos, book, shares, best_bid, f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}"), "ok"
 
         if not estimate or estimate.get("skip"):
-            return None, "ingen fersk estimat"
+            return None, "hold uten fersk estimat"
 
         p_yes = float(estimate["p_yes"])
-        side = str(pos.get("side") or "YES").upper()
         p_hat = p_yes if side == "YES" else 1.0 - p_yes
-        edge = p_hat - avg
-        if p_hat < avg:
+        if p_hat < avg - 0.03:
             return self._exit_ticket(pos, book, shares, best_bid, f"p_hat {p_hat:.2f} < kost {avg:.2f}"), "ok"
-        if edge < settings.min_net_edge / 2:
-            return self._exit_ticket(pos, book, shares, best_bid, f"edge borte {edge:.3f}"), "ok"
         return None, "hold"
 
     def _exit_ticket(self, pos: dict, book: dict, shares: float, price: float, reason: str) -> dict:

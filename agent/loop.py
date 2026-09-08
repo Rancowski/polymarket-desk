@@ -268,7 +268,11 @@ class Desk:
                 )
                 continue
             ticket_ex, why = self.risk.evaluate_exit(
-                pos, pbook, estimates.get(pos.get("condition_id")), bankroll
+                pos,
+                pbook,
+                estimates.get(pos.get("condition_id")),
+                bankroll,
+                kalshi=(by_id.get(pos.get("condition_id") or "") or {}).get("kalshi"),
             )
             if not ticket_ex:
                 continue
