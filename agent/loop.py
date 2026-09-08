@@ -49,7 +49,11 @@ class Desk:
             return
 
         batch = markets[: settings.estimate_batch]
-        estimates = self.brain.estimate(batch)
+        try:
+            estimates = self.brain.estimate(batch)
+        except Exception as exc:
+            log.exception("Brain krasjet: %s", exc)
+            return
 
         accepted = 0
         for m in batch:
