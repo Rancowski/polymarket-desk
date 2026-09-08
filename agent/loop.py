@@ -161,6 +161,9 @@ class Desk:
 
         try:
             estimates = self.brain.estimate(batch)
+            usage = getattr(self.brain, "last_usage", {}) or {}
+            if usage.get("usd"):
+                self.store.add_api_cost(float(usage["usd"]), str(usage.get("model") or ""), int(usage.get("tokens") or 0))
             self.last_error = None
         except Exception as exc:
             log.exception("Brain krasjet: %s", exc)

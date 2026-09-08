@@ -63,7 +63,11 @@ def _response_text(data: dict) -> str:
 class Brain:
     """Grok på Polymarket-mikrostruktur. Ingen X/web-søk (kostnad)."""
 
+    def __init__(self) -> None:
+        self.last_usage = {"usd": 0.0, "tokens": 0, "model": ""}
+
     def estimate(self, markets: list[dict]) -> dict[str, dict]:
+        self.last_usage = {"usd": 0.0, "tokens": 0, "model": ""}
         if not markets:
             return {}
         key = (settings.xai_api_key or "").strip()
@@ -73,7 +77,6 @@ class Brain:
         if not key.startswith("xai-"):
             log.error("XAI_API_KEY ser feil ut. Hopper over estimat.")
             return {}
-
         payload_markets = []
         for m in markets:
             book = m.get("book") or {}
@@ -106,17 +109,25 @@ class Brain:
         models = [settings.grok_model, "grok-4.5", "grok-4"]
         seen: set[str] = set()
         last_err = ""
+        usd = 0.0
+        tokens_n = 0
+        used = ""
         for model in models:
             if not model or model in seen:
                 continue
             seen.add(model)
             try:
-                text = self._call(key, model, user)
+                text, cost, tokens = self._call(key, model, user)
+                usd += cost
+                tokens_n += tokens
+                used = model
+                self.last_usage = {"usd": usd, "tokens": tokens_n, "model": used}
                 if text:
                     return self._parse(text, markets)
             except Exception as exc:
                 last_err = str(exc)
                 log.warning("xAI %s feilet: %s", model, last_err[:300])
+        self.last_usage = {"usd": usd, "tokens": tokens_n, "model": used}
         log.error("Ingen Grok-modell svarte. Siste feil: %s", last_err[:400])
         return {}
 
@@ -142,7 +153,18 @@ class Brain:
         if not r.ok:
             log.error("xAI HTTP %s: %s", r.status_code, r.text[:400])
             r.raise_for_status()
-        return _response_text(r.json())
+        data = r.json()
+        usage = data.get("usage") or {}
+        ticks = usage.get("cost_in_usd_ticks") or 0
+        cost = float(ticks) / 10_000_000_000 if ticks else 0.0
+        if not cost:
+            # fallback grok-4.6 listpris hvis feltet mangler
+            inn = float(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            out = float(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            cost = inn / 1_000_000 * 2.0 + out / 1_000_000 * 6.0
+        tokens = int(usage.get("total_tokens") or 0)
+        log.info("xAI %s kost=$%.4f tokens=%s", model, cost, tokens)
+        return _response_text(data), cost, tokens
 
     def _parse(self, content: str, markets: list[dict]) -> dict[str, dict]:
         rows = _extract_json(content)

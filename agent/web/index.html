@@ -144,6 +144,9 @@
         ["Maks tap", pctn(st.max_dd_pct || 0), (st.max_dd_pct || 0) < -0.001 ? "loss" : ""],
         ["Åpne / kostnad", `${s.open} / ${usd(st.open_cost || 0)}`, ""],
         ["Handler", String(st.trades || 0), ""],
+        ["xAI i dag", usd(st.xai_day || 0), ""],
+        ["xAI totalt", usd(st.xai_total || 0), ""],
+        ["xAI igjen", s.xai_remaining == null ? "sett XAI_PREPAID_USD" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
       ];
       $("stats").innerHTML = cards.map(([l, v, c]) =>
         `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
@@ -193,8 +196,11 @@
       stats(s);
       spark(s.equity_history);
       const c = s.last_cycle;
+      const st = s.stats || {};
+      const next = c && c.ts ? new Date(new Date(c.ts).getTime() + (s.loop_seconds || 900) * 1000) : null;
+      const rejects = (st.top_rejects || []).slice(0, 3).map((r) => `${r.n}× ${r.reason}`).join(" · ");
       $("cycle").textContent = c
-        ? `Siste syklus ${clock(c.ts)} · skannet ${c.scanned || 0} · estimert ${c.estimated || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}`
+        ? `Siste syklus ${clock(c.ts)} · neste ${next ? clock(next.toISOString()) : "—"} · skannet ${c.scanned || 0} · grok ${c.accepted || 0} · arb ${c.arb || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0}${rejects ? " · " + rejects : ""}`
         : "Venter på første syklus.";
       $("err").innerHTML = s.last_error ? `<div class="err">${s.last_error}</div>` : "";
       $("btnOn").disabled = !s.halted;

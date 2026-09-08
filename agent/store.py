@@ -70,6 +70,13 @@ class Store:
                     bankroll REAL,
                     equity REAL
                 );
+                CREATE TABLE IF NOT EXISTS api_costs (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    usd REAL,
+                    model TEXT,
+                    tokens INTEGER
+                );
                 """
             )
             self.conn.commit()
@@ -279,5 +286,59 @@ class Store:
             "trades": self.fill_count(),
             "open_cost": round(open_cost, 2),
             "cash": round(bankroll, 2),
+            "xai_total": round(self.api_spend(hours=None), 4),
+            "xai_day": round(self.api_spend(hours=24), 4),
+            "top_rejects": self.top_rejects(8),
         }
+
+    def add_api_cost(self, usd: float, model: str = "", tokens: int = 0) -> None:
+        if usd <= 0:
+            return
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO api_costs (ts, usd, model, tokens) VALUES (?, ?, ?, ?)",
+                (utc_now(), usd, model, tokens),
+            )
+            self.conn.commit()
+
+    def api_spend(self, hours: float | None = None) -> float:
+        with self._lock:
+            if hours is None:
+                cur = self.conn.execute("SELECT COALESCE(SUM(usd), 0) AS s FROM api_costs")
+            else:
+                cutoff = (datetime.now(timezone.utc).timestamp() - hours * 3600)
+                cur = self.conn.execute("SELECT ts, usd FROM api_costs")
+                total = 0.0
+                for row in cur.fetchall():
+                    try:
+                        ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        if ts.timestamp() >= cutoff:
+                            total += float(row["usd"])
+                    except ValueError:
+                        continue
+                return total
+            row = cur.fetchone()
+        return float(row["s"] if row else 0)
+
+    def top_rejects(self, limit: int = 8) -> list[dict]:
+        rows = self.recent_decisions(200)
+        cutoff = datetime.now(timezone.utc).timestamp() - 2 * 24 * 3600
+        counts: dict[str, int] = {}
+        for row in rows:
+            if row.get("action") not in {"reject", "skip"}:
+                continue
+            reason = (row.get("reason") or "ukjent")[:80]
+            try:
+                ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts.timestamp() < cutoff:
+                    continue
+            except ValueError:
+                pass
+            counts[reason] = counts.get(reason, 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return [{"reason": k, "n": v} for k, v in ranked]
 

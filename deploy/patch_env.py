@@ -9,7 +9,7 @@ PATCH = {
     "MAX_POSITION_PCT": "0.12",
     "MIN_NET_EDGE": "0.03",
     "MODEL_HAIRCUT": "0.02",
-    "KELLY_FRACTION": "0.35",
+    "KELLY_FRACTION": "0.25",
     "MAX_OPEN_POSITIONS": "12",
     "MAX_CATEGORY_PCT": "0.40",
     "DAILY_LOSS_HALT_PCT": "0.06",

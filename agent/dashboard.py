@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import requests
+
 from agent.config import settings
 
 log = logging.getLogger("dash")
@@ -30,6 +32,31 @@ def lan_ip() -> str:
         sock.close()
 
 
+def _xai_remaining(spent: float) -> float | None:
+    key = settings.xai_management_key
+    if key:
+        try:
+            r = requests.get(
+                f"https://management-api.x.ai/v1/billing/teams/{settings.xai_team_id or 'default'}/prepaid/balance",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=6,
+            )
+            if r.ok:
+                data = r.json() if isinstance(r.json(), dict) else {}
+                for k in ("balance_usd", "available_usd", "balance"):
+                    if k in data:
+                        return float(data[k])
+                if "cents" in data:
+                    return float(data["cents"]) / 100.0
+                if "balance_cents" in data:
+                    return float(data["balance_cents"]) / 100.0
+        except Exception:
+            pass
+    if settings.xai_prepaid_usd > 0:
+        return max(0.0, settings.xai_prepaid_usd - spent)
+    return None
+
+
 def _state() -> dict[str, Any]:
     desk = _desk
     mark = desk.store.latest_mark() if desk else None
@@ -38,6 +65,7 @@ def _state() -> dict[str, Any]:
     bankroll = float(mark["bankroll"]) if mark else settings.paper_bankroll_usd
     equity = float(mark["equity"]) if mark else bankroll + locked
     halt = settings.halt_file.exists()
+    st = desk.store.portfolio_stats(equity, bankroll, open_pos) if desk else {}
     return {
         "dry_run": settings.dry_run,
         "halted": halt,
@@ -67,7 +95,8 @@ def _state() -> dict[str, Any]:
         "decisions": desk.store.recent_decisions(60) if desk else [],
         "fills": desk.store.recent_fills(30) if desk else [],
         "equity_history": desk.store.equity_history(120) if desk else [],
-        "stats": desk.store.portfolio_stats(equity, bankroll, open_pos) if desk else {},
+        "stats": st,
+        "xai_remaining": _xai_remaining(float((st or {}).get("xai_total") or 0)),
         "auth_required": bool(settings.dashboard_token),
     }
 

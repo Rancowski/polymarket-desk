@@ -114,6 +114,9 @@ class Risk:
         edge_net = edge_gross - (spread / 2.0) - fee_frac - settings.model_haircut
         if edge_net < settings.min_net_edge:
             return None, f"edge_net {edge_net:.3f} < {settings.min_net_edge}"
+        # Favoritt-sone (Thorp/Kelly): dyr kontrakt krever mer edge
+        if cost >= 0.82 and edge_net < max(settings.min_net_edge * 2, 0.06):
+            return None, f"favoritt-sone kost {cost:.2f} krever mer edge"
 
         open_pos = self.store.positions("open")
         if any(p["condition_id"] == market["condition_id"] for p in open_pos):
