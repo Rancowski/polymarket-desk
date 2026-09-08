@@ -53,6 +53,15 @@ def kelly_usd(p_hat: float, cost: float, bankroll: float) -> float:
     return max(0.0, settings.kelly_fraction * f_star * bankroll)
 
 
+def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
+    """Små kontoer: Kelly på 2 ¢ kant er <$5 og ble avvist. Ta et fillbart klipp i stedet."""
+    kelly = kelly_usd(p_hat, cost, bankroll)
+    if kelly <= 0:
+        return 0.0
+    min_clip = min(cap, max(8.0, 0.04 * bankroll))
+    return min(cap, max(kelly, min_clip))
+
+
 class Risk:
     def __init__(self, store: Store) -> None:
         self.store = store
@@ -138,20 +147,26 @@ class Risk:
             if p.get("category") == market["category"]
         )
 
-        cap = (0.05 if probe else settings.max_position_pct) * bankroll
+        cap = (0.06 if probe else settings.max_position_pct) * bankroll
         remaining_event = max(0.0, cap - same_event_cost)
         remaining_cat = max(0.0, settings.max_category_pct * bankroll - cat_cost)
-        sized = min(kelly_usd(p_hat, cost, bankroll), cap, remaining_event, remaining_cat)
+        hard = min(cap, remaining_event, remaining_cat)
+        sized = clip_usd(p_hat, cost, bankroll, hard)
         if probe:
-            sized = min(sized if sized > 0 else 12.0, 12.0, cap, remaining_event, remaining_cat)
-        if sized < 5:
-            return None, f"size {sized:.2f} for liten"
+            sized = min(max(sized, 8.0), 12.0, hard)
+        if sized < 5 or hard < 5:
+            return None, f"size {sized:.2f} for liten (bankroll {bankroll:.0f})"
 
         shares = sized / cost if cost > 0 else 0
+        if shares < 5:
+            shares = 5.0
+            sized = shares * cost
+            if sized > hard:
+                return None, "min 5 andeler over cap"
         if book_sz and shares > book_sz / settings.min_book_multiple:
             shares = book_sz / settings.min_book_multiple
             sized = shares * cost
-            if sized < 5:
+            if sized < 5 or shares < 5:
                 return None, "bok for tynn etter cap"
 
         daily = self.store.equity_change_since(24, equity)

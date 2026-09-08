@@ -113,7 +113,7 @@ class Arb:
                 shares = min(shares, ysz / max(2, settings.min_book_multiple))
             if nsz:
                 shares = min(shares, nsz / max(2, settings.min_book_multiple))
-            if shares * (yask + nask) < 8:
+            if shares * (yask + nask) < 6:
                 continue
             thesis = f"sum-til-én YES+NO ask {yask+nask:.3f}"
             out.append(_ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis))
