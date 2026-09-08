@@ -352,6 +352,7 @@ class Executor:
 
         tick_f = float(tick_s)
         price = _quantize(float(ticket.limit_price), tick_f)
+        price = _quantize(min(0.99, price + tick_f), tick_f)
         size = _amount_size(price, max(min_sz, float(ticket.shares), 10.0))
         log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s…", price, size, tick_s, neg, token[:14])
         args = OrderArgs(token_id=token, price=price, size=size, side=side)

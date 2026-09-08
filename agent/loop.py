@@ -63,6 +63,10 @@ class Desk:
 
         bankroll = self.exec.bankroll()
         self.last_error = None
+        try:
+            self.exec.cancel_open()
+        except Exception as exc:
+            log.warning("cancel_open: %s", exc)
         open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
         equity = bankroll + locked
