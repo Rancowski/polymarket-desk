@@ -105,18 +105,9 @@ Hvis du er usikker: bruk ny MetaMask/Rabby, `SIGNATURE_TYPE=0`, og sett `POLYMAR
 
 ## 2. Last ned koden
 
-Velg **én** metode.
-
-### Metode 1 — zip (enklest, ingen Git)
-
-Pakk ut `polymarket-desk.zip` til f.eks.:
-
-- Windows: `C:\Users\DITTNAVN\polymarket-desk`
-- Mac/Linux: `~/polymarket-desk`
+Bruk **kun** GitHub-repoet `Rancowski/polymarket-desk` (eller `artifacts\polymarket-agent` fra Grok-zip). Ikke bland dem med nettside-zipen (`AGENTS.md`, `vite`, `src`).
 
 Mappen skal inneholde `main.py`, `requirements.txt` og mappen `agent/`.
-
-### Metode 2 — Git
 
 ```powershell
 cd $HOME
@@ -124,30 +115,21 @@ git clone https://github.com/Rancowski/polymarket-desk.git
 cd polymarket-desk
 ```
 
-Hvis repoet er privat, bruk zip.
+Hvis repoet er privat, last ned zip fra GitHub og pakk ut.
 
 ---
 
 ## 3. Installer avhengigheter
 
-Åpne terminal **i prosjektmappen**.
+Åpne PowerShell **i prosjektmappen**. Ikke kjør `Activate.ps1` — kall venv-python direkte.
 
-**Windows (PowerShell) — ikke aktiver venv (unngår ExecutionPolicy):**
+**Windows:**
 
 ```powershell
 cd C:\Users\DITTNAVN\polymarket-desk
 python -m venv .venv
-.\ .venv\Scripts\python.exe -m pip install --upgrade pip
-.\ .venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-Kall alltid `.\.venv\Scripts\python.exe` i stedet for `python` etter dette.
-
-Hvis du likevel vil aktivere venv og PowerShell sier at scripts er blokkert:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-.\ .venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 **Mac / Linux:**
@@ -205,7 +187,7 @@ Lagre og lukk. **Ikke lim nøkler inn i Grok-chat.**
 ## 5. Generer Polymarket API-credentials (én gang)
 
 ```powershell
-.\ .venv\Scripts\python.exe -m agent.bootstrap_creds
+.\.venv\Scripts\python.exe -m agent.bootstrap_creds
 ```
 
 Den printer tre linjer:
@@ -225,7 +207,7 @@ Hvis den klager på private key: sjekk at `.env` ligger i **samme mappe som `mai
 ## 6. Første paper-syklus (må lykkes før live)
 
 ```powershell
-.\ .venv\Scripts\python.exe main.py once
+.\.venv\Scripts\python.exe main.py once
 ```
 
 Dette kjører **én** runde: scanner → Grok estimerer → risk sier ja/nei → paper-fills logges.
@@ -242,7 +224,7 @@ De fleste markeder **skal** avvises. 8 % netto edge er strengt. Det er meningen.
 Se status:
 
 ```powershell
-.\ .venv\Scripts\python.exe main.py status
+.\.venv\Scripts\python.exe main.py status
 ```
 
 Logg og posisjoner ligger i `data/desk.db` (SQLite). Du kan åpne den med [DB Browser for SQLite](https://sqlitebrowser.org).
@@ -252,7 +234,7 @@ Logg og posisjoner ligger i `data/desk.db` (SQLite). Du kan åpne den med [DB Br
 ## 7. La den kjøre autonomt i paper
 
 ```powershell
-.\ .venv\Scripts\python.exe main.py run
+.\.venv\Scripts\python.exe main.py run
 ```
 
 Den looper hvert 15. minutt (`LOOP_SECONDS=900`). La vinduet stå åpent. Lukk = stopper.
@@ -282,14 +264,14 @@ PAPER_BANKROLL_USD=DET_DU_FAKTISK_HAR_SATT_INN
 4. Kjør én live-syklus først, ikke loop:
 
 ```powershell
-.\ .venv\Scripts\python.exe main.py once
+.\.venv\Scripts\python.exe main.py once
 ```
 
 5. Se i terminalen etter `LIVE ORDER` eller `reject`. Sjekk https://polymarket.com/portfolio at eventuelle ordre faktisk ligger der
 6. Hvis det ser riktig ut:
 
 ```powershell
-.\ .venv\Scripts\python.exe main.py run
+.\.venv\Scripts\python.exe main.py run
 ```
 
 Nå handler den alene innenfor reglene.
@@ -381,7 +363,7 @@ Netto edge:
 ## 12. Vanlige feil
 
 | Symptom | Fix |
-|---|---|---|
+|---|---|
 | `python` ikke gjenkjent | Python ikke i PATH. Reinstaller med «Add to PATH», åpne ny PowerShell |
 | `Activate.ps1` blokkert | Ikke aktiver. Bruk `.\.venv\Scripts\python.exe` i stedet |
 | `XAI_API_KEY mangler` | `.env` ikke i prosjektroten, eller nøkkelen har anførselstegn |
