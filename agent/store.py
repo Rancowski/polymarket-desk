@@ -153,6 +153,8 @@ class Store:
         taking = str(merged.get("takingAmount") if merged.get("takingAmount") is not None else "").strip()
         making = str(merged.get("makingAmount") if merged.get("makingAmount") is not None else "").strip()
         empty = {"", "0", "0.0", "none", "null"}
+        if merged.get("closed_dust"):
+            return True
         if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"} and taking.lower() in empty and making.lower() in empty:
             return False
         if status in {"matched", "filled"}:
@@ -276,6 +278,30 @@ class Store:
                     (utc_now(), condition_id),
                 )
             self.conn.commit()
+
+    def _dust_key(self, condition_id: str, side: str | None) -> str:
+        return f"dust:{condition_id}:{str(side or 'YES').upper()}"
+
+    def is_dust(self, condition_id: str, side: str | None) -> bool:
+        return bool(self.get_meta(self._dust_key(condition_id, side), ""))
+
+    def close_dust(self, condition_id: str, side: str | None = None) -> None:
+        with self._lock:
+            if side:
+                self.conn.execute(
+                    "UPDATE positions SET status='closed_dust', shares=0, last_ts=? WHERE condition_id=? AND side=?",
+                    (utc_now(), condition_id, side),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE positions SET status='closed_dust', shares=0, last_ts=? WHERE condition_id=?",
+                    (utc_now(), condition_id),
+                )
+            self.conn.commit()
+        self.set_meta(self._dust_key(condition_id, side), utc_now())
+
+    def clear_dust(self, condition_id: str, side: str | None) -> None:
+        self.set_meta(self._dust_key(condition_id, side), "")
 
     def add_fill(self, **row: Any) -> None:
         with self._lock:
@@ -470,6 +496,23 @@ class Store:
                     )
             self.conn.commit()
         for r in cleaned:
+            cid = str(r.get("condition_id") or "")
+            side = str(r.get("side") or "YES")
+            if self.is_dust(cid, side):
+                try:
+                    cur = float(r.get("cur_price") or 0)
+                except (TypeError, ValueError):
+                    cur = 0.0
+                try:
+                    mtm = float(r.get("current_value") or 0)
+                except (TypeError, ValueError):
+                    mtm = 0.0
+                shares = float(r.get("shares") or 0)
+                if mtm <= 0 and shares and cur:
+                    mtm = shares * cur
+                if mtm < 0.25 or cur <= 0.01:
+                    continue
+                self.clear_dust(cid, side)
             self.upsert_position(**r)
 
     def first_mark(self) -> dict | None:

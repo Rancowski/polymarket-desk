@@ -223,8 +223,12 @@
         const hint = p.exit_action
           ? `<div class="hint">${p.exit_action}${p.exit_reason ? " · " + p.exit_reason : ""}</div>`
           : "";
+        const kg = p.kalshi_gap;
+        const kline = kg != null && Number.isFinite(Number(kg))
+          ? `<div class="meta">Kalshi ${p.kalshi_ticker || ""} ${Number(p.kalshi_yes || 0).toFixed(2)} vs PM gap ${Number(kg) >= 0 ? "+" : ""}${(Number(kg) * 100).toFixed(0)}c</div>`
+          : "";
         return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
-          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${hint}</div>`;
+          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${kline}${hint}</div>`;
       }).join("");
     }
     function cycleLine(s) {
@@ -256,7 +260,7 @@
       }
       if (!s.decisions.length) { el.innerHTML = `<p class="empty">Ingen logg ennå.</p>`; return; }
       el.innerHTML = s.decisions.map((d) => {
-        const tone = (d.action === "sell" || d.action === "sold" || d.action === "live" || d.action === "paper") ? "gain" : (d.action === "error" || d.action === "reject" || d.action === "selling" ? "loss" : "");
+        const tone = (d.action === "sell" || d.action === "sold" || d.action === "live" || d.action === "paper") ? "gain" : (d.action === "error" || d.action === "reject" || d.action === "selling" || d.action === "closed_dust" ? "loss" : "");
         return `<div class="row-item"><p class="q">${d.question || ""}</p>
           <div class="meta ${tone}">${clock(d.ts)} · ${d.action || "—"} · ${d.reason || ""}</div></div>`;
       }).join("");

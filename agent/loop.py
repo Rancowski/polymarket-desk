@@ -169,6 +169,9 @@ class Desk:
                 "no_token": pos.get("token_id") if pos.get("side") == "NO" else "",
                 "yes_mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
                 "mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
+                "avg_cost": float(pos.get("avg_cost") or 0),
+                "side": str(pos.get("side") or "YES"),
+                "shares": float(pos.get("shares") or 0),
                 "liquidity": 0,
                 "_open_only": True,
             }
@@ -194,6 +197,17 @@ class Desk:
                     "reason": reason,
                 }
 
+            if self.store.is_dust(str(cid or ""), str(side or "YES")):
+                why = "closed_dust — hopper FAK"
+                self.store.log_decision(
+                    condition_id=cid,
+                    question=pos.get("question"),
+                    side=side,
+                    action="hold",
+                    reason=why,
+                )
+                log_rows.append(_row("hold", why))
+                continue
             if not token:
                 why = "mangler token_id"
                 self.store.log_decision(
@@ -206,7 +220,7 @@ class Desk:
                 log_rows.append(_row("hold", why))
                 continue
             try:
-                pbook = self.scout.book(str(token))
+                pbook = self.scout.book(str(token), require_two_sided=False)
             except Exception as exc:
                 pbook = {}
                 self.store.log_decision(
@@ -242,16 +256,49 @@ class Desk:
                 result = self.exec.sell(ticket_ex)
                 status = str(result.get("status") or "")
                 reason = ticket_ex.get("reason") or why
+                book_bid = float(ticket_ex.get("best_bid") or result.get("best_bid") or 0)
+                try:
+                    mark = float(pos.get("cur_price") or 0)
+                except (TypeError, ValueError):
+                    mark = 0.0
+                value = float(pos.get("shares") or 0) * mark
                 if status in {"live_sell", "paper_sell"}:
                     action = "sold"
                     sold += 1
+                elif status == "unmatched_dust" or (
+                    ticket_ex.get("dust")
+                    and status in {"resting_sell", "resting"}
+                    and (value < 0.25 or mark <= 0.01)
+                ):
+                    px = result.get("attempt_px")
+                    self.store.add_fill(
+                        condition_id=cid,
+                        side=f"SELL_{side}",
+                        price=mark or 0.001,
+                        size=pos.get("shares"),
+                        cost=round((mark or 0.001) * float(pos.get("shares") or 0), 4),
+                        dry_run=settings.dry_run,
+                        raw={
+                            "closed_dust": True,
+                            "takingAmount": str(pos.get("shares") or 0),
+                            "status": "matched",
+                            **(result if isinstance(result, dict) else {}),
+                        },
+                    )
+                    self.store.close_dust(str(cid or ""), str(side or "YES"))
+                    action = "closed_dust"
+                    sold += 1
+                    reason = f"closed_dust FAK unmatched @{px} bid={book_bid:.4f} · {reason}"
                 elif status in {"resting_sell", "resting"}:
                     action = "reject"
                     err = ""
                     resp = result.get("response") or {}
                     if isinstance(resp, dict):
                         err = str(resp.get("error") or resp.get("errorMsg") or resp.get("msg") or "")
-                    reason = f"FAK unmatched{(': ' + err) if err else ''} · {reason}"
+                    reason = (
+                        f"FAK unmatched bid={book_bid:.3f}"
+                        f"{(': ' + err) if err else ''} · {reason}"
+                    )
                 else:
                     action = "selling"
                 self.store.log_decision(
@@ -274,16 +321,48 @@ class Desk:
                 log_rows.append(_row("reject", str(exc)))
         return sold, log_rows
 
+    def _log_kalshi(self, rows: list) -> None:
+        seen: set[str] = set()
+        for row in rows:
+            cid = str(row.get("condition_id") or "")
+            key = cid or str(row.get("question") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            gap = float(row.get("gap") or 0)
+            self.store.log_decision(
+                condition_id=cid or None,
+                question=row.get("question"),
+                mid=row.get("pm"),
+                p_hat=row.get("kalshi"),
+                edge_net=gap,
+                action=f"kalshi-{row.get('action') or 'skip'}",
+                reason=(
+                    f"{row.get('ticker') or '—'} PM {float(row.get('pm') or 0):.2f} "
+                    f"Kalshi {float(row.get('kalshi') or 0):.2f} gap {gap:+.2f} "
+                    f"{row.get('why') or ''}"
+                ).strip(),
+                payload=row,
+            )
+
     def _cycle(self) -> dict:
         halt = self.risk.halted()
         self.last_error = None
         bankroll, equity, open_pos = self._refresh_portfolio()
+        from agent.kalshi import compare as kalshi_compare, fetch_open as kalshi_fetch
+        kalshi_rows: list = []
+        kalshi_log: list = []
+        try:
+            kalshi_rows = kalshi_fetch()
+        except Exception as exc:
+            log.warning("Kalshi fetch: %s", exc)
         by_open = self._market_stubs(open_pos)
         try:
-            from agent.kalshi import attach as kalshi_attach_open
-            kalshi_attach_open(list(by_open.values()))
+            _n, log1 = kalshi_compare(list(by_open.values()), kalshi_rows)
+            kalshi_log.extend(log1)
         except Exception as exc:
             log.warning("Kalshi (åpne): %s", exc)
+        self._log_kalshi(kalshi_log)
         exits, exit_log = self._run_exits(open_pos, {}, by_open)
         open_pos = self.store.positions("open")
         if halt:
@@ -295,7 +374,8 @@ class Desk:
                 "estimated": 0,
                 "accepted": 0,
                 "rejected": 0,
-                "kalshi": 0,
+                "kalshi": len(kalshi_log),
+                "kalshi_log": kalshi_log,
                 "xai_usd": 0.0,
                 "exits": exits,
                 "exit_log": exit_log,
@@ -319,11 +399,14 @@ class Desk:
 
         markets = self.scout.fetch()
         try:
-            from agent.kalshi import attach as kalshi_attach
-            kalshi_n = kalshi_attach(markets)
+            _n2, log2 = kalshi_compare(markets, kalshi_rows)
+            seen_k = {str(r.get("condition_id") or r.get("question")) for r in kalshi_log}
+            new_k = [r for r in log2 if str(r.get("condition_id") or r.get("question")) not in seen_k]
+            kalshi_log.extend(new_k)
+            self._log_kalshi(new_k)
         except Exception as exc:
             log.warning("Kalshi: %s", exc)
-            kalshi_n = 0
+        kalshi_n = len(kalshi_log)
         arb_tickets = self.arb.scan(markets, bankroll)
         arb_n = 0
         failed_events: set[str] = set()
@@ -381,6 +464,10 @@ class Desk:
             open_pos = self.store.positions("open")
 
         by_id = {m["condition_id"]: m for m in markets}
+        for cid, stub in by_open.items():
+            by_id.setdefault(cid, stub)
+            if stub.get("kalshi") and not (by_id.get(cid) or {}).get("kalshi"):
+                by_id[cid]["kalshi"] = stub["kalshi"]
         for cid, stub in self._market_stubs(open_pos).items():
             by_id.setdefault(cid, stub)
         ranked = [m for m in markets if not m.get("_open_only")]
@@ -399,11 +486,6 @@ class Desk:
 
         ranked.sort(key=_prio)
         extras = [m for m in by_id.values() if m.get("_open_only")]
-        try:
-            from agent.kalshi import attach as kalshi_attach_open
-            kalshi_attach_open(extras)
-        except Exception:
-            pass
         prepaid = self.store.xai_prepaid_usd()
         spent = self.store.api_spend(hours=None)
         remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
@@ -457,6 +539,7 @@ class Desk:
                 "exit_log": exit_log,
                 "arb": arb_n,
                 "kalshi": kalshi_n,
+                "kalshi_log": kalshi_log,
                 "bankroll": bankroll,
                 "equity": equity,
                 "xai_usd": 0.0,
@@ -528,6 +611,7 @@ class Desk:
                 "accepted": 0,
                 "arb": arb_n,
                 "kalshi": kalshi_n,
+                "kalshi_log": kalshi_log,
                 "rejected": 0,
                 "exits": exits,
                 "exit_log": exit_log,
@@ -631,6 +715,7 @@ class Desk:
             "accepted": accepted,
             "arb": arb_n,
             "kalshi": kalshi_n,
+            "kalshi_log": kalshi_log,
             "rejected": rejected,
             "exits": exits,
             "exit_log": exit_log,

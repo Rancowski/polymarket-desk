@@ -104,12 +104,17 @@ def _update_status() -> dict[str, Any]:
 
 def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
     hints = {}
+    kalshi_by = {}
     for row in (last_cycle or {}).get("exit_log") or []:
         q = (row.get("question") or "")[:80]
         hints[q] = row
         cid = row.get("condition_id")
         if cid:
             hints[f"{cid}:{row.get('side') or ''}"] = row
+    for row in (last_cycle or {}).get("kalshi_log") or []:
+        cid = row.get("condition_id")
+        if cid:
+            kalshi_by[str(cid)] = row
     out = []
     for p in open_pos:
         cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
@@ -138,6 +143,9 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
                 "last_ts": p.get("last_ts"),
                 "exit_action": hint.get("action"),
                 "exit_reason": hint.get("reason"),
+                "kalshi_ticker": (kalshi_by.get(str(cid or "")) or {}).get("ticker"),
+                "kalshi_yes": (kalshi_by.get(str(cid or "")) or {}).get("kalshi"),
+                "kalshi_gap": (kalshi_by.get(str(cid or "")) or {}).get("gap"),
             }
         )
     return out

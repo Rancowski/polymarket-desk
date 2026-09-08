@@ -188,7 +188,7 @@ class Scout:
         log.info("Scout: %s kandidater etter filter", len(out))
         return out
 
-    def book(self, token_id: str, fallback_mid: float | None = None) -> dict:
+    def book(self, token_id: str, fallback_mid: float | None = None, require_two_sided: bool = True) -> dict:
         bids: list = []
         asks: list = []
         try:
@@ -216,12 +216,20 @@ class Scout:
             best_bid, best_ask = best_ask, best_bid
         bid_sz = sum(_level_sz(x) for x in bids[:8])
         ask_sz = sum(_level_sz(x) for x in asks[:8])
-        if not best_bid or not best_ask or (best_ask - best_bid) > 0.20:
+        if require_two_sided and (not best_bid or not best_ask or (best_ask - best_bid) > 0.20):
             syn = self._synthetic(fallback_mid)
             if syn:
                 return syn
-        spread = max(0.0, best_ask - best_bid)
-        mid = (best_bid + best_ask) / 2
+        if not best_bid and not best_ask:
+            syn = self._synthetic(fallback_mid)
+            if syn:
+                return syn
+            return {}
+        spread = max(0.0, (best_ask - best_bid) if best_bid and best_ask else 0.0)
+        if best_bid and best_ask:
+            mid = (best_bid + best_ask) / 2
+        else:
+            mid = best_bid or best_ask
         return {
             "best_bid": best_bid,
             "best_ask": best_ask,

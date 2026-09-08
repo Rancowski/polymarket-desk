@@ -679,14 +679,32 @@ class Executor:
                 side = "SELL"
         tick_s, neg = _clob_meta(token)
         tick_f = float(tick_s)
-        if price < 0.10 and tick_f > 0.001:
+        dust = bool(order.get("dust") or order.get("kind") == "dust")
+        book_bid = float(order.get("best_bid") or 0)
+        if (dust or price < 0.10) and tick_f > 0.001:
             tick_s, tick_f = "0.001", 0.001
-        px0 = _quantize(min(price, 0.99), tick_f)
+        attempts: list[float] = []
+        if dust or price <= 0.012:
+            first = min(0.01, book_bid) if book_bid > 0 else 0.01
+            first = max(0.001, first)
+            attempts.append(_quantize(first, tick_f) if first >= tick_f else 0.001)
+            if abs(attempts[0] - 0.001) > 1e-9:
+                attempts.append(0.001)
+        else:
+            px0 = _quantize(min(price, 0.99), tick_f)
+            for drop in (0, 1, 2):
+                attempt = _quantize(max(tick_f, px0 - drop * tick_f), tick_f)
+                if attempt not in attempts:
+                    attempts.append(attempt)
+            if book_bid >= 0.50:
+                extra = _quantize(max(tick_f, book_bid - 0.02), tick_f)
+                if extra not in attempts:
+                    attempts.append(extra)
         last_signed: Any = None
         data: dict = {}
-        for drop in (0, 1, 2):
-            attempt = max(tick_f, round(px0 - drop * tick_f, 6))
-            attempt = _quantize(attempt, tick_f)
+        last_attempt = attempts[0] if attempts else price
+        for attempt in attempts:
+            last_attempt = attempt
             try:
                 args = OrderArgs(token_id=token, price=attempt, size=size, side=side, builder_code="")
             except TypeError:
@@ -719,4 +737,11 @@ class Executor:
                 self.store.close_position(order["condition_id"], order.get("side"))
                 return {"status": "live_sell", "response": data or signed, "ticket": payload}
         log.info("Salg umatchet etter FAK-retry — ingen fill")
-        return {"status": "resting_sell", "response": data or last_signed, "ticket": payload}
+        st = "unmatched_dust" if dust else "resting_sell"
+        return {
+            "status": st,
+            "response": data or last_signed,
+            "ticket": payload,
+            "attempt_px": last_attempt,
+            "best_bid": book_bid,
+        }
