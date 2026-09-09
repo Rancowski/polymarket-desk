@@ -269,31 +269,43 @@ class Arb:
         return out
 
     def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_halt: bool = False) -> list[Ticket]:
-        """Kalshi confirmation ≥ 4 ¢ on a mapped pair. Not locked arb."""
+        """Named Kalshi pair. Buy when Kalshi ≥ PM + 5c. Not locked arb."""
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
+        held_side = {
+            str(p.get("condition_id")): str(p.get("side") or "YES").upper()
+            for p in self.store.positions("open")
+        }
         for m in markets:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
-            if not cid or cid in open_ids or not ks:
+            if not cid or not ks or not ks.get("ticker"):
                 continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
-            gap = float(ks.get("gap") or 0)
-            if abs(gap) < 0.04:
+            pm = float(m.get("yes_mid") or m.get("mid") or 0)
+            k_yes = float(ks.get("yes") or 0)
+            gap = pm - k_yes
+            if k_yes >= pm + 0.05:
+                side = "YES"
+            elif cid not in held_side and gap >= 0.05:
+                side = "NO"
+            else:
                 continue
-            # gap = poly_yes - kalshi_yes. Poly dyr YES → kjøp NO.
-            side = "NO" if gap > 0 else "YES"
+            if cid in held_side and held_side[cid] != side:
+                continue
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")
             cost = float(book.get("best_ask") or 0)
-            if cost < 0.22 or cost > 0.82:
+            if cost < 0.20 or cost > 0.80:
                 continue
             ask_sz = float(book.get("ask_size") or 0)
             usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])
             if why:
                 continue
-            thesis = f"Kalshi-bekreftelse {ks.get('yes')} vs Poly {float(m.get('yes_mid') or 0):.2f} gap={gap:+.2f} → {side}"
+            thesis = (
+                f"Kalshi-bekreftelse {k_yes:.2f} vs Poly {pm:.2f} gap={gap:+.2f} → {side}"
+            )
             out.append(_ticket(m, side, token, book, cost, shares, thesis))
             open_ids.add(cid)
             if len(out) >= 3:

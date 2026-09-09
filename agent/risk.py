@@ -518,6 +518,9 @@ class Risk:
                 return "sports trail åpen — ingen ny sports"
         if same_player_conflicts(self.store.positions("open")):
             return "motsigelse sports — flatten først"
+        for p in self.store.positions("open"):
+            if is_tournament(p):
+                return "turnering åpen — ingen ny tennis/CS"
         return None
 
     def evaluate(
@@ -614,9 +617,21 @@ class Risk:
             held = same_side[0]
             held_cost = float(held.get("shares") or 0) * float(held.get("avg_cost") or 0)
             upnl = _row_upnl(held)
-            if held_cost <= 0 or upnl < REUP_MIN_PNL * held_cost:
+            ks = market.get("kalshi") or {}
+            k_yes = float(ks.get("yes") or 0)
+            named = bool(ks.get("ticker"))
+            kalshi_add = (
+                named
+                and side == "YES"
+                and 0.20 <= cost <= 0.80
+                and k_yes >= cost + 0.05
+            )
+            if kalshi_add:
+                reup = True
+            elif held_cost <= 0 or upnl < REUP_MIN_PNL * held_cost:
                 return None, "aldri average down"
-            reup = True
+            else:
+                reup = True
         if len(open_pos) >= settings.max_open_positions and not hedge and not reup:
             return None, "max 10 åpne (kun hedge/påfyll)"
         sports_pos = [p for p in open_pos if is_sports(p)]
@@ -719,6 +734,33 @@ class Risk:
                 pos, book, shares, 0.0, "resolved loser — close locally",
                 kind="resolved_loser", best_bid=book_bid,
             ), "ok"
+        try:
+            book_mid = float((book or {}).get("mid") or 0)
+        except (TypeError, ValueError):
+            book_mid = 0.0
+        # bid ≥ 0.98 or mid ≥ 0.99: redeem if dead book, else FAK. Never hold 0.999.
+        if live >= 0.98 or mark >= 0.99 or book_mid >= 0.99:
+            redeemable = bool(
+                pos.get("redeemable")
+                or (market or {}).get("redeemable")
+                or (market or {}).get("closed")
+                or (market or {}).get("resolved")
+            )
+            if redeemable and live < 0.02:
+                return None, "resolved — redeem"
+            if live >= 0.98:
+                return self._exit_ticket(
+                    pos, book, shares, live,
+                    f"ta {live:.3f} ≥0.98",
+                    kind="tp", best_bid=live,
+                ), "ok"
+            if live >= 0.02:
+                return self._exit_ticket(
+                    pos, book, shares, live,
+                    f"ta mid {max(mark, book_mid):.3f} ≥0.99 bud {live:.3f}",
+                    kind="tp", best_bid=live,
+                ), "ok"
+            return None, "resolved — redeem"
         dep = self.store.deposited_usd(0.0)
         base = sizing_base(dep, bankroll)
         dust_cut = dust_cutoff(base)
@@ -803,14 +845,20 @@ class Risk:
 
         ks = kalshi or {}
         k_yes = float(ks.get("yes") or 0)
+        ticker = str(ks.get("ticker") or "")
         if sports:
             k_yes = 0.0
-        if not sports and 0.02 < k_yes < 0.98:
+            ticker = ""
+        if not sports and ticker:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
-            if k_hat + 0.07 < avg and live >= 0.02:
+            pm_hat = live if live > 0 else mark
+            against_mid = k_hat <= pm_hat - 0.07
+            against_cost = k_hat + 0.07 < avg
+            crash = k_hat < 0.02 and pm_hat > 0.40
+            if live >= 0.02 and (against_mid or against_cost or crash):
                 return self._exit_ticket(
                     pos, book, shares, live,
-                    f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}",
+                    f"Kalshi {k_hat:.2f} vs PM {pm_hat:.2f} kost {avg:.2f} — selg",
                     kind="stop", best_bid=live,
                 ), "ok"
 

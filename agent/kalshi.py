@@ -26,13 +26,19 @@ def _theme(text: str) -> set[str]:
     if any(x in t for x in ("fed", "fomc", "federal reserve")):
         tags.add("fed")
         # «25» kun for 25 bps/bp — aldri fordi tittelen har 4.25 %.
-        if re.search(r"(?<![\d.])25\+?\s*(bps|bp|basis)", t):
+        if re.search(r"25\s*\+|more than 25|>\s*25|25\s*or more", t) or re.search(
+            r"(?<![\d.])50\+?\s*(bps|bp|basis)", t
+        ):
+            tags.add("25plus")
+        elif re.search(r"(?<![\d.])25\s*(bps|bp|basis)", t):
             tags.add("25")
         if re.search(r"(?<![\d.])50\+?\s*(bps|bp|basis)", t):
             tags.add("50")
         if re.search(r"\b(cut|decrease|lower|easing)\b", t) or re.search(r"\beast\b", t):
             tags.add("cut")
-        if re.search(r"\b(hike|increase|raise|hikes|increases)\b", t):
+        if re.search(r"(?<![\d.])0\s*(bps|bp)", t):
+            tags.add("hold")
+        elif re.search(r"\b(hike|increase|raise|hikes|increases)\b", t):
             tags.add("hike")
         if re.search(r"\b(unchanged|hold|pause)\b", t) or "no change" in t:
             tags.add("hold")
@@ -255,16 +261,61 @@ def fetch_open(limit: int = 400) -> list[dict]:
     return collected[:limit]
 
 
+_FED_SUFFIX_RE = re.compile(r"-(H26|H25|H0|C26|C25)(?:\b|$|-)", re.I)
+_FED_WANT_LABEL = {
+    "H25": "hike25",
+    "H26": "hike25+",
+    "H0": "hold",
+    "C25": "cut25",
+    "C26": "cut25+",
+}
+
+
+def _fed_suffix(ticker: str) -> str | None:
+    m = _FED_SUFFIX_RE.search(str(ticker or "").upper())
+    return m.group(1) if m else None
+
+
+def _fed_want(text: str) -> str | None:
+    """Map PM Fed text to Kalshi decision suffix. H26 is >25bps, not hike 25."""
+    t = (text or "").lower()
+    if not any(x in t for x in ("fed", "fomc", "federal reserve")):
+        return None
+    plus = bool(
+        re.search(r"25\s*\+|more than 25|>\s*25|25\s*or more|(?<![\d.])50\s*(bps|bp)", t)
+    )
+    has25 = bool(re.search(r"(?<![\d.])25(\s*\+)?\s*(bps|bp|basis)|(?<![\d.])25\b", t))
+    is_cut = bool(re.search(r"\b(cut|cuts|decrease|lower|easing)\b", t))
+    is_hike = bool(re.search(r"\b(hike|hikes|increase|increases|raise|raises)\b", t))
+    is_hold = (
+        "no change" in t
+        or "unchanged" in t
+        or bool(re.search(r"\b(hold|pause)\b", t))
+        or bool(re.search(r"(?<![\d.])0\s*(bps|bp)", t))
+    )
+    if is_hold and not (is_cut or (is_hike and has25 and not re.search(r"(?<![\d.])0\s*(bps|bp)", t))):
+        return "H0"
+    if is_cut:
+        return "C26" if plus else "C25"
+    if is_hike:
+        return "H26" if plus else "H25"
+    if is_hold:
+        return "H0"
+    return None
+
+
 def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
     """Comparable named contract only. Returns (row, skip_why)."""
     qtok = _tokens(_human_text(q))
     qtheme = _theme(_human_text(q))
     qmonths = _months(q)
     qyears = _years(q)
+    want = _fed_want(q)
     best = None
     best_score = 0.0
     month_conflict = False
     year_conflict = False
+    wrong_suffix: list[tuple[str, str, str]] = []
     for k in kalshi:
         n = len(qtok & k["tokens"])
         t = len(qtheme & k["theme"])
@@ -289,6 +340,14 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         if qyears and ky and not (qyears & ky):
             year_conflict = True
             continue
+        suf = _fed_suffix(ticker)
+        if want:
+            if not suf:
+                continue
+            if suf != want:
+                wrong_suffix.append((suf, ticker, title))
+                continue
+            score += 20
         if qmonths and km and (qmonths & km):
             score += 8
         if qyears and ky and (qyears & ky):
@@ -297,6 +356,17 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
             best_score = score
             best = k
     if not best:
+        if want and wrong_suffix:
+            suf, tick, title = wrong_suffix[0]
+            label = _FED_WANT_LABEL.get(want, want)
+            why = f"wrong ticker {suf} ≠ {label}"
+            log.info("kalshi-skip %s | %s | %s", tick, title[:70], why)
+            return {
+                "title": title[:90],
+                "ticker": tick,
+                "yes": 0.0,
+                "_skip": True,
+            }, why
         if year_conflict and not month_conflict:
             return None, "ulikt år"
         if month_conflict:
@@ -311,7 +381,10 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
     if qmonths and km and not (qmonths & km):
         return None, "ulik måned"
     qth, kth = qtheme, best["theme"]
-    if ("25" in qth) != ("25" in kth):
+    if want:
+        best = {**best, "overlap": int(best_score), "fed_suffix": want}
+        return best, ""
+    if ("25" in qth) != ("25" in kth) or ("25plus" in qth) != ("25plus" in kth):
         return None, "25 bps mismatch"
     if ("50" in qth) != ("50" in kth):
         return None, "50 bps mismatch"
@@ -358,8 +431,24 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
             blob = f"{q} {slug}"
         best, why = _pick(blob, kalshi)
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
+        if best and best.get("_skip"):
+            if want:
+                logs.append(
+                    {
+                        "condition_id": m.get("condition_id"),
+                        "question": q[:90],
+                        "ticker": best.get("ticker") or "",
+                        "title": best.get("title") or "",
+                        "pm": round(poly, 3),
+                        "kalshi": None,
+                        "gap": None,
+                        "action": "skip",
+                        "why": why,
+                    }
+                )
+            continue
         k_yes = float(best["yes"]) if best else 0.0
-        if not best or k_yes <= 0:
+        if not best:
             if want:
                 logs.append(
                     {
@@ -370,7 +459,7 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                         "kalshi": None,
                         "gap": None,
                         "action": "skip",
-                        "why": why if not best else "kalshi_yes=0",
+                        "why": why,
                     }
                 )
             continue
@@ -384,21 +473,22 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
         }
         m["kalshi"] = payload
         hits += 1
-        action, reason = "skip", f"gap {gap:+.2f} < 4c"
+        action, reason = "skip", f"PM {poly:.2f} Kalshi {k_yes:.2f} gap {gap:+.2f}"
         side = str(m.get("side") or "").upper()
         avg = float(m.get("avg_cost") or 0)
-        k_yes = float(best["yes"])
-        if 0.02 < k_yes < 0.98 and avg > 0 and side in {"YES", "NO"}:
-            k_hat = k_yes if side == "YES" else 1.0 - k_yes
-            if k_hat + 0.07 < avg:
-                action, reason = "sell", f"Kalshi {k_hat:.2f} ≥7c mot kost {avg:.2f}"
+        k_hat = k_yes if side != "NO" else 1.0 - k_yes
+        pm_hat = poly if side != "NO" else (1.0 - poly if poly else 0.0)
+        if avg > 0 and side in {"YES", "NO"}:
+            if k_hat <= pm_hat - 0.07 or k_hat + 0.07 < avg or (k_hat < 0.02 and pm_hat > 0.40):
+                action, reason = "sell", f"Kalshi {k_hat:.2f} vs PM {pm_hat:.2f} gap {gap:+.2f}"
+            elif k_hat >= pm_hat + 0.05:
+                action, reason = "buy", f"Kalshi {k_hat:.2f} ≥ PM {pm_hat:.2f}+5c"
             elif abs(gap) >= 0.04:
                 action, reason = "skip", "allerede inne"
-            else:
-                action, reason = "skip", f"gap {gap:+.2f} < 4c"
-        elif abs(gap) >= 0.04:
-            cheap = "NO" if gap > 0 else "YES"
-            action, reason = "buy", f"bekreftelse {cheap} gap {gap:+.2f}"
+        elif k_yes >= poly + 0.05:
+            action, reason = "buy", f"bekreftelse YES gap {gap:+.2f}"
+        elif gap >= 0.05:
+            action, reason = "buy", f"bekreftelse NO gap {gap:+.2f}"
         logs.append(
             {
                 "condition_id": m.get("condition_id"),
