@@ -72,7 +72,7 @@ class Settings:
     min_book_multiple: float = _f("MIN_BOOK_MULTIPLE", 3)
     max_spread: float = _f("MAX_SPREAD", 0.08)
     loop_seconds: int = _i("CYCLE_SECONDS", 0) or _i("LOOP_SECONDS", 300)
-    estimate_batch: int = _i("ESTIMATE_BATCH", 12)
+    estimate_batch: int = _i("ESTIMATE_BATCH", 15)
     live_search: bool = _b("LIVE_SEARCH", False)
     paper_bankroll_usd: float = _f("PAPER_BANKROLL_USD", 1000)
     dashboard_port: int = _i("DASHBOARD_PORT", 8788)
@@ -108,6 +108,7 @@ FEE_RATE = {
 SKIP_QUESTION_PATTERNS = (
     "up or down",
     "up/down",
+    "up-or-down",
     "15m",
     "15 min",
     "5m",
@@ -116,4 +117,8 @@ SKIP_QUESTION_PATTERNS = (
     "15-minute",
     "next 15",
     "next 5 minute",
+    "next 5 min",
+    "1-hour",
+    "1 hour",
+    "hourly",
 )

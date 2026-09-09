@@ -533,9 +533,12 @@ class Risk:
             log.info("no_end — hopper nær-res, andre filter %s", (market.get("question") or "")[:60])
         if is_sports(market) and (mid >= 0.88 or mid <= 0.12):
             return None, "sports nær avgjort"
-        disagreement = abs(p_yes - mid)
-        if conf == "low" and disagreement < (0.04 if probe else 0.05):
-            return None, "confidence=low uten stor uenighet"
+        ks_pair = market.get("kalshi") or {}
+        clean_kalshi = bool(ks_pair.get("ticker")) and 0 < float(ks_pair.get("yes") or 0) < 1
+        if not clean_kalshi and conf == "low":
+            return None, "confidence=low"
+        if mid >= 0.90 and not clean_kalshi:
+            return None, "mid≥0.90 uten Kalshi-par"
         spread = float(book.get("spread") or 0)
         if book.get("synthetic"):
             return None, "syntetisk bok"
@@ -575,6 +578,14 @@ class Risk:
         need = settings.min_net_edge if min_edge is None else min_edge
         if is_sports(market):
             need = max(need, 0.022)
+        if not clean_kalshi:
+            yask = float(book.get("best_ask") or cost)
+            nb = market.get("no_book") or {}
+            nask = float(nb.get("best_ask") or 0)
+            if nask <= 0:
+                nask = max(0.01, 1.0 - float(book.get("best_bid") or mid))
+            if yask + nask >= 0.985:
+                return None, f"YES+NO ask {yask + nask:.3f} ≥ 0.985"
         if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
         sports = is_sports(market) or is_tournament(market)
@@ -713,29 +724,33 @@ class Risk:
             book_mid = float((book or {}).get("mid") or 0)
         except (TypeError, ValueError):
             book_mid = 0.0
-        # bid ≥ 0.98 or mid ≥ 0.99: redeem if dead book, else FAK. Never hold 0.999.
-        if live >= 0.98 or mark >= 0.99 or book_mid >= 0.99:
+        hwm_key = f"hwm:{cid}:{side}"
+        try:
+            hwm = float(self.store.get_meta(hwm_key) or 0)
+        except (TypeError, ValueError):
+            hwm = 0.0
+        if live > hwm:
+            hwm = live
+            self.store.set_meta(hwm_key, f"{hwm:.4f}")
+        peak = max(live, mark, book_mid, hwm)
+        # Peak ≥ 0.98: redeem or FAK at bid ≥ 0.98. Never dump 0.999 → 0.40.
+        if peak >= 0.98 or mark >= 0.99:
             redeemable = bool(
                 pos.get("redeemable")
                 or (market or {}).get("redeemable")
                 or (market or {}).get("closed")
                 or (market or {}).get("resolved")
             )
-            if redeemable and live < 0.02:
-                return None, "resolved — redeem"
+            if redeemable or (mark >= 0.99 and live <= 0.02) or (book_mid >= 0.99 and live <= 0.02):
+                if live < 0.98:
+                    return None, "resolved — redeem"
             if live >= 0.98:
                 return self._exit_ticket(
                     pos, book, shares, live,
                     f"ta {live:.3f} ≥0.98",
                     kind="tp", best_bid=live,
                 ), "ok"
-            if live >= 0.02:
-                return self._exit_ticket(
-                    pos, book, shares, live,
-                    f"ta mid {max(mark, book_mid):.3f} ≥0.99 bud {live:.3f}",
-                    kind="tp", best_bid=live,
-                ), "ok"
-            return None, "resolved — redeem"
+            return None, f"hold peak {peak:.3f} — ikke dump bid {live:.3f}"
         dep = self.store.deposited_usd(0.0)
         base = sizing_base(dep, bankroll)
         dust_cut = dust_cutoff(base)
@@ -751,6 +766,8 @@ class Risk:
                 best_bid=book_bid,
             ), "ok"
         if force_reason:
+            if peak >= 0.98:
+                return None, f"hold peak {peak:.3f} — ikke trim-dump ({force_reason})"
             if book_bid < 0.02:
                 return None, f"hold trim — ingen live bud ({force_reason})"
             return self._exit_ticket(
@@ -765,14 +782,6 @@ class Risk:
         pnl_pct = (live - avg) / avg if avg and live > 0 else 0.0
         mid = float((book or {}).get("mid") or live or mark)
 
-        hwm_key = f"hwm:{cid}:{side}"
-        try:
-            hwm = float(self.store.get_meta(hwm_key) or 0)
-        except (TypeError, ValueError):
-            hwm = 0.0
-        if live > hwm:
-            hwm = live
-            self.store.set_meta(hwm_key, f"{hwm:.4f}")
         trail_px = hwm * 0.92 if hwm > 0 else 0.0
         armed = hwm > 0 and avg > 0 and (hwm >= avg * 1.18 or pnl_pct >= 0.18)
         if sports and live >= 0.02 and armed and live <= trail_px:

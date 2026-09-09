@@ -109,7 +109,7 @@ def _event_key(raw: dict) -> str:
 class Scout:
     """Henter likvide, handelbare markeder. Ingen LLM her."""
 
-    def fetch(self, limit: int = 80) -> list[dict]:
+    def fetch(self, limit: int = 150) -> list[dict]:
         params = {
             "closed": "false",
             "limit": limit,
@@ -142,6 +142,11 @@ class Scout:
                 continue
             yes_px = _num(prices[0] if prices else 0)
             no_px = _num(prices[1] if len(prices) > 1 else max(0.0, 1 - yes_px))
+            if yes_px <= 0:
+                continue
+            hours_left = _hours_left(raw.get("endDate") or raw.get("endDateIso"))
+            if hours_left is not None and hours_left < 0:
+                continue
             mid = yes_px if 0 < yes_px < 1 else 0.5
             item = {
                 "condition_id": raw.get("conditionId") or raw.get("condition_id"),
@@ -163,7 +168,7 @@ class Scout:
                 "no_mid": no_px,
                 "mid": mid,
                 "complement": round(yes_px + no_px, 4) if yes_px and no_px else None,
-                "hours_left": _hours_left(raw.get("endDate") or raw.get("endDateIso")),
+                "hours_left": hours_left,
                 "url": f"https://polymarket.com/market/{raw.get('slug')}",
             }
             if is_sports(item):

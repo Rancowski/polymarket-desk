@@ -31,6 +31,28 @@ LOCKED_NO = 0.12
 _parse_end = parse_end
 
 
+def _finishing(m: dict) -> bool:
+    """Don't farm in-play/collapsed books. mid≥0.90 only with a clean Kalshi pair."""
+    try:
+        mid = float(m.get("yes_mid") or m.get("mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    if mid <= 0:
+        return True
+    hours = m.get("hours_left")
+    try:
+        h = float(hours) if hours is not None and hours != "" else None
+    except (TypeError, ValueError):
+        h = None
+    if is_sports(m) and h is not None and h < 6:
+        return True
+    if mid >= 0.90:
+        ks = m.get("kalshi") or {}
+        if not (ks.get("ticker") and 0 < float(ks.get("yes") or 0) < 1):
+            return True
+    return False
+
+
 def _ticket(market: dict, side: str, token: str, book: dict, cost: float, shares: float, thesis: str) -> Ticket:
     mid = float(book.get("mid") or cost)
     return Ticket(
@@ -156,6 +178,8 @@ class Arb:
                 break
             if self._skip_sports(m, sports_n, sports_halt, out, need=2):
                 continue
+            if _finishing(m):
+                continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
             if yes_m <= 0.02 or no_m <= 0.02:
@@ -237,6 +261,8 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
+            if _finishing(m):
+                continue
             if is_sports(m):
                 continue
             end = _parse_end(m.get("end_date"))
@@ -283,9 +309,13 @@ class Arb:
                 continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
+            if _finishing(m):
+                continue
             pm = float(m.get("yes_mid") or m.get("mid") or 0)
             k_yes = float(ks.get("yes") or 0)
             gap = pm - k_yes
+            if abs(gap) < 0.05:
+                continue
             if k_yes >= pm + 0.05:
                 side = "YES"
             elif cid not in held_side and gap >= 0.05:
@@ -297,7 +327,7 @@ class Arb:
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")
             cost = float(book.get("best_ask") or 0)
-            if cost < 0.20 or cost > 0.80:
+            if cost < 0.18 or cost > 0.82:
                 continue
             ask_sz = float(book.get("ask_size") or 0)
             usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])

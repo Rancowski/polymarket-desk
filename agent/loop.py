@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from agent.arb import Arb
 from agent.brain import Brain
-from agent.config import settings
+from agent.config import SKIP_QUESTION_PATTERNS, settings
 from agent.executor import Executor
 from agent.risk import (
     MAX_SPORTS,
@@ -23,6 +23,32 @@ from agent.scanner import Scout
 from agent.store import Store
 
 log = logging.getLogger("desk")
+GROK_BATCH_N = 15
+
+
+def _grok_eligible(m: dict) -> bool:
+    """Top-volume names only. No in-play, no collapsed mids, no 5/15-min crypto."""
+    if m.get("_open_only"):
+        return False
+    q = (m.get("question") or "").lower()
+    if any(p in q for p in SKIP_QUESTION_PATTERNS):
+        return False
+    try:
+        mid = float(m.get("yes_mid") or m.get("mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    if mid <= 0.10 or mid >= 0.90:
+        return False
+    hours = m.get("hours_left")
+    try:
+        h = float(hours) if hours is not None and hours != "" else None
+    except (TypeError, ValueError):
+        h = None
+    if h is not None and h < 6:
+        return False
+    if is_sports(m) and h is not None and h < 12:
+        return False
+    return True
 
 
 class Desk:
@@ -632,7 +658,7 @@ class Desk:
             return {"ok": True, "halted": True}
 
         self._cycle_i += 1
-        run_grok = self._cycle_i % 2 == 1
+        run_grok = True
         log.info(
             "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s grok=%s n=%s",
             settings.dry_run,
@@ -716,16 +742,8 @@ class Desk:
                 by_id[cid]["kalshi"] = stub["kalshi"]
         for cid, stub in self._market_stubs(open_pos).items():
             by_id.setdefault(cid, stub)
-        ranked = [m for m in markets if not m.get("_open_only")]
-
-        def _prio(m: dict) -> tuple:
-            ks = m.get("kalshi") or {}
-            gap = abs(float(ks.get("gap") or 0))
-            vol = float(m.get("volume_24h") or m.get("liquidity") or 0)
-            return (-vol, -gap)
-
-        ranked.sort(key=_prio)
-        extras = [m for m in by_id.values() if m.get("_open_only")]
+        ranked = [m for m in markets if _grok_eligible(m)]
+        ranked.sort(key=lambda m: -float(m.get("volume_24h") or m.get("liquidity") or 0))
         prepaid = self.store.xai_prepaid_usd()
         spent = self.store.api_spend(hours=None)
         remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
@@ -739,14 +757,12 @@ class Desk:
             seen.add(cid)
             batch.append(m)
 
-        for m in extras:
-            _take(m)
         if remaining >= 0.15:
             for m in ranked:
                 _take(m)
-                if len(batch) >= max(settings.estimate_batch, len(extras)):
+                if len(batch) >= GROK_BATCH_N:
                     break
-        batch = batch[: max(settings.estimate_batch, len(extras))]
+        batch = batch[:GROK_BATCH_N]
         if not batch:
             log.info("Ingen markeder passerte filter")
             self.last_cycle = {
@@ -754,6 +770,7 @@ class Desk:
                 "halted": False,
                 "scanned": len(markets),
                 "estimated": 0,
+                "grok": 0,
                 "accepted": 0,
                 "rejected": 0,
                 "exits": exits,
@@ -787,13 +804,12 @@ class Desk:
 
         xai_cycle = 0.0
         try:
-            if remaining < 0.05 and extras:
-                batch = extras
-            if not run_grok:
+            if remaining < 0.02:
                 estimates = {}
-                log.info("Hopper Grok (syklus %s, annenhver)", self._cycle_i)
+                log.info("Hopper Grok — xAI-budsjett tomt")
             else:
-                estimates = self.brain.estimate(batch) if (remaining >= 0.02 or extras) else {}
+                estimates = self.brain.estimate(batch) if batch else {}
+                log.info("Grok-batch %s navn (syklus %s)", len(batch), self._cycle_i)
             usage = getattr(self.brain, "last_usage", {}) or {}
             xai_cycle = float(usage.get("usd") or 0)
             if xai_cycle:
@@ -853,8 +869,6 @@ class Desk:
 
         accepted = 0
         rejected = 0
-        if not run_grok:
-            batch = []
         for m in batch:
             if m.get("_open_only"):
                 continue
@@ -931,8 +945,8 @@ class Desk:
             "ts": datetime.now(timezone.utc).isoformat(),
             "halted": False,
             "scanned": len(markets),
-            "estimated": 0 if not run_grok else len(estimates),
-            "grok": 0 if not run_grok else len(estimates),
+            "estimated": len(estimates),
+            "grok": len(estimates),
             "accepted": accepted,
             "arb": arb_n,
             "kalshi": kalshi_n,
