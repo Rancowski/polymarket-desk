@@ -465,7 +465,7 @@ def resolved_state(pos: dict, book: dict | None = None, market: dict | None = No
         bid = 0.0
     redeemable = bool(pos.get("redeemable") or market.get("redeemable"))
     closed = bool(market.get("closed") or market.get("resolved") or pos.get("closed"))
-    if redeemable or (mid >= 0.99 and bid <= 0.01) or (closed and mid >= 0.90):
+    if redeemable or (mid >= 0.99 and bid <= 0.02) or (closed and mid >= 0.90):
         if mid <= 0.05 and not redeemable:
             return "loser"
         return "winner"
@@ -500,27 +500,8 @@ class Risk:
         return self.halted()
 
     def sports_blocked(self, equity: float, deposited: float, cash: float | None = None) -> str | None:
-        if deposited >= 1 and equity > 0 and equity <= EQUITY_SPORTS_HALT * deposited:
-            return "equity ≤70% — ingen ny sports"
-        if cash is not None and deposited >= 1 and cash < CASH_SPORTS_MIN * deposited:
-            return "cash <15% — redeem først"
-        for p in self.store.positions("open"):
-            if not is_sports(p):
-                continue
-            cid = p.get("condition_id")
-            side = str(p.get("side") or "YES").upper()
-            try:
-                hwm = float(self.store.get_meta(f"hwm:{cid}:{side}") or 0)
-            except (TypeError, ValueError):
-                hwm = 0.0
-            avg = float(p.get("avg_cost") or 0)
-            if hwm > 0 and avg > 0 and hwm >= avg * 1.22:
-                return "sports trail åpen — ingen ny sports"
-        if same_player_conflicts(self.store.positions("open")):
-            return "motsigelse sports — flatten først"
-        for p in self.store.positions("open"):
-            if is_tournament(p):
-                return "turnering åpen — ingen ny tennis/CS"
+        """No category buy-bans. Seat caps live in evaluate()."""
+        _ = (equity, deposited, cash)
         return None
 
     def evaluate(
@@ -598,14 +579,8 @@ class Risk:
             return None, f"edge_net {edge_net:.3f} < {need}"
         sports = is_sports(market) or is_tournament(market)
         open_pos = self.store.positions("open")
-        clash = ticket_player_conflict(market, side, open_pos) if sports else None
-        if clash:
-            return None, clash
         if sports and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
             return None, "sports ekstrem-pris"
-        sport_halt = self.sports_blocked(equity, deposited, cash=bankroll)
-        if sports and sport_halt:
-            return None, sport_halt
         event = market.get("event_key") or market["condition_id"]
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
         same_side = [p for p in same_cid if str(p.get("side") or "").upper() == side]
@@ -799,26 +774,27 @@ class Risk:
             hwm = live
             self.store.set_meta(hwm_key, f"{hwm:.4f}")
         trail_px = hwm * 0.92 if hwm > 0 else 0.0
-        if sports and live >= 0.02 and hwm > 0 and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and live <= trail_px:
+        armed = hwm > 0 and avg > 0 and (hwm >= avg * 1.18 or pnl_pct >= 0.18)
+        if sports and live >= 0.02 and armed and live <= trail_px:
             return self._exit_ticket(
                 pos, book, shares, live,
                 f"sports trail −8% fra topp {hwm:.3f} (≤{trail_px:.3f}) bud {live:.3f}",
                 kind="tp", best_bid=live,
             ), "ok"
 
-        if sports and live >= 0.02 and (live <= avg * 0.85 or pnl_pct <= -0.15):
+        if sports and live > 0 and (live <= avg * 0.85 or live <= 0.03):
             return self._exit_ticket(
                 pos, book, shares, live, f"sports stopp-tap {pnl_pct:.1%} bid {live:.3f}",
                 kind="stop", best_bid=live,
             ), "ok"
-        if sports and live < 0.02:
+        if sports and live <= 0:
             return None, f"hold tom/resolved bok bid {live:.4f} — ikke FAK"
-        if not sports and live >= 0.02 and pnl_pct <= -0.22:
+        if not sports and live >= 0.02 and pnl_pct <= -0.18:
             return self._exit_ticket(
                 pos, book, shares, live, f"stopp-tap {pnl_pct:.1%} bid {live:.3f}",
                 kind="stop", best_bid=live,
             ), "ok"
-        if not sports and (live >= 0.90 or (live >= 0.02 and pnl_pct >= 0.28)):
+        if not sports and live >= 0.02 and (live >= 0.92 or pnl_pct >= 0.22):
             return self._exit_ticket(
                 pos, book, shares, live, f"ta gevinst {pnl_pct:.1%} bid {live:.3f}",
                 kind="tp", best_bid=live,

@@ -250,14 +250,14 @@
       if (tab === "rules") {
         el.innerHTML = [
           ["Syklus", "Hvert 5. minutt. Redeem først, deretter exits + Kalshi + tape. Grok annenhver runde. FAK kun på live bok. Ingen X/web."],
-          ["Redeem", "Resolverte vinnere (closed / mid≥0,99 og bud≤0,01 / data-api redeemable) innløses on-chain via proxy/relayer (CTF eller NegRisk-adapter) til pUSD. Tapere til 0 lukkes lokalt. Aldri FAK @ 0,001 på resolvert bok. Aldri closed_dust på mid≈1. redeem_ok/redeem_err én gang per condition_id, 30 min cooldown ved feil."],
-          ["Kjøp", "På ask med dybde, hvis én er sann: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen (ikke død sports-bok). 3) Kalshi-par gap ≥ 4 ¢ og PM-ask 0,22–0,82. 4) Grok-kant ≥ MIN_NET_EDGE på et likvid navn. Nær resolusjon kun hvis ≤72 t til slutt og mid ≥0,90/≤0,10, eller mid ≥0,94 med ekte bok. Mangler slutt-dato → ikke nær-res."],
+          ["Redeem", "Hver syklus først: closed / data-api redeemable / (mid≥0,99 og bud≤0,02) → CTF/NegRisk redeem til pUSD. Tapere til 0 lukkes lokalt. Bud ≥ 0,98 på live bok → FAK @ bud (0,99/0,98). Aldri FAK 0,001 på resolvert bok. Aldri hold 0,999. redeem_ok/redeem_err én gang per condition_id, 30 min cooldown."],
+          ["Kjøp", "Sports, CS, tennis, Fed, crypto er lov. På ask med dybde: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen. 3) Kalshi-par er egen spor (ingen par = vekt 0, blokkerer ikke kjøp). 4) Grok-kant ≥ MIN_NET_EDGE. Ingen X/web."],
           ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Samme kamp/event_key maks 25 % av innskutt samlet. Inntil 75 % av innskutt i markedet."],
           ["Størrelse", "Alt i prosent av innskutt (ellers egenkapital). Gulv 5 %. Sports/turnering/longshot 6–8 %, også mid < 0,40. Kjerne 10–14 %. Hard tak 18 % ett navn. Maks 50 % av ask-dybde og 90 % av kontant. Tynn bok (dybde < 5 %) hoppes. Påfyll kun kjerne ≥ +10 %, aldri average down, aldri rød sports. Aldri stub under 5 %."],
-          ["Sports", "Maks 4. Én tese per spiller. Ingen ny tennis/CS mens en Open/turnering er åpen. Stopp/TP kun bud ≥ 0,02. Trail 8 % under HWM. Bud ≥ 0,98 eller mid ≥ 0,99 → redeem eller FAK @ 0,99/0,98. Aldri hold 0,999. Aldri Fed."],
-          ["Kjerne-exits", "Stopp −22 % og TP på live bud ≥ 0,02 (TP også bud ≥ 0,90). Kalshi ≤ PM − 7 ¢ eller Kalshi < 0,02 mens PM > 0,40 → selg. Kalshi ≥ 7 ¢ mot kost → selg. Hedge holdes."],
-          ["Kalshi", "Navngitt par: KXFEDDECISION-26SEP-H25 = hike 25, H26 = >25bps, H0 = no change, C25 = cut 25. Feil suffix → kalshi-skip wrong ticker, ikke 51c-hold. Logg begge mids. Kalshi ≥ PM + 5 ¢ og ask 0,20–0,80 → kjøp kjerne 10–14 %. Ingen Kalshi på sports."],
-          ["Sikring", "Ingen daglig handelsstopp. Ingen 85 %-halt. Eneste porteføljebrems: egenkapital ≤ 70 % av innskutt → ingen NY sports. Kjerne-kjøp og alle exits kjører."],
+          ["Sports-exits", "Kun live bud. Stopp: bud ≤ avg×0,85 eller bud ≤ 0,03. Ta: +18 % vs avg, deretter trail 8 % under HWM (0,72 → selg ≤ 0,662). FAK på bud, retry −1/−2 tick. Umachet to ganger → reject+bid. Død bok mark ≤ 0,01 eller verdi < 0,1 % av innskutt → closed_dust (ikke Fed)."],
+          ["Kjerne-exits", "Stopp −18 % vs avg. Ta bud ≥ 0,92 eller +22 % vs avg. Rent Kalshi-par og Kalshi ≤ PM − 7 ¢ vs kost → selg nå (Grok overstyrer ikke). FAK på live bud + 2 retry."],
+          ["Kalshi", "Egen spor. Navngitt par: H25 = hike 25, H26 = >25bps, H0 = no change. Ingen par = vekt 0, blokkerer ikke kjøp. Logg begge mids. Kalshi ≥ PM + 5 ¢ og ask 0,20–0,80 kan bekrefte kjerne-kjøp."],
+          ["Sikring", "Ingen daglig handelsstopp. Ingen 85 %-halt. Ingen sports-kjøpsstopp. HALT-fil stopper alt. Exits og redeem kjører hver syklus før Grok."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;
       }
