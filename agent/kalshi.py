@@ -30,11 +30,11 @@ def _theme(text: str) -> set[str]:
             tags.add("25")
         if re.search(r"(?<![\d.])50\+?\s*(bps|bp|basis)", t):
             tags.add("50")
-        if any(x in t for x in ("cut", "decrease", "lower", "ease")):
+        if re.search(r"\b(cut|decrease|lower|easing)\b", t) or re.search(r"\beast\b", t):
             tags.add("cut")
-        if any(x in t for x in ("hike", "increase", "raise")):
+        if re.search(r"\b(hike|increase|raise|hikes|increases)\b", t):
             tags.add("hike")
-        if any(x in t for x in ("no change", "unchanged", "hold", "pause")):
+        if re.search(r"\b(unchanged|hold|pause)\b", t) or "no change" in t:
             tags.add("hold")
         if re.search(r"above\s+\d", t) or "funds rate" in t or "fed funds" in t:
             tags.add("funds")
@@ -75,9 +75,36 @@ _NUM_MONTH = {
 }
 
 
+def _human_text(text: str) -> str:
+    """Strip 0x condition ids / long hex so 2025 inside a cid is not a year."""
+    t = text or ""
+    t = re.sub(r"0x[0-9a-fA-F]{8,}", " ", t)
+    t = re.sub(r"\b[0-9a-fA-F]{32,}\b", " ", t)
+    return t
+
+
+def _years(text: str) -> set[int]:
+    """20xx from titles, and YY before a month in tickers (26SEP → 2026). Not 25 bps."""
+    t = _human_text(text)
+    found: set[int] = set()
+    for y in re.findall(r"20\d{2}", t):
+        yi = int(y)
+        if 2020 <= yi <= 2035:
+            found.add(yi)
+    low = t.lower()
+    for yy, _mon in re.findall(
+        r"(?<![0-9])([12][0-9])(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)",
+        low,
+    ):
+        yi = 2000 + int(yy)
+        if 2020 <= yi <= 2035:
+            found.add(yi)
+    return found
+
+
 def _months(text: str) -> set[str]:
     """Full names, ticker codes (26SEP, SEP17), and 2026-09. sep ≡ september."""
-    t = (text or "").lower()
+    t = _human_text(text).lower()
     found: set[str] = set()
     for full in (
         "january", "february", "march", "april", "may", "june",
@@ -162,13 +189,17 @@ def _rows_to_out(rows: list) -> list[dict]:
         px = _yes_px(row)
         if not title or not px:
             continue
+        ticker = str(row.get("ticker") or "")
+        blob = f"{title} {ticker}"
         out.append(
             {
                 "title": title,
-                "ticker": row.get("ticker"),
+                "ticker": ticker,
                 "yes": px,
                 "tokens": _tokens(title),
                 "theme": _theme(title),
+                "years": _years(blob),
+                "months": _months(blob),
             }
         )
     return out
@@ -215,12 +246,14 @@ def fetch_open(limit: int = 200) -> list[dict]:
 
 def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
     """Comparable named contract only. Returns (row, skip_why)."""
-    qtok = _tokens(q)
-    qtheme = _theme(q)
+    qtok = _tokens(_human_text(q))
+    qtheme = _theme(_human_text(q))
     qmonths = _months(q)
+    qyears = _years(q)
     best = None
     best_score = 0.0
     month_conflict = False
+    year_conflict = False
     for k in kalshi:
         n = len(qtok & k["tokens"])
         t = len(qtheme & k["theme"])
@@ -234,24 +267,31 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         tok_need = 3 if distinctive else 4
         if not theme_ok and n < tok_need:
             continue
-        km = _months(f"{k.get('title') or ''} {k.get('ticker') or ''}")
+        km = k.get("months") or _months(f"{k.get('title') or ''} {k.get('ticker') or ''}")
+        ky = k.get("years") or _years(f"{k.get('title') or ''} {k.get('ticker') or ''}")
         if qmonths and km and not (qmonths & km):
             month_conflict = True
             continue
+        if qyears and ky and not (qyears & ky):
+            year_conflict = True
+            continue
         if qmonths and km and (qmonths & km):
+            score += 4
+        if qyears and ky and (qyears & ky):
             score += 4
         if score > best_score:
             best_score = score
             best = k
     if not best:
+        if year_conflict and not month_conflict:
+            return None, "ulikt år"
         if month_conflict:
             return None, "ulik måned"
         return None, "ingen sammenlignbar kontrakt"
-    years = set(re.findall(r"20\d{2}", q))
-    kyears = set(re.findall(r"20\d{2}", best["title"]))
-    if years and kyears and not (years & kyears):
+    kyears = best.get("years") or _years(f"{best.get('title') or ''} {best.get('ticker') or ''}")
+    if qyears and kyears and not (qyears & kyears):
         return None, "ulikt år"
-    km = _months(f"{best.get('title') or ''} {best.get('ticker') or ''}")
+    km = best.get("months") or _months(f"{best.get('title') or ''} {best.get('ticker') or ''}")
     if qmonths and km and not (qmonths & km):
         return None, "ulik måned"
     qth, kth = qtheme, best["theme"]
@@ -296,7 +336,11 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
         if is_sports(m):
             continue
         want = _named_target(m)
-        best, why = _pick(f"{q} {m.get('event_key') or ''}", kalshi)
+        slug = str(m.get("event_key") or "")
+        blob = q
+        if slug and not slug.startswith("0x") and len(slug) < 96 and " " not in slug[:2]:
+            blob = f"{q} {slug}"
+        best, why = _pick(blob, kalshi)
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
         k_yes = float(best["yes"]) if best else 0.0
         if not best or k_yes <= 0:

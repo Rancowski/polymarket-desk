@@ -154,11 +154,20 @@ class Store:
         making = str(merged.get("makingAmount") if merged.get("makingAmount") is not None else "").strip()
         empty = {"", "0", "0.0", "none", "null"}
         if merged.get("closed_dust"):
+            return False
+        if merged.get("redeem"):
             return True
         if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"} and taking.lower() in empty and making.lower() in empty:
             return False
         if status in {"matched", "filled"}:
-            return True
+            try:
+                if float(taking or 0) > 0 or float(making or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+            if merged.get("redeem"):
+                return True
+            return False
         try:
             if float(taking) > 0 or float(making) > 0:
                 return True

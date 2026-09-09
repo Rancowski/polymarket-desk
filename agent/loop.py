@@ -273,6 +273,9 @@ class Desk:
 
         ready: list[dict] = []
         for cid, rows in winners.items():
+            if self.store.get_meta(f"redeem_ok:{cid}", ""):
+                self.store.close_position(cid)
+                continue
             if self._redeem_cooldown(cid):
                 why = "redeem_err cooldown 30m"
                 if cid not in logged:
@@ -485,20 +488,6 @@ class Desk:
                     )
                 ):
                     px = result.get("attempt_px")
-                    self.store.add_fill(
-                        condition_id=cid,
-                        side=f"SELL_{side}",
-                        price=mark or 0.001,
-                        size=pos.get("shares"),
-                        cost=round((mark or 0.001) * float(pos.get("shares") or 0), 4),
-                        dry_run=settings.dry_run,
-                        raw={
-                            "closed_dust": True,
-                            "takingAmount": str(pos.get("shares") or 0),
-                            "status": "matched",
-                            **(result if isinstance(result, dict) else {}),
-                        },
-                    )
                     self.store.close_dust(str(cid or ""), str(side or "YES"))
                     action = "closed_dust"
                     sold += 1
@@ -509,8 +498,10 @@ class Desk:
                     resp = result.get("response") or {}
                     if isinstance(resp, dict):
                         err = str(resp.get("error") or resp.get("errorMsg") or resp.get("msg") or "")
+                    attempt_px = result.get("attempt_px")
                     reason = (
                         f"FAK unmatched bid={book_bid:.3f}"
+                        f"{(' try@' + str(attempt_px)) if attempt_px not in (None, '') else ''}"
                         f"{(': ' + err) if err else ''} · {reason}"
                     )
                 else:

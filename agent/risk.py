@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -399,6 +400,18 @@ class Risk:
             return "equity ≤70% — ingen ny sports"
         if cash is not None and deposited >= 1 and cash < CASH_SPORTS_MIN * deposited:
             return "cash <15% — redeem først"
+        for p in self.store.positions("open"):
+            if not is_sports(p):
+                continue
+            cid = p.get("condition_id")
+            side = str(p.get("side") or "YES").upper()
+            try:
+                hwm = float(self.store.get_meta(f"hwm:{cid}:{side}") or 0)
+            except (TypeError, ValueError):
+                hwm = 0.0
+            avg = float(p.get("avg_cost") or 0)
+            if hwm > 0 and avg > 0 and hwm >= avg * 1.22:
+                return "sports trail åpen — ingen ny sports"
         return None
 
     def evaluate(
@@ -585,9 +598,9 @@ class Risk:
                 book_bid = float(book.get("best_bid") or 0)
             except (TypeError, ValueError):
                 book_bid = 0.0
-        bid = _live_bid(book, pos)
+        live = book_bid
         missing = book_bid <= 0
-        mark = bid
+        mark = live if live > 0 else _live_bid(book, pos)
         value = shares * mark
         state = resolved_state(pos, book, market)
         if state == "winner":
@@ -600,8 +613,10 @@ class Risk:
         dep = self.store.deposited_usd(0.0)
         base = sizing_base(dep, bankroll)
         dust_cut = dust_cutoff(base)
-        # Dust/dead SPORTS only — never Fed, never a mid≈1 winner.
-        if sports and mark < 0.90 and (missing or book_bid <= 0.01 or mark <= 0.01 or (dust_cut > 0 and value < dust_cut)):
+        # Dust/dead SPORTS only — never Fed, never a mid≈1 winner, never a live bid ≥ 0.02.
+        if sports and live < 0.02 and mark < 0.90 and (
+            missing or book_bid <= 0.01 or mark <= 0.01 or (dust_cut > 0 and value < dust_cut)
+        ):
             px = min(0.01, book_bid) if book_bid > 0 else 0.01
             return self._exit_ticket(
                 pos, book, shares, px,
@@ -613,7 +628,7 @@ class Risk:
             if book_bid < 0.02:
                 return None, f"hold trim — ingen live bud ({force_reason})"
             return self._exit_ticket(
-                pos, book, shares, max(bid, 0.01), force_reason, kind="stop", best_bid=book_bid or bid
+                pos, book, shares, book_bid, force_reason, kind="stop", best_bid=book_bid
             ), "ok"
         counterparts = [
             p for p in self.store.positions("open")
@@ -621,39 +636,41 @@ class Risk:
         ]
         if counterparts:
             return None, "complement-hold"
-        pnl_pct = (bid - avg) / avg if avg else 0.0
-        mid = float((book or {}).get("mid") or bid)
+        pnl_pct = (live - avg) / avg if avg and live > 0 else 0.0
+        mid = float((book or {}).get("mid") or live or mark)
 
         hwm_key = f"hwm:{cid}:{side}"
         try:
             hwm = float(self.store.get_meta(hwm_key) or 0)
         except (TypeError, ValueError):
             hwm = 0.0
-        if bid > hwm:
-            hwm = bid
+        if live > hwm:
+            hwm = live
             self.store.set_meta(hwm_key, f"{hwm:.4f}")
-        if sports and bid >= 0.02 and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and hwm > 0 and bid <= hwm * 0.92:
+        trail_px = hwm * 0.92 if hwm > 0 else 0.0
+        if sports and live >= 0.02 and hwm > 0 and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and live <= trail_px:
             return self._exit_ticket(
-                pos, book, shares, bid, f"sports trail −8% fra topp {hwm:.3f} → {bid:.3f}",
-                kind="tp", best_bid=bid,
+                pos, book, shares, live,
+                f"sports trail −8% fra topp {hwm:.3f} (≤{trail_px:.3f}) bud {live:.3f}",
+                kind="tp", best_bid=live,
             ), "ok"
 
-        if sports and bid >= 0.02 and (bid <= avg * 0.85 or pnl_pct <= -0.15):
+        if sports and live >= 0.02 and (live <= avg * 0.85 or pnl_pct <= -0.15):
             return self._exit_ticket(
-                pos, book, shares, bid, f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
-                kind="stop", best_bid=bid,
+                pos, book, shares, live, f"sports stopp-tap {pnl_pct:.1%} bid {live:.3f}",
+                kind="stop", best_bid=live,
             ), "ok"
-        if sports and bid < 0.02:
-            return None, f"hold tom/resolved bok bid {bid:.4f} — ikke FAK"
-        if not sports and bid >= 0.02 and pnl_pct <= -0.22:
+        if sports and live < 0.02:
+            return None, f"hold tom/resolved bok bid {live:.4f} — ikke FAK"
+        if not sports and live >= 0.02 and pnl_pct <= -0.22:
             return self._exit_ticket(
-                pos, book, shares, bid, f"stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
-                kind="stop", best_bid=bid,
+                pos, book, shares, live, f"stopp-tap {pnl_pct:.1%} bid {live:.3f}",
+                kind="stop", best_bid=live,
             ), "ok"
-        if not sports and (bid >= 0.90 or (bid >= 0.02 and pnl_pct >= 0.28)):
+        if not sports and (live >= 0.90 or (live >= 0.02 and pnl_pct >= 0.28)):
             return self._exit_ticket(
-                pos, book, shares, bid, f"ta gevinst {pnl_pct:.1%} bid {bid:.3f}",
-                kind="tp", best_bid=bid,
+                pos, book, shares, live, f"ta gevinst {pnl_pct:.1%} bid {live:.3f}",
+                kind="tp", best_bid=live,
             ), "ok"
 
         hours_open = 0.0
@@ -669,10 +686,10 @@ class Risk:
         hours_left = None
         if market:
             hours_left = market.get("hours_left")
-        if sports and book_bid >= 0.02 and mid < 0.15 and (hours_open >= 3 or (hours_left is not None and float(hours_left) < -3)):
+        if sports and live >= 0.02 and mid < 0.15 and (hours_open >= 3 or (hours_left is not None and float(hours_left) < -3)):
             return self._exit_ticket(
-                pos, book, shares, max(bid, 0.01), f"kamp >3t og mid {mid:.3f}<0.15",
-                kind="dust", best_bid=book_bid,
+                pos, book, shares, live, f"kamp >3t og mid {mid:.3f}<0.15",
+                kind="stop", best_bid=live,
             ), "ok"
 
         ks = kalshi or {}
@@ -681,14 +698,14 @@ class Risk:
             k_yes = 0.0
         if not sports and 0.02 < k_yes < 0.98:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
-            if k_hat + 0.07 < avg:
+            if k_hat + 0.07 < avg and live >= 0.02:
                 return self._exit_ticket(
-                    pos, book, shares, max(bid, 0.01),
+                    pos, book, shares, live,
                     f"Kalshi mot oss {k_hat:.2f} < kost {avg:.2f}",
-                    kind="stop", best_bid=bid,
+                    kind="stop", best_bid=live,
                 ), "ok"
 
-        if estimate and not estimate.get("skip"):
+        if estimate and not estimate.get("skip") and live >= 0.02:
             try:
                 p_yes = float(estimate["p_yes"])
             except (TypeError, ValueError, KeyError):
@@ -698,10 +715,10 @@ class Risk:
                 faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
                 if p_hat + 0.05 <= avg and not faded_to_mid:
                     return self._exit_ticket(
-                        pos, book, shares, bid, f"p_hat {p_hat:.2f} ≥5c under kost {avg:.2f}",
-                        kind="stop", best_bid=bid,
+                        pos, book, shares, live, f"p_hat {p_hat:.2f} ≥5c under kost {avg:.2f}",
+                        kind="stop", best_bid=live,
                     ), "ok"
-        return None, f"hold bid {bid:.3f} pnl {pnl_pct:.1%}"
+        return None, f"hold bid {live:.3f} pnl {pnl_pct:.1%}"
 
     def _exit_ticket(
         self,
@@ -713,13 +730,24 @@ class Risk:
         kind: str = "stop",
         best_bid: float = 0.0,
     ) -> dict:
+        live = float(best_bid or 0)
         px = float(price or 0)
-        tick = 0.001 if px < 0.10 or kind == "dust" else 0.01
-        if px < tick:
-            px = tick
+        if kind != "dust" and kind != "resolved_loser" and live >= 0.10:
+            tick = 0.01
+            px = math.floor(live / tick + 1e-12) * tick
+            px = round(min(0.99, px), 2)
+        elif kind == "dust" or px < 0.10:
+            tick = 0.001 if px < 0.10 or kind == "dust" else 0.01
+            if px < tick:
+                px = tick
+            else:
+                px = math.floor(px / tick + 1e-12) * tick
+            px = round(max(tick, min(0.99, px)), 4)
         else:
-            px = int(px / tick) * tick
-        px = round(max(tick, min(0.99, px)), 4)
+            tick = 0.01
+            src = live if live >= 0.02 else px
+            px = math.floor(src / tick + 1e-12) * tick
+            px = round(max(tick, min(0.99, px)), 2)
         return {
             "condition_id": pos["condition_id"],
             "question": pos.get("question"),

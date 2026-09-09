@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -96,6 +97,17 @@ def _quantize(price: float, tick: float) -> float:
     return round(px, decimals)
 
 
+def _floor_tick(price: float, tick: float) -> float:
+    """Round down to the market tick. Does not clamp a live bid down to 0.01."""
+    tick = tick if tick > 0 else 0.01
+    if float(price) <= 0:
+        return 0.0
+    steps = math.floor(float(price) / tick + 1e-12)
+    px = steps * tick
+    decimals = len(_tick_literal(tick).split(".")[-1])
+    return round(px, decimals)
+
+
 def _clob_meta(token_id: str) -> tuple[float, bool]:
     tick, neg = 0.01, False
     try:
@@ -162,18 +174,15 @@ def _as_dict(raw: Any) -> dict:
 
 
 def _order_filled(signed: Any) -> tuple[bool, dict]:
-    """Kun matched/takingAmount > 0 er fill. status=live med tom takingAmount er ikke en posisjon."""
+    """Kun takingAmount/makingAmount > 0 er fill. status=matched uten size telles ikke."""
     data = _as_dict(signed)
-    status = str(data.get("status") or "").lower()
     taking = str(data.get("takingAmount") if data.get("takingAmount") is not None else "").strip()
     making = str(data.get("makingAmount") if data.get("makingAmount") is not None else "").strip()
-    if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"}:
-        if taking in {"", "0", "0.0"} and making in {"", "0", "0.0"}:
-            return False, data
-    if status in {"matched", "filled"}:
-        return True, data
-    if taking not in {"", "0", "0.0"} or making not in {"", "0", "0.0"}:
-        return True, data
+    try:
+        if float(taking or 0) > 0 or float(making or 0) > 0:
+            return True, data
+    except (TypeError, ValueError):
+        pass
     return False, data
 
 
@@ -683,25 +692,35 @@ class Executor:
             raise RuntimeError("resolved winner — redeem, ikke FAK")
         if str(order.get("kind") or "") == "resolved_loser":
             raise RuntimeError("resolved loser — close locally")
-        if (dust or price < 0.10) and tick_f > 0.001:
-            tick_s, tick_f = "0.001", 0.001
+        live = book_bid if book_bid > 0 else 0.0
         attempts: list[float] = []
-        if dust or price <= 0.012:
-            first = min(0.01, book_bid) if book_bid > 0 else 0.01
-            first = max(0.001, first)
-            attempts.append(_quantize(first, tick_f) if first >= tick_f else 0.001)
-            if abs(attempts[0] - 0.001) > 1e-9:
-                attempts.append(0.001)
+        if dust or live < 0.10:
+            if live < 0.02 and not dust:
+                return {
+                    "status": "resting_sell",
+                    "response": {"error": "ingen live bud"},
+                    "ticket": payload,
+                    "attempt_px": None,
+                    "best_bid": live,
+                }
+            if tick_f > 0.001:
+                tick_s, tick_f = "0.001", 0.001
+            src = live if live > 0 else min(0.01, price)
+            first = _floor_tick(src, tick_f) if src >= tick_f else tick_f
+            attempts.append(first)
         else:
-            px0 = _quantize(min(price, 0.99), tick_f)
+            # FAK at live bid, then bid−1 tick, bid−2. Never 0.01 when bid ≥ 0.10.
+            tick_f = tick_f if 0 < tick_f <= 0.10 else 0.01
+            tick_s = _tick_literal(tick_f)
             for drop in (0, 1, 2):
-                attempt = _quantize(max(tick_f, px0 - drop * tick_f), tick_f)
+                attempt = _floor_tick(live - drop * tick_f, tick_f)
+                if attempt < 0.10:
+                    continue
                 if attempt not in attempts:
                     attempts.append(attempt)
-            if book_bid >= 0.50:
-                extra = _quantize(max(tick_f, book_bid - 0.02), tick_f)
-                if extra not in attempts:
-                    attempts.append(extra)
+            if not attempts:
+                attempts.append(_floor_tick(live, 0.01))
+            attempts = attempts[:3]
         last_signed: Any = None
         data: dict = {}
         last_attempt = attempts[0] if attempts else price
@@ -974,21 +993,24 @@ class Executor:
         except (TypeError, ValueError):
             mark = 0.0
         px = 1.0 if mark >= 0.5 else 0.0
-        self.store.add_fill(
-            condition_id=cid,
-            side=f"REDEEM_{pos.get('side') or 'YES'}",
-            price=px,
-            size=shares,
-            cost=round(shares * px, 4),
-            dry_run=paper,
-            raw={
-                "redeem": True,
-                "tx": txh,
-                "neg_risk": neg,
-                "takingAmount": str(shares),
-                "status": "matched",
-            },
-        )
+        already = self.store.get_meta(f"redeem_ok:{cid}", "")
+        if not already:
+            self.store.add_fill(
+                condition_id=cid,
+                side=f"REDEEM_{pos.get('side') or 'YES'}",
+                price=px,
+                size=shares,
+                cost=round(shares * px, 4),
+                dry_run=paper,
+                raw={
+                    "redeem": True,
+                    "tx": txh,
+                    "neg_risk": neg,
+                    "takingAmount": str(shares),
+                    "status": "matched",
+                },
+            )
+            self.store.set_meta(f"redeem_ok:{cid}", str(int(time.time())))
         self.store.close_position(cid)
         try:
             self.store.clear_dust(cid, pos.get("side"))
