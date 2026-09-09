@@ -269,7 +269,7 @@
             ? `${p.kalshi_ticker} ${ky.toFixed(2)} vs PM ${pmy.toFixed(2)} gap ${Number.isFinite(Number(kg)) ? (Number(kg) >= 0 ? "+" : "") + (Number(kg) * 100).toFixed(0) + "c" : ""}`
             : "");
         const src = p.entry_source || "ukjent";
-        const thesis = `<div class="thesis">${badge(src)} ${live || p.entry_detail || ""}</div>`;
+        const thesis = `<div class="thesis">${badge(src)} ${live || ""}</div>`;
         return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
           <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${thesis}${hint}</div>`;
       }).join("");

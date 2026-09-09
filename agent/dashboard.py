@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from agent.config import settings
+from agent.kalshi import pair_ok
 from agent.version import release as git_release
 
 log = logging.getLogger("dash")
@@ -118,7 +119,8 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
             k_yes = float(row.get("kalshi")) if row.get("kalshi") not in (None, "") else 0.0
         except (TypeError, ValueError):
             k_yes = 0.0
-        if cid and ticker and k_yes > 0:
+        qn = str(row.get("question") or "")
+        if cid and ticker and k_yes > 0 and pair_ok(qn, ticker)[0]:
             kalshi_by[str(cid)] = row
     out = []
     for p in open_pos:
@@ -132,7 +134,7 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
         upnl_pct = round(upnl / cost, 4) if upnl is not None and cost > 0 else None
         q = (p.get("question") or "")[:80]
         cid = p.get("condition_id")
-        hint = hints.get(f"{cid}:{p.get('side') or ''}") or hints.get(q) or {}
+        hint = hints.get(f"{cid}:{p.get('side') or ''}") or {}
         ks = kalshi_by.get(str(cid or "")) or {}
         k_tick = ks.get("ticker")
         try:
@@ -151,8 +153,15 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
         if k_tick and 0 < k_yes_raw < 1 and 0 < pm_yes < 1:
             gc = (gap_yes if gap_yes is not None else (pm_yes - k_yes_raw)) * 100
             live_thesis = f"{k_tick} {k_yes_raw:.2f} vs PM {pm_yes:.2f} gap {gc:+.0f}c"
+        if k_tick and not pair_ok(str(p.get("question") or ""), str(k_tick), "", k_yes_raw or None, pm_yes or None)[0]:
+            k_tick = None
+            live_thesis = None
+            k_yes_raw = 0.0
+            gap_yes = None
+            pm_yes = 0.0
         out.append(
             {
+                "condition_id": cid,
                 "question": p.get("question"),
                 "outcome": p.get("outcome"),
                 "side": p.get("side"),

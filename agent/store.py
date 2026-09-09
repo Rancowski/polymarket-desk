@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -778,6 +779,30 @@ class Store:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return float(settings.xai_prepaid_usd or 0)
+
+    def kalshi_tickers_for(self, condition_id: str) -> list[str]:
+        cid = str(condition_id or "").strip()
+        if not cid:
+            return []
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT kalshi_ticker, source_detail FROM fills
+                WHERE condition_id=? ORDER BY id DESC LIMIT 12
+                """,
+                (cid,),
+            )
+            rows = cur.fetchall()
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            for raw in (row["kalshi_ticker"], row["source_detail"]):
+                for t in re.findall(r"\b(KX[A-Z0-9-]{5,})\b", str(raw or ""), re.I):
+                    u = t.upper()
+                    if u not in seen:
+                        seen.add(u)
+                        out.append(u)
+        return out
 
     def fill_count(self) -> int:
         with self._lock:

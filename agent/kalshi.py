@@ -343,24 +343,90 @@ def _series_prefix(ticker: str) -> str:
     return str(ticker or "").split("-")[0]
 
 
-def _wanted_series(q: str) -> list[str]:
+def _pm_family(q: str) -> str:
     t = (q or "").lower()
-    out: list[str] = []
+    if "tweet" in t:
+        return "tweets"
+    if "fdv" in t or "fully diluted" in t or "one day after launch" in t:
+        return "fdv"
+    if "hormuz" in t:
+        return "hormuz"
+    if re.search(r"\bdsa\b", t) or "democratic socialists" in t:
+        return "dsa"
     if any(x in t for x in ("fed", "fomc", "federal reserve")):
-        out.extend(["KXFEDDECISION", "KXFED", "KXFEDHIKE", "KXFEDFUNDS", "KXFOMC"])
-    if "senate" in t:
-        out.extend(["KXSENATE", "KXSENATEMID"])
-    if "house" in t or "congress" in t:
-        out.append("CONTROLH")
-    if any(x in t for x in ("president", "presidential", "white house")):
-        out.extend(["PRES", "KXPRESPARTY"])
-    if "nominee" in t or "primary" in t or "presnom" in t:
-        out.extend(["KXPRESNOMD", "KXPRESNOMR"])
+        return "fed"
+    if "lula" in t or ("brazil" in t and "president" in t):
+        return "br_pres"
+    if "brazil" in t and any(x in t for x in ("senate", "congress", "deput", "chamber", "legislature")):
+        return "br_leg"
+    if any(x in t for x in ("united russia", "new people", "a just russia", "ldpr", "state duma")):
+        return "ru_party"
     if "bitcoin" in t or re.search(r"\bbtc\b", t):
-        out.extend(["KXBTC", "KXBTCMAX", "KXBTCMAXY", "KXBTCMAX150"])
+        return "btc"
     if "ethereum" in t or re.search(r"\beth\b", t):
-        out.extend(["KXETH", "KXETHMAX"])
-    return list(dict.fromkeys(out))
+        return "eth"
+    if any(x in t for x in ("senate", "house", "congress", "president", "presidential", "electoral")):
+        if "brazil" in t:
+            return "br_pres" if "president" in t else "br_leg"
+        if "russia" in t:
+            return "ru_party"
+        return "us_election"
+    return "other"
+
+
+def _ticker_family(ticker: str, title: str = "") -> str:
+    tick = (ticker or "").upper()
+    pfx = tick.split("-")[0]
+    if pfx.startswith("KXFED") or "FEDDECISION" in tick or "FEDHIKE" in tick or "FEDFUNDS" in tick or pfx in {"KXFOMC"}:
+        return "fed"
+    if pfx.startswith("KXBTC"):
+        return "btc"
+    if pfx.startswith("KXETH"):
+        return "eth"
+    if "BRSEN" in tick:
+        return "br_leg"
+    if pfx.startswith("KXBR") and "PRES" in tick:
+        return "br_pres"
+    if pfx.startswith("KXBR"):
+        return "br_other"
+    if "TWEET" in tick:
+        return "tweets"
+    if "HORMUZ" in tick:
+        return "hormuz"
+    if "FDV" in tick:
+        return "fdv"
+    if pfx in {"PRES", "CONTROLH", "KXSENATE", "KXSENATEMID", "KXPRESPARTY", "POPVOTE", "KXPRESNOMD", "KXPRESNOMR"}:
+        return "us_election"
+    if pfx.startswith("SENATE") or pfx.startswith("HOUSE") or pfx.startswith("PRESPARTY") or pfx.startswith("KXPRES"):
+        return "us_election"
+    return "other"
+
+
+def _wanted_series(q: str) -> list[str]:
+    fam = _pm_family(q)
+    t = (q or "").lower()
+    if fam == "fed":
+        return ["KXFEDDECISION", "KXFED", "KXFEDHIKE", "KXFEDFUNDS", "KXFOMC"]
+    if fam == "us_election":
+        out: list[str] = []
+        if "senate" in t:
+            out.extend(["KXSENATE", "KXSENATEMID"])
+        if "house" in t or "congress" in t:
+            out.append("CONTROLH")
+        if "president" in t or "presidential" in t:
+            out.extend(["PRES", "KXPRESPARTY"])
+        return list(dict.fromkeys(out))
+    if fam == "btc":
+        return ["KXBTC", "KXBTCMAX", "KXBTCMAXY", "KXBTCMAX150"]
+    if fam == "eth":
+        return ["KXETH", "KXETHMAX"]
+    if fam == "tweets":
+        return ["KXELONTWEETS"]
+    if fam == "hormuz":
+        return ["KXHORMUZNORM"]
+    if fam == "br_leg":
+        return ["KXBRSENMOSTSEATS"]
+    return []
 
 
 def _outcome_tags(text: str) -> set[str]:
@@ -386,9 +452,10 @@ def _outcome_tags(text: str) -> set[str]:
 
 
 def _strikes(text: str) -> set[int]:
+    """Dollar levels only. Never years (2026) or dates."""
     t = (text or "").lower().replace(",", "")
     found: set[int] = set()
-    for n, suf in re.findall(r"(\d+(?:\.\d+)?)\s*(k|m)?", t):
+    for n, suf in re.findall(r"\$?\s*(\d+(?:\.\d+)?)\s*(k|m)?", t):
         try:
             v = float(n)
         except ValueError:
@@ -398,9 +465,103 @@ def _strikes(text: str) -> set[int]:
         elif suf == "m":
             v *= 1_000_000
         iv = int(round(v))
-        if iv >= 1000:
-            found.add(iv)
+        if 1900 <= iv <= 2035:
+            continue
+        if iv < 500:
+            continue
+        found.add(iv)
+    m = re.search(r"-T(\d{3,})$", (text or "").upper())
+    if m:
+        n = int(m.group(1))
+        if n >= 500 and not (1900 <= n <= 2035):
+            found.add(n)
     return found
+
+
+def _md(text: str) -> set[str]:
+    t = _human_text(text).lower()
+    out: set[str] = set()
+    for d in _dates(text):
+        out.add(d[5:])
+    for mon, dd in re.findall(
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\b",
+        t,
+    ):
+        mm = _MON_NUM.get(mon)
+        if mm:
+            out.add(f"{mm}-{int(dd):02d}")
+    return out
+
+
+def _strike_close(a: set[int], b: set[int], tol: float = 0.02) -> bool:
+    if not a or not b:
+        return False
+    for x in a:
+        for y in b:
+            if x <= 0 or y <= 0:
+                continue
+            if abs(x - y) / max(x, y) <= tol:
+                return True
+    return False
+
+
+def extract_tickers(text: str) -> list[str]:
+    found = re.findall(r"\b(KX[A-Z0-9-]{5,}|PRES|CONTROLH|KXSENATE[A-Z0-9-]*)\b", text or "", re.I)
+    return [t.upper() for t in found]
+
+
+def pair_ok(
+    pm_q: str,
+    ticker: str,
+    k_title: str = "",
+    k_yes: float | None = None,
+    pm_yes: float | None = None,
+) -> tuple[bool, str]:
+    """Hard gate. Family + strike/date/outcome + live mids. No fuzzy senate→Brazil."""
+    tick = str(ticker or "").strip()
+    if not tick:
+        return False, "ingen ticker"
+    pf = _pm_family(pm_q)
+    tf = _ticker_family(tick, k_title)
+    if pf in {"", "other"} or tf in {"", "other"}:
+        return False, f"ulik familie {pf or '—'} vs {tf or '—'} ({tick})"
+    if pf != tf:
+        return False, f"familie {pf} ≠ {tf} ({tick})"
+    if pf == "fed":
+        want = _fed_want(pm_q)
+        suf = _fed_suffix(tick)
+        if not str(tick).upper().startswith("KXFED"):
+            return False, f"ikke KXFED* ({tick})"
+        if not want or not suf or want != suf:
+            return False, f"fed {suf or '—'} ≠ {want or '—'}"
+    if pf in {"btc", "eth"}:
+        q_strike = _strikes(pm_q)
+        k_strike = _strikes(f"{tick} {k_title}")
+        if not _strike_close(q_strike, k_strike, 0.02):
+            return False, f"strike mismatch {sorted(q_strike)[:3]} vs {sorted(k_strike)[:3]}"
+        qmd, kmd = _md(pm_q), _md(f"{tick} {k_title}")
+        if qmd and kmd and not (qmd & kmd):
+            return False, "ulik session-dato"
+    if k_yes is not None and pm_yes is not None:
+        try:
+            ky = float(k_yes)
+            py = float(pm_yes)
+        except (TypeError, ValueError):
+            return False, "ugyldig mid"
+        pinned = (ky <= 0.01 or ky >= 0.99) and (py <= 0.01 or py >= 0.99)
+        if not pinned and not (0.01 < ky < 0.99 and 0.01 < py < 0.99):
+            return False, f"mid utenfor (0.01,0.99) k={ky:.3f} pm={py:.3f}"
+    return True, ""
+
+
+def keep_fed_h25(pm_q: str, ticker: str) -> bool:
+    tick = str(ticker or "").upper()
+    return (
+        _pm_family(pm_q) == "fed"
+        and "KXFEDDECISION" in tick
+        and _fed_suffix(tick) == "H25"
+        and _fed_want(pm_q) == "H25"
+    )
 
 
 def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[str], pages: int = 2) -> int:
@@ -449,17 +610,6 @@ def expand_catalog(collected: list[dict], markets: list[dict], host: str | None 
             continue
         q = str(m.get("question") or "")
         want.extend(_wanted_series(q))
-        qtok = {w for w in _tokens(q) if len(w) >= 4}
-        if not qtok:
-            continue
-        ranked = []
-        for s in _SERIES_META:
-            hit = qtok & (s.get("tokens") or set())
-            if len(hit) >= 1:
-                ranked.append((len(hit), s.get("vol") or 0.0, s["ticker"]))
-        ranked.sort(reverse=True)
-        for _n, _v, tick in ranked[:3]:
-            want.append(tick)
     extra = []
     for tick in dict.fromkeys(want):
         if tick in have:
@@ -579,141 +729,53 @@ def _fed_want(text: str) -> str | None:
 
 
 def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
-    """Comparable named contract only. Returns (row, skip_why)."""
-    qtok = _tokens(_human_text(q))
-    qtheme = _theme(_human_text(q))
-    qmonths = _months(q)
-    qyears = _years(q)
-    qdates = _dates(q)
-    want = _fed_want(q)
+    """Attach only a hard-legal pair. No fuzzy token score."""
+    fam = _pm_family(q)
+    wanted = _wanted_series(q)
+    last_why = "ingen lovlig par"
     best = None
-    best_score = 0.0
-    month_conflict = False
-    year_conflict = False
-    wrong_suffix: list[tuple[str, str, str]] = []
+    best_score = -1.0
+    fed_wrong: list[tuple[str, str, str]] = []
     for k in kalshi:
-        n = len(qtok & k["tokens"])
-        t = len(qtheme & k["theme"])
-        score = n + 3 * t
-        distinctive = qtheme & k["theme"] & {
-            "fed", "btc", "eth", "sol", "trump", "harris", "israel-air", "tennis",
-            "election", "shutdown", "cpi", "gdp",
-        }
-        bps = qtheme & k["theme"] & {"25", "50", "hike", "cut", "hold"}
-        fed_ok = "fed" in distinctive and (bool(bps) or t >= 2)
         ticker = str(k.get("ticker") or "")
         title = str(k.get("title") or "")
-        kdates = k.get("dates") or _dates(f"{ticker} {title}")
-        same_date = bool(qdates and kdates and (qdates & kdates))
-        q_out = _outcome_tags(q)
-        k_out = _outcome_tags(f"{ticker} {title}")
-        same_outcome = bool(q_out and k_out and (q_out & k_out)) or n >= 2
-        date_pair = same_date and same_outcome
-        if date_pair:
-            score += 15
-        if q_out and k_out and (q_out & k_out):
-            score += 12
-        prefix = _series_prefix(ticker)
-        if "senate" in qtok and (prefix in {"KXSENATE", "KXSENATEMID"} or "senate" in k["tokens"]):
-            score += 12
-            same_outcome = True
-        if "house" in qtok and (prefix == "CONTROLH" or "house" in k["tokens"]):
-            score += 12
-            same_outcome = True
-        q_strike = _strikes(q)
-        k_strike = _strikes(f"{ticker} {title}")
-        same_strike = bool(q_strike and k_strike and (q_strike & k_strike))
-        if same_strike and (same_date or not qdates):
+        try:
+            k_yes = float(k.get("yes") or 0)
+        except (TypeError, ValueError):
+            k_yes = 0.0
+        ok, why = pair_ok(q, ticker, title, k_yes if k_yes else None, None)
+        if not ok:
+            last_why = why
+            if fam == "fed" and _fed_suffix(ticker) and _fed_want(q) and _fed_suffix(ticker) != _fed_want(q):
+                fed_wrong.append((_fed_suffix(ticker) or "", ticker, title))
+            continue
+        score = 1.0
+        if fam in {"btc", "eth"}:
+            qs, ks = _strikes(q), _strikes(f"{ticker} {title}")
+            if qs and ks:
+                dist = min(abs(x - y) for x in qs for y in ks)
+                score = 50.0 - dist / 1000.0
+        if fam == "fed" and _fed_suffix(ticker) == _fed_want(q):
             score += 20
-        names = {w for w in qtok if len(w) >= 5}
-        named = bool(names & k["tokens"])
-        if named:
-            score += 8
-        theme_ok = (
-            fed_ok
-            or date_pair
-            or same_strike
-            or named
-            or ("senate" in qtok and prefix in {"KXSENATE", "KXSENATEMID"})
-            or ("house" in qtok and prefix == "CONTROLH")
-            or (q_out and k_out and (q_out & k_out))
-            or (t >= 2 and bool(distinctive))
-            or (t >= 1 and n >= 3 and bool(distinctive))
-        )
-        tok_need = 2 if distinctive or named or q_out else 4
-        if not theme_ok and n < tok_need:
-            continue
-        # Ticker/series month is source of truth (26SEP). Title month is fallback only.
-        km = _months(ticker) or k.get("months") or _months(title)
-        ky = _years(ticker) or k.get("years") or _years(title)
-        if qmonths and km and not (qmonths & km):
-            month_conflict = True
-            continue
-        if qyears and ky and not (qyears & ky):
-            year_conflict = True
-            continue
-        suf = _fed_suffix(ticker)
-        if want:
-            if not suf:
-                continue
-            if suf != want:
-                wrong_suffix.append((suf, ticker, title))
-                continue
-            score += 20
-        if qmonths and km and (qmonths & km):
-            score += 8
-        if qyears and ky and (qyears & ky):
-            score += 8
-        if same_date:
-            score += 8
+        qmd, kmd = _md(q), _md(f"{ticker} {title}")
+        if qmd and kmd and (qmd & kmd):
+            score += 5
         if score > best_score:
             best_score = score
             best = k
     if not best:
-        if want and wrong_suffix:
-            suf, tick, title = wrong_suffix[0]
-            label = _FED_WANT_LABEL.get(want, want)
+        if fam == "fed" and fed_wrong:
+            suf, tick, title = fed_wrong[0]
+            label = _FED_WANT_LABEL.get(_fed_want(q) or "", _fed_want(q) or "")
             why = f"wrong ticker {suf} ≠ {label}"
             log.info("kalshi-skip %s | %s | %s", tick, title[:70], why)
-            return {
-                "title": title[:90],
-                "ticker": tick,
-                "yes": 0.0,
-                "_skip": True,
-            }, why
-        if year_conflict and not month_conflict:
-            return None, "ulikt år"
-        if month_conflict:
-            return None, "ulik måned"
-        wanted = _wanted_series(q)
-        labels = wanted or sorted({_series_prefix(str(k.get("ticker") or "")) for k in kalshi if k.get("ticker")})[:6]
+            return {"title": title[:90], "ticker": tick, "yes": 0.0, "_skip": True}, why
+        labels = wanted or [fam]
         counts = [f"{s}:{_FETCHED_N.get(s, 0)}" for s in labels[:6]]
-        if wanted and not any(_FETCHED_N.get(s, 0) for s in wanted):
-            return None, f"katalog mangler {'/'.join(wanted[:4])} (0 open, prøvd {', '.join(counts) or '—'})"
-        return None, f"ingen treff i {'/'.join(wanted[:4]) or 'katalog'} ({', '.join(counts) or '0 kontrakter'})"
-    bticker = str(best.get("ticker") or "")
-    btitle = str(best.get("title") or "")
-    kyears = _years(bticker) or best.get("years") or _years(btitle)
-    if qyears and kyears and not (qyears & kyears):
-        return None, "ulikt år"
-    km = _months(bticker) or best.get("months") or _months(btitle)
-    if qmonths and km and not (qmonths & km):
-        return None, "ulik måned"
-    qth, kth = qtheme, best["theme"]
-    if want:
-        best = {**best, "overlap": int(best_score), "fed_suffix": want}
-        return best, ""
-    if ("25" in qth) != ("25" in kth) or ("25plus" in qth) != ("25plus" in kth):
-        return None, "25 bps mismatch"
-    if ("50" in qth) != ("50" in kth):
-        return None, "50 bps mismatch"
-    if ("funds" in kth and "hike" in qth) or ("funds" in qth and "hike" in kth):
-        return None, "funds vs hike"
-    for tag in ("hike", "cut", "hold"):
-        if tag in qth or tag in kth:
-            if tag not in qth or tag not in kth:
-                return None, f"{tag} mismatch"
+        return None, f"{last_why} ({fam}; {' '.join(counts)})"
     best = {**best, "overlap": int(best_score)}
+    if fam == "fed":
+        best["fed_suffix"] = _fed_want(q)
     return best, ""
 
 
@@ -776,6 +838,25 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                 )
             continue
         k_yes = float(best["yes"]) if best else 0.0
+        if best and not best.get("_skip"):
+            ok, why2 = pair_ok(blob, str(best.get("ticker") or ""), str(best.get("title") or ""), k_yes, poly)
+            if not ok:
+                if want:
+                    logs.append(
+                        {
+                            "condition_id": m.get("condition_id"),
+                            "question": q[:90],
+                            "ticker": "",
+                            "pm": round(poly, 3),
+                            "pm_yes": round(poly, 3),
+                            "kalshi": None,
+                            "kalshi_yes": None,
+                            "gap": None,
+                            "action": "skip",
+                            "why": why2,
+                        }
+                    )
+                continue
         if not best:
             if want:
                 logs.append(

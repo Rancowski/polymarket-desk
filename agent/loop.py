@@ -22,6 +22,7 @@ from agent.risk import (
     sizing_base,
 )
 from agent.scanner import Scout
+from agent.kalshi import extract_tickers, keep_fed_h25, pair_ok
 from agent.store import Store
 
 log = logging.getLogger("desk")
@@ -290,6 +291,47 @@ class Desk:
                 force[key] = "maks 10 — trim dårligste"
         return force
 
+    def _illegal_pair_flatten(self, open_pos: list, by_id: dict) -> dict[tuple, str]:
+        """FAK-sell legs whose stored/live Kalshi ticker fails the hard pair rule."""
+        force: dict[tuple, str] = {}
+        for p in open_pos:
+            q = str(p.get("question") or "")
+            cid = str(p.get("condition_id") or "")
+            side = str(p.get("side") or "YES")
+            if not cid:
+                continue
+            ticks: list[str] = []
+            live = (by_id.get(cid) or {}).get("kalshi") or {}
+            if live.get("ticker"):
+                ticks.append(str(live.get("ticker")))
+            ticks.extend(extract_tickers(str(p.get("entry_detail") or "")))
+            try:
+                ticks.extend(self.store.kalshi_tickers_for(cid))
+            except Exception:
+                pass
+            seen: set[str] = set()
+            for tick in ticks:
+                t = str(tick or "").strip()
+                if not t or t in seen:
+                    continue
+                seen.add(t)
+                if keep_fed_h25(q, t):
+                    continue
+                title = str(live.get("title") or "")
+                try:
+                    ky = float(live.get("yes") or 0) or None
+                except (TypeError, ValueError):
+                    ky = None
+                try:
+                    py = float(live.get("pm_yes") or p.get("cur_price") or 0) or None
+                except (TypeError, ValueError):
+                    py = None
+                ok, why = pair_ok(q, t, title, ky, py)
+                if not ok:
+                    force[(cid, side)] = f"ulovlig par {t} — {why}"
+                    break
+        return force
+
     def _market_stubs(self, open_pos: list) -> dict:
         by_id: dict = {}
         for pos in open_pos:
@@ -542,6 +584,7 @@ class Desk:
         sold = 0
         log_rows: list[dict] = []
         force = self._trim_reasons(open_pos, equity=equity)
+        force.update(self._illegal_pair_flatten(open_pos, by_id))
         for pos in list(open_pos):
             q = (pos.get("question") or "")[:80]
             cid = pos.get("condition_id")
