@@ -343,6 +343,43 @@ class Desk:
                 continue
             if str(p.get("entry_source") or "") == "kalshi":
                 force[(cid, side)] = "kalshi uten gyldig ticker — flatten"
+        by_cid: dict[str, list] = {}
+        for p in open_pos:
+            cid = str(p.get("condition_id") or "")
+            if cid:
+                by_cid.setdefault(cid, []).append(p)
+        for cid, rows in by_cid.items():
+            if len(rows) < 2:
+                continue
+            def _opened(r: dict) -> str:
+                return str(r.get("opened_ts") or r.get("last_ts") or "")
+            keep = sorted(rows, key=_opened)[0]
+            keep_side = str(keep.get("side") or "YES")
+            for r in rows:
+                rs = str(r.get("side") or "YES")
+                if rs == keep_side:
+                    continue
+                force[(cid, rs)] = "stacked fills — behold eldste lot"
+        for p in open_pos:
+            cid = str(p.get("condition_id") or "")
+            side = str(p.get("side") or "YES")
+            stub = by_id.get(cid) or {}
+            try:
+                yes_mid = float(stub.get("yes_mid") or stub.get("mid") or 0)
+            except (TypeError, ValueError):
+                yes_mid = 0.0
+            if side == "NO" and yes_mid >= 0.95:
+                force[(cid, side)] = f"short pin PM YES {yes_mid:.2f}"
+            if side == "YES" and 0 < yes_mid <= 0.05:
+                force[(cid, side)] = f"short pin PM YES {yes_mid:.2f}"
+            try:
+                n_buy = self.store.buy_fill_count(cid, side)
+                first = self.store.first_buy_shares(cid, side)
+                cur = float(p.get("shares") or 0)
+            except Exception:
+                n_buy, first, cur = 0, None, 0.0
+            if n_buy >= 2 and first and cur > first + 0.5:
+                force[(cid, side)] = "stacked fills — selg påfyll"
         return force
 
     def _market_stubs(self, open_pos: list) -> dict:
@@ -695,6 +732,18 @@ class Desk:
                 sold += 1
                 continue
             try:
+                if "stacked" in str(ticket_ex.get("reason") or force.get(key) or ""):
+                    first = self.store.first_buy_shares(str(cid or ""), str(side or "YES"))
+                    cur = float(pos.get("shares") or 0)
+                    if first and cur > first + 0.5:
+                        extra = round(cur - first, 2)
+                        ticket_ex = {
+                            **ticket_ex,
+                            "shares": extra,
+                            "size_usd": round(extra * float(ticket_ex.get("limit_price") or 0), 4),
+                            "leave_shares": first,
+                            "reason": ticket_ex.get("reason") or "stacked fills — selg påfyll",
+                        }
                 result = self.exec.sell(ticket_ex)
                 status = str(result.get("status") or "")
                 reason = ticket_ex.get("reason") or why
@@ -1028,9 +1077,17 @@ class Desk:
             if remaining < 0.02:
                 estimates = {}
                 log.info("Hopper Grok — xAI-budsjett tomt")
+                setattr(self.brain, "last_skip", "filter")
             else:
                 estimates = self.brain.estimate(batch) if batch else {}
                 log.info("Grok-batch %s navn (syklus %s)", len(batch), self._cycle_i)
+                grok_why = str(getattr(self.brain, "last_skip", "") or "")
+                if batch and not estimates:
+                    log.warning("Grok batch tom etter kjøring (%s navn): %s", len(batch), grok_why or "timeout/parse/filter")
+                elif batch:
+                    n_miss = sum(1 for m in batch if m.get("condition_id") not in estimates)
+                    if n_miss:
+                        log.warning("Grok parse miss %s/%s navn (%s)", n_miss, len(batch), grok_why or "parse")
             usage = getattr(self.brain, "last_usage", {}) or {}
             xai_cycle = float(usage.get("usd") or 0)
             if xai_cycle:
@@ -1104,11 +1161,12 @@ class Desk:
                 continue
             est = estimates.get(m["condition_id"])
             if not est:
+                why_est = str(getattr(self.brain, "last_skip", "") or "parse")
                 self.store.log_decision(
                     condition_id=m["condition_id"],
                     question=m["question"],
                     action="skip",
-                    reason="ingen estimat",
+                    reason=f"ingen estimat ({why_est})",
                 )
                 rejected += 1
                 continue

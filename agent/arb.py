@@ -359,10 +359,7 @@ class Arb:
                 side = "NO"
             else:
                 continue
-            held = held_side.get(str(cid))
-            if held == side:
-                continue
-            if held and held != side:
+            if str(cid) in held_side:
                 continue
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")

@@ -842,6 +842,49 @@ class Store:
                         out.append(u)
         return out
 
+    def first_buy_shares(self, condition_id: str, side: str | None) -> float | None:
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if yn.startswith("BUY_"):
+            yn = yn[4:]
+        if not cid:
+            return None
+        want = {f"BUY_{yn}", yn}
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side, size FROM fills WHERE condition_id=? ORDER BY id ASC",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su in {f"BUY_{yn}", yn} or (su.startswith("BUY_") and su[4:] == yn):
+                try:
+                    sz = float(row["size"] or 0)
+                except (TypeError, ValueError):
+                    sz = 0.0
+                if sz > 0:
+                    return sz
+        return None
+
+    def buy_fill_count(self, condition_id: str, side: str | None) -> int:
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if yn.startswith("BUY_"):
+            yn = yn[4:]
+        n = 0
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side FROM fills WHERE condition_id=?",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su in {f"BUY_{yn}", yn} or (su.startswith("BUY_") and su[4:] == yn):
+                n += 1
+        return n
+
     def fill_count(self) -> int:
         with self._lock:
             cur = self.conn.execute("SELECT COUNT(*) AS n FROM fills")

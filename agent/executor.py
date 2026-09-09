@@ -735,7 +735,23 @@ class Executor:
                 raw=payload,
                 **{k: v for k, v in attr.items() if k != "side"},
             )
-            self.store.close_position(order["condition_id"], order.get("side"))
+            leave = order.get("leave_shares")
+            try:
+                leave_f = float(leave) if leave not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                leave_f = 0.0
+            if leave_f > 0:
+                self.store.upsert_position(
+                    condition_id=order.get("condition_id"),
+                    question=order.get("question"),
+                    side=order.get("side"),
+                    token_id=order.get("token_id"),
+                    shares=leave_f,
+                    avg_cost=order.get("avg_cost") or order.get("mark"),
+                    status="open",
+                )
+            else:
+                self.store.close_position(order["condition_id"], order.get("side"))
             return {"status": "paper_sell", "ticket": payload}
 
         client = self._live_client()
@@ -782,18 +798,17 @@ class Executor:
             first = _floor_tick(src, tick_f) if src >= tick_f else tick_f
             attempts.append(first)
         else:
-            # FAK at live bid, then bid−1 tick, bid−2. Never 0.01 when bid ≥ 0.10.
+            # Stop/trail: FAK at live bid, then bid−1 tick. Never 0.001 / 0.01.
             tick_f = tick_f if 0 < tick_f <= 0.10 else 0.01
             tick_s = _tick_literal(tick_f)
-            for drop in (0, 1, 2):
+            for drop in (0, 1):
                 attempt = _floor_tick(live - drop * tick_f, tick_f)
                 if attempt < 0.10:
                     continue
                 if attempt not in attempts:
                     attempts.append(attempt)
-            if not attempts:
-                attempts.append(_floor_tick(live, 0.01))
-            attempts = attempts[:3]
+            if not attempts and live >= 0.10:
+                attempts.append(_floor_tick(live, tick_f if tick_f >= 0.01 else 0.01))
         last_signed: Any = None
         data: dict = {}
         last_attempt = attempts[0] if attempts else price
@@ -807,12 +822,32 @@ class Executor:
             try:
                 signed = _place_limit(client, args, tick_s, neg, sdk=sdk)
             except Exception as exc:
+                msg = str(exc).lower()
                 log.warning("SELL %s @ %s: %s", (order.get("question") or "")[:40], attempt, exc)
                 last_signed = {"error": str(exc)}
+                if "not enough" in msg or "insufficient" in msg or "balance" in msg:
+                    log.warning("SELL skip — ikke nok balance, ingen dust-retry")
+                    return {
+                        "status": "resting_sell",
+                        "response": {"error": str(exc)},
+                        "ticket": payload,
+                        "attempt_px": attempt,
+                        "best_bid": book_bid,
+                    }
                 continue
             log.info("LIVE SELL try @ %s %s", attempt, signed)
             filled, data = _order_filled(signed)
             last_signed = signed
+            err = str((data or {}).get("error") or (data or {}).get("errorMsg") or "")
+            if err and ("not enough" in err.lower() or "insufficient" in err.lower() or "balance" in err.lower()):
+                log.warning("SELL skip — CLOB balance %s", err[:160])
+                return {
+                    "status": "resting_sell",
+                    "response": data or signed,
+                    "ticket": payload,
+                    "attempt_px": attempt,
+                    "best_bid": book_bid,
+                }
             if filled:
                 attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
                 self.store.add_fill(
@@ -832,7 +867,23 @@ class Executor:
                     },
                     **{k: v for k, v in attr.items() if k != "side"},
                 )
-                self.store.close_position(order["condition_id"], order.get("side"))
+                leave = order.get("leave_shares")
+                try:
+                    leave_f = float(leave) if leave not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    leave_f = 0.0
+                if leave_f > 0:
+                    self.store.upsert_position(
+                        condition_id=order.get("condition_id"),
+                        question=order.get("question"),
+                        side=order.get("side"),
+                        token_id=order.get("token_id"),
+                        shares=leave_f,
+                        avg_cost=order.get("avg_cost") or order.get("mark"),
+                        status="open",
+                    )
+                else:
+                    self.store.close_position(order["condition_id"], order.get("side"))
                 return {"status": "live_sell", "response": data or signed, "ticket": payload}
         log.info("Salg umatchet etter FAK-retry — ingen fill")
         st = "unmatched_dust" if dust else "resting_sell"

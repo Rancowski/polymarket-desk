@@ -167,6 +167,12 @@ def _dates(text: str) -> set[str]:
     ):
         mm = _MON_NUM.get(mon, "00")
         found.add(f"{y}-{mm}-{int(dd):02d}")
+    for dd, mon, y in re.findall(
+        r"(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)[a-z]*\s*,?\s*(20\d{2})",
+        t,
+    ):
+        mm = _MON_NUM.get(mon, "00")
+        found.add(f"{y}-{mm}-{int(dd):02d}")
     return found
 
 
@@ -452,10 +458,18 @@ def _outcome_tags(text: str) -> set[str]:
 
 
 def _strikes(text: str) -> set[int]:
-    """Dollar levels only. Never years (2026) or dates."""
-    t = (text or "").lower().replace(",", "")
+    """Dollar levels only. Never years (2026) or ticker date crumbs (0907)."""
+    raw = text or ""
+    t = raw.lower().replace(",", "")
     found: set[int] = set()
-    for n, suf in re.findall(r"\$?\s*(\d+(?:\.\d+)?)\s*(k|m)?", t):
+
+    def _add(v: float) -> None:
+        iv = int(round(v))
+        if iv < 500 or 1900 <= iv <= 2035:
+            return
+        found.add(iv)
+
+    for n, suf in re.findall(r"\$\s*(\d+(?:\.\d+)?)\s*(k|m)?", t):
         try:
             v = float(n)
         except ValueError:
@@ -464,17 +478,22 @@ def _strikes(text: str) -> set[int]:
             v *= 1000
         elif suf == "m":
             v *= 1_000_000
-        iv = int(round(v))
-        if 1900 <= iv <= 2035:
+        _add(v)
+    for n, suf in re.findall(r"\b(\d+(?:\.\d+)?)\s*(k|m)\b", t):
+        try:
+            v = float(n)
+        except ValueError:
             continue
-        if iv < 500:
+        v *= 1000 if suf == "k" else 1_000_000
+        _add(v)
+    for n in re.findall(r"\b(\d{5,})\b", t):
+        try:
+            _add(float(n))
+        except ValueError:
             continue
-        found.add(iv)
-    m = re.search(r"-T(\d{3,})$", (text or "").upper())
+    m = re.search(r"-T(\d{3,})(?:\b|$)", raw.upper())
     if m:
-        n = int(m.group(1))
-        if n >= 500 and not (1900 <= n <= 2035):
-            found.add(n)
+        _add(float(m.group(1)))
     return found
 
 
@@ -485,6 +504,13 @@ def _md(text: str) -> set[str]:
         out.add(d[5:])
     for mon, dd in re.findall(
         r"(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})\b",
+        t,
+    ):
+        mm = _MON_NUM.get(mon)
+        if mm:
+            out.add(f"{mm}-{int(dd):02d}")
+    for dd, mon in re.findall(
+        r"(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)[a-z]*\b",
         t,
     ):
         mm = _MON_NUM.get(mon)
@@ -510,6 +536,36 @@ def extract_tickers(text: str) -> list[str]:
     return [t.upper() for t in found]
 
 
+_MON_CODE = {
+    "january": "JAN", "february": "FEB", "march": "MAR", "april": "APR",
+    "may": "MAY", "june": "JUN", "july": "JUL", "august": "AUG",
+    "september": "SEP", "october": "OCT", "november": "NOV", "december": "DEC",
+}
+_MEET_RE = re.compile(
+    r"(?<![A-Z0-9])(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?![A-Z])",
+    re.I,
+)
+
+
+def _meeting_codes(text: str) -> set[str]:
+    t = (text or "").upper().replace("SEPT", "SEP")
+    return {f"{yy}{mon.upper()}" for yy, mon in _MEET_RE.findall(t)}
+
+
+def _pm_fed_meeting(pm_q: str) -> set[str]:
+    """September 2026 meeting → {26SEP}. Also picks explicit 26SEP in the title."""
+    out = _meeting_codes(pm_q)
+    years = _years(pm_q)
+    months = _months(pm_q)
+    for y in years:
+        yy = f"{y % 100:02d}"
+        for m in months:
+            code = _MON_CODE.get(m)
+            if code:
+                out.add(f"{yy}{code}")
+    return out
+
+
 def pair_ok(
     pm_q: str,
     ticker: str,
@@ -517,7 +573,7 @@ def pair_ok(
     k_yes: float | None = None,
     pm_yes: float | None = None,
 ) -> tuple[bool, str]:
-    """Hard gate. Family + strike/date/outcome + live mids. No fuzzy senate→Brazil."""
+    """Hard gate. Family + calendar + strike/outcome + live mids."""
     tick = str(ticker or "").strip()
     if not tick:
         return False, "ingen ticker"
@@ -527,6 +583,7 @@ def pair_ok(
         return False, f"ulik familie {pf or '—'} vs {tf or '—'} ({tick})"
     if pf != tf:
         return False, f"familie {pf} ≠ {tf} ({tick})"
+    blob_k = f"{tick} {k_title}"
     if pf == "fed":
         want = _fed_want(pm_q)
         suf = _fed_suffix(tick)
@@ -534,25 +591,52 @@ def pair_ok(
             return False, f"ikke KXFED* ({tick})"
         if not want or not suf or want != suf:
             return False, f"fed {suf or '—'} ≠ {want or '—'}"
+        pm_meet = _pm_fed_meeting(pm_q)
+        tick_meet = _meeting_codes(tick)
+        if pm_meet and tick_meet and not (pm_meet & tick_meet):
+            return False, f"ulik møte {'/'.join(sorted(pm_meet))} ≠ {'/'.join(sorted(tick_meet))}"
+    if pf == "us_election":
+        qy = _years(pm_q)
+        ty = _years(tick) | _years(k_title)
+        if qy and ty and not (qy & ty):
+            return False, f"ulikt år {sorted(qy)} ≠ {sorted(ty)}"
     if pf in {"btc", "eth"}:
         q_strike = _strikes(pm_q)
-        k_strike = _strikes(f"{tick} {k_title}")
+        k_strike = _strikes(blob_k)
         if not q_strike:
             return False, "ingen strike i PM"
         if not _strike_close(q_strike, k_strike, 0.02):
             return False, f"strike mismatch {sorted(q_strike)[:3]} vs {sorted(k_strike)[:3]}"
-        qmd, kmd = _md(pm_q), _md(f"{tick} {k_title}")
+        qmd, kmd = _md(pm_q), _md(blob_k)
         if qmd and kmd and not (qmd & kmd):
             return False, "ulik session-dato"
+        if pm_yes is not None:
+            try:
+                py = float(pm_yes)
+            except (TypeError, ValueError):
+                py = None
+            if py is not None and (py >= 0.95 or py <= 0.05):
+                return False, "pm pin ikke kalshi-buy"
+    if pf in {"hormuz", "tweets", "fdv"}:
+        qd, kd = _dates(pm_q), _dates(blob_k)
+        qmd, kmd = _md(pm_q), _md(blob_k)
+        if (qd or qmd) and (kd or kmd):
+            hit = bool(qd and kd and (qd & kd)) or bool(qmd and kmd and (qmd & kmd))
+            if not hit:
+                return False, f"ulik dato {sorted(qd or qmd)[:2]} ≠ {sorted(kd or kmd)[:2]}"
     if k_yes is not None and pm_yes is not None:
         try:
             ky = float(k_yes)
             py = float(pm_yes)
         except (TypeError, ValueError):
             return False, "ugyldig mid"
+        if pf in {"btc", "eth"} and (py >= 0.95 or py <= 0.05):
+            return False, "pm pin ikke kalshi-buy"
         pinned = (ky <= 0.01 or ky >= 0.99) and (py <= 0.01 or py >= 0.99)
         if not pinned and not (0.01 < ky < 0.99 and 0.01 < py < 0.99):
             return False, f"mid utenfor (0.01,0.99) k={ky:.3f} pm={py:.3f}"
+        if pinned and pf in {"btc", "eth"}:
+            return False, "pm pin ikke kalshi-buy"
     return True, ""
 
 
@@ -571,16 +655,44 @@ ILLEGAL_PAIR_FIXTURES: tuple[tuple[str, str, str], ...] = (
     ("Caiado president Brazil", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
 )
 
+CALENDAR_PAIR_FIXTURES: tuple[tuple[str, str, str, float, float], ...] = (
+    (
+        "Will the Fed hold after the September 2026 meeting?",
+        "KXFEDDECISION-28JAN-H0",
+        "Fed hold January",
+        0.55,
+        0.52,
+    ),
+    (
+        "2026 House majority",
+        "KXPRESPARTY-2032-R",
+        "Presidential party 2032",
+        0.40,
+        0.42,
+    ),
+    (
+        "Bitcoin above $76000 on Sep 9",
+        "KXBTC-26SEP0907-T87299",
+        "Bitcoin T87299",
+        0.01,
+        1.00,
+    ),
+)
+
 
 def pair_ok_selfcheck() -> None:
-    """Kill the process if the 12:19 illegal fixtures would still attach."""
+    """Kill the process if illegal fixtures would still attach."""
     bad: list[str] = []
     for q, tick, title in ILLEGAL_PAIR_FIXTURES:
         ok, why = pair_ok(q, tick, title, 0.45, 0.47)
         if ok:
             bad.append(f"{q[:48]} + {tick} ({why})")
+    for q, tick, title, ky, py in CALENDAR_PAIR_FIXTURES:
+        ok, why = pair_ok(q, tick, title, ky, py)
+        if ok:
+            bad.append(f"{q[:48]} + {tick} ({why})")
     legal_ok, legal_why = pair_ok(
-        "Fed hike 25 bps in September",
+        "Fed hike 25 bps after the September 2026 meeting",
         "KXFEDDECISION-26SEP-H25",
         "Fed decision 25bp",
         0.45,
@@ -590,17 +702,17 @@ def pair_ok_selfcheck() -> None:
         raise RuntimeError(f"pair_ok selfcheck: legal Fed H25 rejected ({legal_why})")
     if bad:
         raise RuntimeError("pair_ok selfcheck FAILED, would attach: " + " | ".join(bad))
-    log.info("pair_ok selfcheck ok — %s illegal fixtures blocked", len(ILLEGAL_PAIR_FIXTURES))
+    n = len(ILLEGAL_PAIR_FIXTURES) + len(CALENDAR_PAIR_FIXTURES)
+    log.info("pair_ok selfcheck ok — %s illegal fixtures blocked", n)
 
 
 def keep_fed_h25(pm_q: str, ticker: str) -> bool:
+    """True only if pair_ok including calendar (26SEP on a Sep-2026 question)."""
     tick = str(ticker or "").upper()
-    return (
-        _pm_family(pm_q) == "fed"
-        and "KXFEDDECISION" in tick
-        and _fed_suffix(tick) == "H25"
-        and _fed_want(pm_q) == "H25"
-    )
+    if "KXFEDDECISION" not in tick or _fed_suffix(tick) != "H25":
+        return False
+    ok, _ = pair_ok(pm_q, tick, "", 0.45, 0.47)
+    return ok
 
 
 def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[str], pages: int = 2) -> int:

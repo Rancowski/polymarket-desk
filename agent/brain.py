@@ -66,16 +66,21 @@ class Brain:
 
     def __init__(self) -> None:
         self.last_usage = {"usd": 0.0, "tokens": 0, "model": ""}
+        self.last_skip = ""
 
     def estimate(self, markets: list[dict]) -> dict[str, dict]:
         self.last_usage = {"usd": 0.0, "tokens": 0, "model": ""}
+        self.last_skip = ""
         if not markets:
+            self.last_skip = "filter"
             return {}
         key = (settings.xai_api_key or "").strip()
         if not key:
+            self.last_skip = "timeout/missing key"
             log.warning("XAI_API_KEY mangler — hopper over estimat")
             return {}
         if not key.startswith("xai-"):
+            self.last_skip = "filter"
             log.error("XAI_API_KEY ser feil ut. Hopper over estimat.")
             return {}
         payload_markets = []
@@ -130,11 +135,22 @@ class Brain:
                 used = model
                 self.last_usage = {"usd": usd, "tokens": tokens_n, "model": used}
                 if text:
-                    return self._parse(text, markets)
+                    parsed = self._parse(text, markets)
+                    if not parsed:
+                        self.last_skip = "parse"
+                        log.warning("Grok parse tom for %s navn", len(markets))
+                    return parsed
+                self.last_skip = "parse"
             except Exception as exc:
                 last_err = str(exc)
+                low = last_err.lower()
+                if "timeout" in low or "timed out" in low:
+                    self.last_skip = "timeout"
+                else:
+                    self.last_skip = f"timeout/http {last_err[:80]}"
                 log.warning("xAI %s feilet: %s", model, last_err[:300])
         self.last_usage = {"usd": usd, "tokens": tokens_n, "model": used}
+        self.last_skip = self.last_skip or (f"timeout/http {last_err[:80]}" if last_err else "timeout")
         log.error("Ingen Grok-modell svarte. Siste feil: %s", last_err[:400])
         return {}
 
@@ -174,7 +190,12 @@ class Brain:
         return _response_text(data), cost, tokens
 
     def _parse(self, content: str, markets: list[dict]) -> dict[str, dict]:
-        rows = _extract_json(content)
+        try:
+            rows = _extract_json(content)
+        except Exception:
+            self.last_skip = "parse"
+            log.warning("Grok JSON parse feilet")
+            return {}
         if not isinstance(rows, list):
             rows = [rows] if isinstance(rows, dict) else []
         known = {str(m.get("condition_id")): m for m in markets}

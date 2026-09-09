@@ -619,31 +619,9 @@ class Risk:
             return None, "sports ekstrem-pris"
         event = market.get("event_key") or market["condition_id"]
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
-        same_side = [p for p in same_cid if str(p.get("side") or "").upper() == side]
-        hedge = bool(same_cid) and not same_side
-        reup = False
-        if same_side:
-            if sports:
-                return None, "ingen påfyll sports"
-            held = same_side[0]
-            held_cost = float(held.get("shares") or 0) * float(held.get("avg_cost") or 0)
-            upnl = _row_upnl(held)
-            ks = market.get("kalshi") or {}
-            k_yes = float(ks.get("yes") or 0)
-            named = bool(ks.get("ticker"))
-            kalshi_add = (
-                named
-                and side == "YES"
-                and 0.20 <= cost <= 0.80
-                and k_yes >= cost + 0.05
-            )
-            if kalshi_add:
-                reup = True
-            elif held_cost <= 0 or upnl < REUP_MIN_PNL * held_cost:
-                return None, "aldri average down"
-            else:
-                reup = True
-        if len(open_pos) >= settings.max_open_positions and not hedge and not reup:
+        if same_cid:
+            return None, "aldri average down"
+        if len(open_pos) >= settings.max_open_positions:
             return None, "max 10 åpne (kun hedge/påfyll)"
         sports_pos = [p for p in open_pos if is_sports(p)]
         if sports and len(sports_pos) >= MAX_SPORTS:
