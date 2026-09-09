@@ -129,6 +129,7 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
         except (TypeError, ValueError):
             mtm = None
         upnl = round(mtm - cost, 2) if mtm is not None else None
+        upnl_pct = round(upnl / cost, 4) if upnl is not None and cost > 0 else None
         q = (p.get("question") or "")[:80]
         cid = p.get("condition_id")
         hint = hints.get(f"{cid}:{p.get('side') or ''}") or hints.get(q) or {}
@@ -143,6 +144,7 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
                 "current_value": mtm,
                 "cost": round(cost, 2),
                 "upnl": upnl,
+                "upnl_pct": upnl_pct,
                 "category": p.get("category"),
                 "opened_ts": p.get("opened_ts"),
                 "last_ts": p.get("last_ts"),
@@ -151,6 +153,8 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
                 "kalshi_ticker": (kalshi_by.get(str(cid or "")) or {}).get("ticker"),
                 "kalshi_yes": (kalshi_by.get(str(cid or "")) or {}).get("kalshi"),
                 "kalshi_gap": (kalshi_by.get(str(cid or "")) or {}).get("gap"),
+                "entry_source": p.get("entry_source"),
+                "entry_detail": p.get("entry_detail"),
             }
         )
     return out
@@ -186,7 +190,14 @@ def _state() -> dict[str, Any]:
     spent = float((st or {}).get("xai_total") or 0)
     prepaid = float((st or {}).get("xai_prepaid") or 0)
     remaining = max(0.0, prepaid - spent) if prepaid > 0 else _xai_remaining(spent)
-    fills = desk.store.recent_fills(30, real_only=not settings.dry_run) if desk else []
+    fills = desk.store.recent_fills(40, real_only=not settings.dry_run) if desk else []
+    attr = {}
+    if desk:
+        try:
+            attr = desk.store.attribution_stats(open_pos)
+        except Exception as exc:
+            log.exception("attribution_stats: %s", exc)
+            attr = {}
     return {
         "dry_run": settings.dry_run,
         "halted": halt,
@@ -207,6 +218,7 @@ def _state() -> dict[str, Any]:
         "fills": fills,
         "equity_history": desk.store.equity_history(120) if desk else [],
         "stats": st,
+        "attribution": attr,
         "xai_remaining": remaining,
         "auth_required": bool(settings.dashboard_token),
         "rules": {

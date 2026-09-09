@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from typing import Any
 
 from agent.arb import Arb
 from agent.brain import Brain
@@ -24,6 +25,14 @@ from agent.store import Store
 
 log = logging.getLogger("desk")
 GROK_BATCH_N = 15
+REJECT_KEYS = (
+    "confidence=low",
+    "edge_net",
+    "cs_live",
+    "mid_extreme",
+    "short_horizon",
+    "near-res",
+)
 _ESPORT_TITLE = (
     "counter-strike", "counter strike", "cs2", "cs 2", " cs ",
     "dota", "league of legends", "league-of-legends", "valorant",
@@ -111,6 +120,9 @@ class Desk:
         self.last_error: str | None = None
         self.last_cycle: dict | None = None
         self._cycle_i = 0
+        self._cycle_id = ""
+        self._bought = 0
+        self._reject_counts = {k: 0 for k in REJECT_KEYS}
         threading.Thread(target=self._bootstrap_portfolio, daemon=True, name="desk-boot").start()
 
     def begin_cycle_async(self) -> bool:
@@ -312,6 +324,61 @@ class Desk:
             return (time.time() - float(raw)) < 1800
         except (TypeError, ValueError):
             return False
+
+    def _reject_bucket(self, reason: str) -> str | None:
+        r = (reason or "").lower()
+        if reason in self._reject_counts:
+            return reason
+        if "confidence=low" in r:
+            return "confidence=low"
+        if "edge_net" in r:
+            return "edge_net"
+        if "cs_live" in r:
+            return "cs_live"
+        if "mid_extreme" in r:
+            return "mid_extreme"
+        if "short_horizon" in r:
+            return "short_horizon"
+        if "nær resolusjon" in r or "near-res" in r or "nær avgjort" in r:
+            return "near-res"
+        return None
+
+    def _bump_reject(self, reason: str) -> None:
+        bucket = self._reject_bucket(reason)
+        if bucket:
+            self._reject_counts[bucket] = self._reject_counts.get(bucket, 0) + 1
+
+    def _finish_cycle(self, **kwargs: Any) -> dict:
+        sold = kwargs.get("sold")
+        if sold is None:
+            sold = kwargs.get("exits", 0)
+        base = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "halted": False,
+            "scanned": 0,
+            "estimated": 0,
+            "grok": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "arb": 0,
+            "kalshi": 0,
+            "kalshi_log": [],
+            "xai_usd": 0.0,
+            "exits": 0,
+            "exit_log": [],
+            "bought": self._bought,
+            "sold": sold,
+            "redeem_ok": 0,
+            "reject_counts": dict(self._reject_counts),
+            "cycle_id": self._cycle_id,
+            "bankroll": 0,
+            "equity": 0,
+        }
+        base.update(kwargs)
+        if "sold" not in kwargs:
+            base["sold"] = sold
+        self.last_cycle = base
+        return base
 
     def _run_redeems(self, open_pos: list, by_id: dict) -> tuple[int, list]:
         """CTF redeem winners before any FAK. Losers close locally. Once per condition_id."""
@@ -655,6 +722,10 @@ class Desk:
     def _cycle(self) -> dict:
         halt = self.risk.halted()
         self.last_error = None
+        self._cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.store.set_meta("cycle_id", self._cycle_id)
+        self._bought = 0
+        self._reject_counts = {k: 0 for k in REJECT_KEYS}
         bankroll, equity, open_pos = self._refresh_portfolio()
         from agent.kalshi import compare as kalshi_compare, fetch_open as kalshi_fetch
         kalshi_rows: list = []
@@ -678,28 +749,31 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi (åpne): %s", exc)
         self._log_kalshi(kalshi_log)
-        exits, exit_log = self._run_exits(open_pos, {}, by_open, equity=equity)
+        sold_n, exit_log = self._run_exits(open_pos, {}, by_open, equity=equity)
         exit_log = redeem_log + exit_log
-        exits = redeems + exits
+        exits = redeems + sold_n
         open_pos = self.store.positions("open")
+        n_redeem_ok = sum(1 for r in redeem_log if r.get("action") == "redeem_ok")
         if halt:
             log.warning("Stoppet: %s", halt)
-            self.last_cycle = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "halted": True,
-                "scanned": 0,
-                "estimated": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "kalshi": len(kalshi_log),
-                "kalshi_log": kalshi_log,
-                "xai_usd": 0.0,
-                "exits": exits,
-                "exit_log": exit_log,
-                "reason": halt,
-                "bankroll": bankroll,
-                "equity": equity,
-            }
+            self._finish_cycle(
+                halted=True,
+                scanned=0,
+                estimated=0,
+                grok=0,
+                accepted=0,
+                rejected=0,
+                kalshi=len(kalshi_log),
+                kalshi_log=kalshi_log,
+                xai_usd=0.0,
+                exits=exits,
+                sold=sold_n,
+                redeem_ok=n_redeem_ok,
+                exit_log=exit_log,
+                reason=halt,
+                bankroll=bankroll,
+                equity=equity,
+            )
             return {"ok": True, "halted": True}
 
         self._cycle_i += 1
@@ -747,6 +821,7 @@ class Desk:
                 )
                 if result.get("status") in {"live", "paper"}:
                     bankroll = max(0.0, bankroll - ticket.size_usd)
+                    self._bought += 1
                 if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
                     pending_hedge = ticket if pending_hedge is None else None
                 else:
@@ -766,6 +841,8 @@ class Desk:
                                 "limit_price": max(0.01, pending_hedge.best_bid or pending_hedge.limit_price),
                                 "size_usd": pending_hedge.size_usd,
                                 "reason": "hedge-rollback",
+                                "source": "flatten",
+                                "source_detail": "hedge-rollback",
                             }
                         )
                     except Exception:
@@ -797,6 +874,7 @@ class Desk:
             why = _grok_drop_reason(m)
             if why:
                 if logged_drop < GROK_BATCH_N:
+                    self._bump_reject(why)
                     self.store.log_decision(
                         condition_id=m.get("condition_id"),
                         question=m.get("question"),
@@ -834,23 +912,23 @@ class Desk:
         batch = batch[:GROK_BATCH_N]
         if not batch:
             log.info("Ingen markeder passerte filter")
-            self.last_cycle = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "halted": False,
-                "scanned": len(markets),
-                "estimated": 0,
-                "grok": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "exits": exits,
-                "exit_log": exit_log,
-                "arb": arb_n,
-                "kalshi": kalshi_n,
-                "kalshi_log": kalshi_log,
-                "bankroll": bankroll,
-                "equity": equity,
-                "xai_usd": 0.0,
-            }
+            self._finish_cycle(
+                scanned=len(markets),
+                estimated=0,
+                grok=0,
+                accepted=0,
+                rejected=0,
+                exits=exits,
+                sold=sold_n,
+                redeem_ok=n_redeem_ok,
+                exit_log=exit_log,
+                arb=arb_n,
+                kalshi=kalshi_n,
+                kalshi_log=kalshi_log,
+                bankroll=bankroll,
+                equity=equity,
+                xai_usd=0.0,
+            )
             return {"ok": True, "scanned": 0}
 
         for m in batch:
@@ -909,29 +987,31 @@ class Desk:
         except Exception as exc:
             log.exception("Brain krasjet: %s", exc)
             self.last_error = str(exc)
-            self.last_cycle = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "halted": False,
-                "scanned": len(markets),
-                "estimated": 0,
-                "accepted": 0,
-                "arb": arb_n,
-                "kalshi": kalshi_n,
-                "kalshi_log": kalshi_log,
-                "rejected": 0,
-                "exits": exits,
-                "exit_log": exit_log,
-                "xai_usd": round(xai_cycle, 4),
-                "bankroll": bankroll,
-                "equity": equity,
-                "reason": str(exc),
-            }
+            self._finish_cycle(
+                scanned=len(markets),
+                estimated=0,
+                grok=0,
+                accepted=0,
+                arb=arb_n,
+                kalshi=kalshi_n,
+                kalshi_log=kalshi_log,
+                rejected=0,
+                exits=exits,
+                sold=sold_n,
+                redeem_ok=n_redeem_ok,
+                exit_log=exit_log,
+                xai_usd=round(xai_cycle, 4),
+                bankroll=bankroll,
+                equity=equity,
+                reason=str(exc),
+            )
             return {"ok": False, "reason": str(exc), **self.last_cycle}
 
         open_pos = self.store.positions("open")
         if estimates:
             more, log2 = self._run_exits(open_pos, estimates, by_id, equity=equity)
             exits += more
+            sold_n += more
             exit_log.extend(log2)
             open_pos = self.store.positions("open")
         locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
@@ -967,6 +1047,7 @@ class Desk:
             ticket, reason = self.risk.evaluate(m, book, est, bankroll, equity)
             if not ticket:
                 rejected += 1
+                self._bump_reject(reason)
                 self.store.log_decision(
                     condition_id=m["condition_id"],
                     question=m["question"],
@@ -995,6 +1076,7 @@ class Desk:
                     bankroll = max(0.0, bankroll - ticket.size_usd)
                     equity = bankroll + locked + ticket.size_usd
                     locked += ticket.size_usd
+                    self._bought += 1
             except Exception as exc:
                 log.exception("Ordre feilet")
                 self.last_error = str(exc)
@@ -1010,23 +1092,23 @@ class Desk:
         except Exception:
             pass
         log.info("Syklus ferdig. Grok-tickets: %s arb: %s kalshi: %s exits: %s", accepted, arb_n, kalshi_n, exits)
-        self.last_cycle = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "halted": False,
-            "scanned": len(markets),
-            "estimated": len(estimates),
-            "grok": len(estimates),
-            "accepted": accepted,
-            "arb": arb_n,
-            "kalshi": kalshi_n,
-            "kalshi_log": kalshi_log,
-            "rejected": rejected,
-            "exits": exits,
-            "exit_log": exit_log,
-            "xai_usd": round(xai_cycle, 4),
-            "bankroll": bankroll,
-            "equity": equity,
-        }
+        self._finish_cycle(
+            scanned=len(markets),
+            estimated=len(estimates),
+            grok=len(estimates),
+            accepted=accepted,
+            arb=arb_n,
+            kalshi=kalshi_n,
+            kalshi_log=kalshi_log,
+            rejected=rejected,
+            exits=exits,
+            sold=sold_n,
+            redeem_ok=n_redeem_ok,
+            exit_log=exit_log,
+            xai_usd=round(xai_cycle, 4),
+            bankroll=bankroll,
+            equity=equity,
+        )
         return {"ok": True, **self.last_cycle}
 
     def run_forever(self) -> None:

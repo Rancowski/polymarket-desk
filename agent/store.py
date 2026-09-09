@@ -10,8 +10,103 @@ from typing import Any
 from agent.config import settings
 
 
+VALID_SOURCES = frozenset(
+    {
+        "grok",
+        "kalshi",
+        "complement",
+        "tape",
+        "exit_stop",
+        "exit_take",
+        "exit_trail",
+        "exit_kalshi",
+        "redeem",
+        "flatten",
+    }
+)
+
+_SIDE_MAP = {
+    "YES": "BUY_YES",
+    "NO": "BUY_NO",
+    "BUY": "BUY_YES",
+    "BUY_YES": "BUY_YES",
+    "BUY_NO": "BUY_NO",
+    "SELL": "SELL_YES",
+    "SELL_YES": "SELL_YES",
+    "SELL_NO": "SELL_NO",
+    "REDEEM": "REDEEM",
+    "REDEEM_YES": "REDEEM",
+    "REDEEM_NO": "REDEEM",
+}
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_side(side: Any) -> str:
+    s = str(side or "").upper().replace(" ", "_")
+    return _SIDE_MAP.get(s, s)
+
+
+def normalize_source(src: Any) -> str | None:
+    if src is None:
+        return None
+    s = str(src).strip().lower()
+    if not s or s in {"ukjent", "unknown", "none", "null"}:
+        return None
+    return s if s in VALID_SOURCES else None
+
+
+def _raw_dict(raw: Any) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {"_text": raw}
+    return {}
+
+
+def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
+    """Evidence from raw/thesis only. Never invent grok."""
+    data = _raw_dict(raw)
+    thesis = str(
+        data.get("source_detail") or data.get("thesis") or data.get("reason") or ""
+    ).strip()[:160]
+    explicit = normalize_source(data.get("source"))
+    su = normalize_side(side)
+    if explicit:
+        return explicit, thesis or None
+    low = thesis.lower()
+    if su == "REDEEM" or data.get("redeem"):
+        return "redeem", thesis or "redeem_ok"
+    sell = su.startswith("SELL")
+    if sell:
+        if "kalshi" in low:
+            return "exit_kalshi", thesis or None
+        if "trail" in low:
+            return "exit_trail", thesis or None
+        if "stopp" in low or "stop-tap" in low or "kamp >3t" in low:
+            return "exit_stop", thesis or None
+        if "ta gevinst" in low or low.startswith("ta ") or " ≥0.98" in low:
+            return "exit_take", thesis or None
+        if "flatten" in low or "hedge-rollback" in low or "død sports" in low or "trim" in low:
+            return "flatten", thesis or None
+        return None, thesis or None
+    if "sum-til-én" in low or "event-sett" in low:
+        return "complement", thesis or None
+    if "låst utfall" in low:
+        return "tape", thesis or None
+    if "kalshi-bekreftelse" in low:
+        return "kalshi", thesis or None
+    if " | kalshi " in low or low.startswith("grok ") or "edge_net=" in low:
+        return "grok", thesis or None
+    if "kalshi" in low:
+        return "kalshi", thesis or None
+    return None, thesis or None
 
 
 class Store:
@@ -89,6 +184,9 @@ class Store:
             self._ensure_column("positions", "current_value", "REAL")
             self._ensure_column("positions", "cur_price", "REAL")
             self._ensure_column("positions", "outcome", "TEXT")
+            self._ensure_column("positions", "entry_source", "TEXT")
+            self._ensure_column("positions", "entry_detail", "TEXT")
+            self._migrate_fills()
             self._purge_ghost_fills()
 
     def _migrate_positions(self) -> None:
@@ -132,6 +230,96 @@ class Store:
         if col not in names:
             self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             self.conn.commit()
+
+    def _migrate_fills(self) -> None:
+        for col, decl in (
+            ("question", "TEXT"),
+            ("token_id", "TEXT"),
+            ("source", "TEXT"),
+            ("source_detail", "TEXT"),
+            ("grok_p", "REAL"),
+            ("grok_conf", "TEXT"),
+            ("edge_net", "REAL"),
+            ("kalshi_ticker", "TEXT"),
+            ("kalshi_mid", "REAL"),
+            ("pm_mid", "REAL"),
+            ("gap_c", "REAL"),
+            ("cycle_id", "TEXT"),
+        ):
+            self._ensure_column("fills", col, decl)
+        self._backfill_fill_attribution()
+        self._backfill_position_entry()
+
+    def _backfill_fill_attribution(self) -> None:
+        try:
+            cur = self.conn.execute(
+                "SELECT id, side, raw, source, source_detail, question, token_id FROM fills"
+            )
+            for row in cur.fetchall():
+                src = normalize_source(row["source"])
+                detail = (row["source_detail"] or "").strip() or None
+                question = (row["question"] or "").strip() or None
+                token = (row["token_id"] or "").strip() or None
+                data = _raw_dict(row["raw"])
+                inf, inf_detail = infer_fill_source(row["side"], data)
+                if not src:
+                    src = inf
+                if not detail:
+                    detail = inf_detail
+                if not question:
+                    q = data.get("question")
+                    question = str(q).strip() if q else None
+                if not token:
+                    t = data.get("token_id")
+                    token = str(t).strip() if t else None
+                if src or detail or question or token:
+                    self.conn.execute(
+                        """
+                        UPDATE fills SET
+                            source=COALESCE(NULLIF(source,''), ?),
+                            source_detail=COALESCE(NULLIF(source_detail,''), ?),
+                            question=COALESCE(NULLIF(question,''), ?),
+                            token_id=COALESCE(NULLIF(token_id,''), ?)
+                        WHERE id=?
+                        """,
+                        (src, detail, question, token, row["id"]),
+                    )
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def _backfill_position_entry(self) -> None:
+        try:
+            cur = self.conn.execute(
+                """
+                SELECT condition_id, side, source, source_detail
+                FROM fills
+                WHERE source IS NOT NULL AND source != ''
+                ORDER BY id ASC
+                """
+            )
+            first: dict[tuple[str, str], tuple[str, str | None]] = {}
+            for row in cur.fetchall():
+                su = normalize_side(row["side"])
+                if not su.startswith("BUY_"):
+                    continue
+                yn = su[4:] or "YES"
+                key = (str(row["condition_id"] or ""), yn)
+                if key[0] and key not in first:
+                    first[key] = (str(row["source"]), row["source_detail"])
+            for (cid, side), (src, detail) in first.items():
+                self.conn.execute(
+                    """
+                    UPDATE positions SET
+                        entry_source=COALESCE(NULLIF(entry_source,''), ?),
+                        entry_detail=COALESCE(NULLIF(entry_detail,''), ?)
+                    WHERE condition_id=? AND UPPER(COALESCE(side,'YES'))=?
+                    """,
+                    (src, detail, cid, side),
+                )
+            self.conn.commit()
+        except Exception:
+            pass
 
     def _raw_is_matched(self, raw: Any) -> bool:
         data: Any = raw
@@ -236,8 +424,8 @@ class Store:
         with self._lock:
             self.conn.execute(
                 """
-                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, current_value, cur_price, outcome, opened_ts, last_ts, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO positions (condition_id, question, category, event_key, side, token_id, shares, avg_cost, current_value, cur_price, outcome, opened_ts, last_ts, status, entry_source, entry_detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id, side) DO UPDATE SET
                     shares=excluded.shares,
                     avg_cost=excluded.avg_cost,
@@ -248,7 +436,9 @@ class Store:
                     status=excluded.status,
                     token_id=excluded.token_id,
                     question=COALESCE(excluded.question, positions.question),
-                    category=COALESCE(excluded.category, positions.category)
+                    category=COALESCE(excluded.category, positions.category),
+                    entry_source=COALESCE(NULLIF(positions.entry_source,''), excluded.entry_source),
+                    entry_detail=COALESCE(NULLIF(positions.entry_detail,''), excluded.entry_detail)
                 """,
                 (
                     row["condition_id"],
@@ -265,6 +455,8 @@ class Store:
                     row.get("opened_ts", utc_now()),
                     utc_now(),
                     row.get("status", "open"),
+                    row.get("entry_source"),
+                    row.get("entry_detail"),
                 ),
             )
             self.conn.commit()
@@ -313,21 +505,61 @@ class Store:
         self.set_meta(self._dust_key(condition_id, side), "")
 
     def add_fill(self, **row: Any) -> None:
+        raw = row.get("raw", {})
+        data = _raw_dict(raw)
+        side = normalize_side(row.get("side"))
+        src = normalize_source(row.get("source") if row.get("source") is not None else data.get("source"))
+        detail = row.get("source_detail")
+        if detail is None:
+            detail = data.get("source_detail") or data.get("thesis") or data.get("reason")
+        if detail is not None:
+            detail = str(detail).strip()[:160] or None
+        if not src:
+            inf, inf_detail = infer_fill_source(side, {**data, "source": src, "source_detail": detail})
+            src = inf
+            if not detail:
+                detail = inf_detail
+        question = row.get("question") or data.get("question")
+        token_id = row.get("token_id") or data.get("token_id")
+        grok_p = row.get("grok_p") if "grok_p" in row else data.get("grok_p")
+        grok_conf = row.get("grok_conf") if "grok_conf" in row else data.get("grok_conf")
+        edge_net = row.get("edge_net") if "edge_net" in row else data.get("edge_net")
+        kalshi_ticker = row.get("kalshi_ticker") if "kalshi_ticker" in row else data.get("kalshi_ticker")
+        kalshi_mid = row.get("kalshi_mid") if "kalshi_mid" in row else data.get("kalshi_mid")
+        pm_mid = row.get("pm_mid") if "pm_mid" in row else data.get("pm_mid")
+        gap_c = row.get("gap_c") if "gap_c" in row else data.get("gap_c")
+        cycle_id = row.get("cycle_id") if row.get("cycle_id") is not None else data.get("cycle_id")
         with self._lock:
             self.conn.execute(
                 """
-                INSERT INTO fills (ts, condition_id, side, price, size, cost, dry_run, raw)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO fills (
+                    ts, condition_id, question, token_id, side, price, size, cost, dry_run, raw,
+                    source, source_detail, grok_p, grok_conf, edge_net,
+                    kalshi_ticker, kalshi_mid, pm_mid, gap_c, cycle_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now(),
                     row.get("condition_id"),
-                    row.get("side"),
+                    question,
+                    token_id,
+                    side,
                     row.get("price"),
                     row.get("size"),
                     row.get("cost"),
                     1 if row.get("dry_run") else 0,
-                    json.dumps(row.get("raw", {}), default=str),
+                    json.dumps(raw if raw is not None else {}, default=str),
+                    src,
+                    detail,
+                    grok_p,
+                    grok_conf,
+                    edge_net,
+                    kalshi_ticker,
+                    kalshi_mid,
+                    pm_mid,
+                    gap_c,
+                    cycle_id,
                 ),
             )
             self.conn.commit()
@@ -376,31 +608,49 @@ class Store:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def _decorate_fill(self, row: dict) -> dict:
+        raw = row.get("raw")
+        src = normalize_source(row.get("source"))
+        detail = (row.get("source_detail") or "").strip() or None
+        if not src or not detail:
+            inf, inf_detail = infer_fill_source(row.get("side"), raw)
+            if not src:
+                src = inf
+            if not detail:
+                detail = inf_detail
+        if not row.get("question"):
+            q = _raw_dict(raw).get("question")
+            if q:
+                row["question"] = q
+        row["side"] = normalize_side(row.get("side"))
+        row["source"] = src
+        row["source_detail"] = detail
+        row.pop("raw", None)
+        return row
+
     def recent_fills(self, limit: int = 40, real_only: bool = False) -> list[dict]:
         with self._lock:
             cur = self.conn.execute(
                 """
-                SELECT ts, condition_id, side, price, size, cost, dry_run, raw
+                SELECT ts, condition_id, question, token_id, side, price, size, cost, dry_run, raw,
+                       source, source_detail, grok_p, grok_conf, edge_net,
+                       kalshi_ticker, kalshi_mid, pm_mid, gap_c, cycle_id
                 FROM fills ORDER BY id DESC LIMIT ?
                 """,
                 (max(limit * 4, 80) if real_only else limit,),
             )
             rows = [dict(r) for r in cur.fetchall()]
-        if real_only:
-            out = []
-            for row in rows:
+        out: list[dict] = []
+        for row in rows:
+            if real_only:
                 if int(row.get("dry_run") or 0) == 1:
                     continue
                 if not self._raw_is_matched(row.get("raw")):
                     continue
-                row.pop("raw", None)
-                out.append(row)
-                if len(out) >= limit:
-                    break
-            return out
-        for row in rows:
-            row.pop("raw", None)
-        return rows[:limit]
+            out.append(self._decorate_fill(row))
+            if len(out) >= limit:
+                break
+        return out
 
     def equity_history(self, limit: int = 60) -> list[dict]:
         with self._lock:
@@ -705,4 +955,215 @@ class Store:
             counts[reason] = counts.get(reason, 0) + 1
         ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
         return [{"reason": k, "n": v} for k, v in ranked]
+
+    def _matched_fills(self) -> list[dict]:
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT ts, condition_id, question, token_id, side, price, size, cost, dry_run, raw,
+                       source, source_detail, grok_p, grok_conf, edge_net,
+                       kalshi_ticker, kalshi_mid, pm_mid, gap_c, cycle_id
+                FROM fills ORDER BY id ASC
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        out: list[dict] = []
+        for row in rows:
+            if int(row.get("dry_run") or 0) == 1:
+                continue
+            if not self._raw_is_matched(row.get("raw")):
+                continue
+            out.append(self._decorate_fill(row))
+        return out
+
+    def attribution_stats(self, open_pos: list[dict] | None = None) -> dict:
+        open_pos = open_pos if open_pos is not None else self.positions("open")
+        deposited = self.deposited_usd(0.0)
+        open_cost = sum(self.position_cost(p) for p in open_pos)
+        open_mtm = sum(self.position_mtm(p) for p in open_pos)
+        unrealized = open_mtm - open_cost
+        seats = len(open_pos)
+        open_pct = (open_cost / deposited) if deposited >= 1 else 0.0
+        fills = self._matched_fills()
+        now = datetime.now(timezone.utc)
+        groups: dict[tuple[str, str], dict] = {}
+
+        def _parse_ts(raw: Any) -> datetime | None:
+            try:
+                ts = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return ts
+            except ValueError:
+                return None
+
+        def _leg(side: Any) -> tuple[str, str]:
+            s = normalize_side(side)
+            if s == "REDEEM":
+                return "redeem", "YES"
+            if s.startswith("SELL_"):
+                return "sell", s[5:] or "YES"
+            if s.startswith("BUY_"):
+                return "buy", s[4:] or "YES"
+            return "buy", s or "YES"
+
+        def _src_bucket(src: Any) -> str | None:
+            s = str(src or "").lower()
+            if s in {"grok", "kalshi", "complement"}:
+                return s
+            if s in {"exit_stop", "exit_take", "exit_trail", "exit_kalshi", "flatten"}:
+                return "exits"
+            return None
+
+        for f in fills:
+            cid = str(f.get("condition_id") or "")
+            direction, yn = _leg(f.get("side"))
+            key = (cid, yn)
+            g = groups.setdefault(
+                key,
+                {
+                    "buy_cost": 0.0,
+                    "buy_n": 0,
+                    "sell_proceeds": 0.0,
+                    "sell_n": 0,
+                    "first_ts": None,
+                    "last_ts": None,
+                    "entry_source": None,
+                    "via_sell": False,
+                    "via_redeem": False,
+                },
+            )
+            ts = _parse_ts(f.get("ts"))
+            if ts and (g["first_ts"] is None or ts < g["first_ts"]):
+                g["first_ts"] = ts
+            if ts and (g["last_ts"] is None or ts > g["last_ts"]):
+                g["last_ts"] = ts
+            try:
+                cost = float(f.get("cost") or 0)
+            except (TypeError, ValueError):
+                cost = 0.0
+            src = f.get("source")
+            if direction == "buy":
+                g["buy_cost"] += cost
+                g["buy_n"] += 1
+                if not g["entry_source"] and _src_bucket(src) in {"grok", "kalshi", "complement"}:
+                    g["entry_source"] = src
+            elif direction == "redeem":
+                g["sell_proceeds"] += cost
+                g["sell_n"] += 1
+                g["via_redeem"] = True
+            else:
+                g["sell_proceeds"] += cost
+                g["sell_n"] += 1
+                g["via_sell"] = True
+
+        open_keys = {
+            (str(p.get("condition_id")), str(p.get("side") or "YES").upper()) for p in open_pos
+        }
+        closed: list[dict] = []
+        for key, g in groups.items():
+            if key in open_keys:
+                continue
+            if g["sell_n"] <= 0 and not g["via_redeem"]:
+                continue
+            realized = g["sell_proceeds"] - g["buy_cost"]
+            hold_h = None
+            if g["first_ts"] and g["last_ts"]:
+                hold_h = (g["last_ts"] - g["first_ts"]).total_seconds() / 3600.0
+            closed.append(
+                {
+                    "realized": realized,
+                    "hold_h": hold_h,
+                    "close_ts": g["last_ts"],
+                    "entry_source": g["entry_source"],
+                    "via_sell": g["via_sell"],
+                }
+            )
+
+        def _window(hours: float | None) -> dict:
+            rows = closed
+            if hours is not None:
+                cutoff = now.timestamp() - hours * 3600
+                rows = [
+                    r
+                    for r in rows
+                    if r["close_ts"] is not None and r["close_ts"].timestamp() >= cutoff
+                ]
+            n = len(rows)
+            pnl = sum(float(r["realized"]) for r in rows)
+            wins = [r for r in rows if r["realized"] > 0.004]
+            losses = [r for r in rows if r["realized"] < -0.004]
+            holds = [r["hold_h"] for r in rows if r["hold_h"] is not None]
+            return {
+                "n": n,
+                "realized": round(pnl, 2),
+                "n_win": len(wins),
+                "n_loss": len(losses),
+                "usd_win": round(sum(r["realized"] for r in wins), 2),
+                "usd_loss": round(sum(r["realized"] for r in losses), 2),
+                "win_pct": round(len(wins) / n, 4) if n else 0.0,
+                "expectancy": round(pnl / n, 4) if n else 0.0,
+                "avg_hold_h": round(sum(holds) / len(holds), 2) if holds else None,
+            }
+
+        all_s = _window(None)
+        d24 = _window(24)
+        d7 = _window(24 * 7)
+        by_source = {
+            k: {"n": 0, "bought": 0.0, "realized": 0.0}
+            for k in ("grok", "kalshi", "complement", "exits")
+        }
+        for f in fills:
+            direction, _yn = _leg(f.get("side"))
+            bucket = _src_bucket(f.get("source"))
+            if not bucket:
+                continue
+            try:
+                cost = float(f.get("cost") or 0)
+            except (TypeError, ValueError):
+                cost = 0.0
+            if direction == "buy" and bucket != "exits":
+                by_source[bucket]["n"] += 1
+                by_source[bucket]["bought"] += cost
+            elif direction != "buy" and bucket == "exits":
+                by_source["exits"]["n"] += 1
+                by_source["exits"]["bought"] += cost
+        for r in closed:
+            b = _src_bucket(r.get("entry_source"))
+            if b in {"grok", "kalshi", "complement"}:
+                by_source[b]["realized"] += r["realized"]
+            if r.get("via_sell"):
+                by_source["exits"]["realized"] += r["realized"]
+        for k, v in by_source.items():
+            v["bought"] = round(v["bought"], 2)
+            v["realized"] = round(v["realized"], 2)
+        return {
+            "realized": all_s["realized"],
+            "realized_24h": d24["realized"],
+            "realized_7d": d7["realized"],
+            "unrealized": round(unrealized, 2),
+            "win_rate": {
+                "n_win": all_s["n_win"],
+                "n_closed": all_s["n"],
+                "pct": all_s["win_pct"],
+                "usd_win": all_s["usd_win"],
+                "usd_loss": all_s["usd_loss"],
+                "n_win_24h": d24["n_win"],
+                "n_closed_24h": d24["n"],
+                "n_win_7d": d7["n_win"],
+                "n_closed_7d": d7["n"],
+            },
+            "expectancy": all_s["expectancy"],
+            "expectancy_24h": d24["expectancy"],
+            "expectancy_7d": d7["expectancy"],
+            "by_source": by_source,
+            "avg_hold_h": all_s["avg_hold_h"],
+            "open_risk": {
+                "usd": round(open_cost, 2),
+                "pct": round(open_pct, 4),
+                "seats": seats,
+                "mtm": round(open_mtm, 2),
+            },
+            "deposited": round(deposited, 2) if deposited >= 1 else 0.0,
+        }
 

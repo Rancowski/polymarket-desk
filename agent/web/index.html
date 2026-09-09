@@ -71,6 +71,20 @@
     .cap label { display: block; color: var(--muted); font-size: .75rem; margin-bottom: .25rem; }
     .cap input { min-height: 44px; width: 100%; border-radius: .6rem; border: 1px solid var(--border);
       background: var(--raised); color: var(--fg); padding: 0 .7rem; }
+    .badge { display: inline-block; font-family: "IBM Plex Mono", monospace; font-size: .62rem;
+      letter-spacing: .04em; padding: .12rem .45rem; border-radius: 999px; vertical-align: middle; }
+    .b-grok { background: #16324f; color: #8ec8ff; }
+    .b-kalshi { background: #3f3010; color: #f0c674; }
+    .b-complement { background: #0f3d3a; color: #6ee7d8; }
+    .b-tape { background: #2a2438; color: #c4b5fd; }
+    .b-exit { background: #4a2030; color: #f9a8c4; }
+    .b-redeem { background: #143d2e; color: #6ee7b7; }
+    .b-ukjent { background: var(--raised); color: var(--muted); }
+    .rej { display: flex; flex-wrap: wrap; gap: .3rem; margin: .35rem 0 .15rem; }
+    .rej .chip { font-family: "IBM Plex Mono", monospace; font-size: .65rem; border: 1px solid var(--border);
+      border-radius: 999px; padding: .2rem .5rem; color: var(--muted); }
+    .rej .chip.on { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, transparent); }
+    .thesis { font-size: .75rem; color: var(--muted); margin-top: .2rem; line-height: 1.4; }
   </style>
 </head>
 <body>
@@ -98,6 +112,10 @@
     <h2>Posisjoner</h2>
     <div id="positions"></div>
     <p class="cycle" id="cycle"></p>
+    <div class="rej" id="rejects"></div>
+    <h2>Kjøp / attribution</h2>
+    <div class="grid4" id="attr"></div>
+    <div class="strip" id="attrSrc"></div>
     <div class="tabs">
       <button class="active" data-tab="log" type="button">Logg</button>
       <button data-tab="fill" type="button">Fills</button>
@@ -129,6 +147,25 @@
       if (!iso) return "—";
       const d = new Date(iso);
       return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("nb-NO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+    };
+    const badge = (src) => {
+      const s = String(src || "ukjent").toLowerCase();
+      let cls = "b-ukjent";
+      if (s === "grok") cls = "b-grok";
+      else if (s === "kalshi") cls = "b-kalshi";
+      else if (s === "complement") cls = "b-complement";
+      else if (s === "tape") cls = "b-tape";
+      else if (s === "redeem") cls = "b-redeem";
+      else if (s.indexOf("exit") === 0 || s === "flatten") cls = "b-exit";
+      const label = s || "ukjent";
+      return `<span class="badge ${cls}">${label}</span>`;
+    };
+    const hoursLabel = (h) => {
+      if (h == null || !Number.isFinite(Number(h))) return "—";
+      const n = Number(h);
+      if (n < 1) return `${Math.round(n * 60)} min`;
+      if (n < 48) return `${n.toFixed(1)} t`;
+      return `${(n / 24).toFixed(1)} d`;
     };
     const age = (iso) => {
       if (!iso) return "";
@@ -228,23 +265,71 @@
         const kline = p.kalshi_ticker && Number.isFinite(ky) && ky > 0 && kg != null && Number.isFinite(Number(kg))
           ? `<div class="meta">Kalshi ${p.kalshi_ticker} ${ky.toFixed(2)} vs PM gap ${Number(kg) >= 0 ? "+" : ""}${(Number(kg) * 100).toFixed(0)}c</div>`
           : "";
+        const src = p.entry_source || "ukjent";
+        const thesis = p.entry_detail
+          ? `<div class="thesis">${badge(src)} ${p.entry_detail}</div>`
+          : `<div class="thesis">${badge(src)}</div>`;
         return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
-          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${kline}${hint}</div>`;
+          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${thesis}${kline}${hint}</div>`;
       }).join("");
     }
     function cycleLine(s) {
       const c = s.last_cycle;
       if (!c) return "Venter på første syklus.";
-      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · arb ${c.arb || 0} · kalshi ${c.kalshi || 0} · solgt ${c.exits || 0} · avvist ${c.rejected || 0} · xAI ${usd(c.xai_usd || 0)} · neste ${countdown(s)}`;
+      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · kalshi ${c.kalshi || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0} · neste ${countdown(s)}`;
+    }
+    function rejects(s) {
+      const el = $("rejects");
+      if (!el) return;
+      const keys = ["confidence=low", "edge_net", "cs_live", "mid_extreme", "short_horizon", "near-res"];
+      const counts = (s.last_cycle && s.last_cycle.reject_counts) || {};
+      el.innerHTML = keys.map((k) => {
+        const n = Number(counts[k] || 0);
+        return `<span class="chip ${n ? "on" : ""}">${k} ${n}</span>`;
+      }).join("");
+    }
+    function attrBlock(s) {
+      const a = s.attribution || {};
+      const wr = a.win_rate || {};
+      const risk = a.open_risk || {};
+      const tone = (n) => (n > 0.004 ? "gain" : n < -0.004 ? "loss" : "");
+      const hold = hoursLabel(a.avg_hold_h);
+      const winLine = `${wr.n_win || 0}/${wr.n_closed || 0} (${pctn(wr.pct || 0)}) · ${signed(wr.usd_win || 0)} / ${signed(wr.usd_loss || 0)}`;
+      const cards = [
+        ["Realized PnL", `${signed(a.realized || 0)} · 24t ${signed(a.realized_24h || 0)} · 7d ${signed(a.realized_7d || 0)}`, tone(a.realized || 0)],
+        ["Unrealized PnL", `${signed(a.unrealized || 0)}`, tone(a.unrealized || 0)],
+        ["Win rate lukket", winLine, ""],
+        ["Expectancy / lukket", usd(a.expectancy || 0), tone(a.expectancy || 0)],
+        ["Snitt hold lukket", hold, ""],
+        ["Open risk", `${usd(risk.usd || 0)} (${pctn(risk.pct || 0)}) · ${risk.seats || 0} seter`, ""],
+      ];
+      const attrEl = $("attr");
+      if (attrEl) {
+        attrEl.innerHTML = cards.map(([l, v, c]) =>
+          `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
+        ).join("");
+      }
+      const src = a.by_source || {};
+      const names = ["grok", "kalshi", "complement", "exits"];
+      const srcEl = $("attrSrc");
+      if (srcEl) {
+        srcEl.innerHTML = names.map((k) => {
+          const row = src[k] || {};
+          return `<div class="stat"><span>${badge(k)} fills</span><strong>${row.n || 0} · kjøpt ${usd(row.bought || 0)} · ${signed(row.realized || 0)}</strong></div>`;
+        }).join("");
+      }
     }
     function renderPanel(s) {
       const el = $("panel");
       if (tab === "fill") {
-        if (!s.fills.length) { el.innerHTML = `<p class="empty">Ingen fills.</p>`; return; }
-        el.innerHTML = s.fills.map((f) =>
-          `<div class="row-item"><p class="q">${f.side} ${usd(f.cost)}</p>
-           <div class="meta">${clock(f.ts)} · ${Number(f.size).toFixed(2)} @ ${Number(f.price).toFixed(3)} ${f.dry_run ? "· paper" : "· live"}</div></div>`
-        ).join("");
+        if (!s.fills || !s.fills.length) { el.innerHTML = `<p class="empty">Ingen fills.</p>`; return; }
+        el.innerHTML = s.fills.map((f) => {
+          const src = f.source || "ukjent";
+          const detail = f.source_detail || "";
+          const q = f.question ? `<p class="q">${f.question}</p>` : "";
+          return `<div class="row-item">${q}<p class="q">${badge(src)} ${f.side || ""} ${usd(f.cost)}</p>
+           <div class="meta">${clock(f.ts)} · ${Number(f.size || 0).toFixed(2)} @ ${Number(f.price || 0).toFixed(3)} · ${usd(f.cost)} ${f.dry_run ? "· paper" : "· live"}${detail ? " · " + detail : ""}</div></div>`;
+        }).join("");
         return;
       }
       if (tab === "rules") {
@@ -274,6 +359,8 @@
       stats(s);
       renderPositions(s);
       $("cycle").textContent = cycleLine(s);
+      rejects(s);
+      attrBlock(s);
       const st = s.stats || {};
       const depEl = $("dep");
       const xaiEl = $("xai");

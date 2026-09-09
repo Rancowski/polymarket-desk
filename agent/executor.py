@@ -9,9 +9,64 @@ import requests
 
 from agent.config import settings
 from agent.risk import Ticket, is_sports
-from agent.store import Store
+from agent.store import Store, normalize_side, normalize_source
 
 log = logging.getLogger("exec")
+
+
+def _num(value: Any) -> float | None:
+    if value is None or value is False or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_attr(src: Any, extra: dict | None = None) -> dict:
+    """Attribution fields for add_fill. Unknown → omitted (stored as null)."""
+    extra = extra or {}
+    if isinstance(src, Ticket):
+        data = {
+            "question": src.question,
+            "token_id": src.token_id,
+            "source": src.source,
+            "source_detail": src.source_detail or src.thesis,
+            "grok_p": src.grok_p,
+            "grok_conf": src.grok_conf,
+            "edge_net": src.edge_net,
+            "kalshi_ticker": src.kalshi_ticker,
+            "kalshi_mid": src.kalshi_mid,
+            "pm_mid": src.pm_mid if src.pm_mid is not None else src.mid,
+            "gap_c": src.gap_c,
+            "cycle_id": src.cycle_id,
+            "side": f"BUY_{src.side}" if str(src.side or "").upper() in {"YES", "NO"} else src.side,
+        }
+    else:
+        data = dict(src or {})
+        side = str(data.get("side") or "")
+        data["side"] = normalize_side(side if side.upper().startswith(("SELL", "REDEEM", "BUY")) else f"SELL_{side}")
+        data["source"] = data.get("source")
+        data["source_detail"] = data.get("source_detail") or data.get("reason") or data.get("thesis")
+        data["question"] = data.get("question")
+        data["token_id"] = data.get("token_id")
+    data.update(extra)
+    out = {
+        "question": data.get("question"),
+        "token_id": data.get("token_id"),
+        "source": normalize_source(data.get("source")),
+        "source_detail": (str(data.get("source_detail")).strip()[:160] if data.get("source_detail") else None),
+        "grok_p": _num(data.get("grok_p")),
+        "grok_conf": data.get("grok_conf") or None,
+        "edge_net": _num(data.get("edge_net")),
+        "kalshi_ticker": data.get("kalshi_ticker") or None,
+        "kalshi_mid": _num(data.get("kalshi_mid")),
+        "pm_mid": _num(data.get("pm_mid")),
+        "gap_c": _num(data.get("gap_c")),
+        "cycle_id": data.get("cycle_id") or None,
+        "side": normalize_side(data.get("side")),
+    }
+    return out
 
 
 def _as_float(value: Any) -> float:
@@ -500,14 +555,16 @@ class Executor:
                 ticket.size_usd,
                 ticket.edge_net,
             )
+            attr = _fill_attr(ticket, {"cycle_id": ticket.cycle_id or self.store.get_meta("cycle_id") or None})
             self.store.add_fill(
                 condition_id=ticket.condition_id,
-                side=ticket.side,
+                side=attr["side"],
                 price=ticket.limit_price,
                 size=ticket.shares,
                 cost=ticket.size_usd,
                 dry_run=True,
                 raw=payload,
+                **{k: v for k, v in attr.items() if k != "side"},
             )
             self.store.upsert_position(
                 condition_id=ticket.condition_id,
@@ -519,6 +576,8 @@ class Executor:
                 shares=ticket.shares,
                 avg_cost=ticket.limit_price,
                 status="open",
+                entry_source=attr.get("source"),
+                entry_detail=attr.get("source_detail"),
             )
             return {"status": "paper", "ticket": payload}
 
@@ -619,14 +678,16 @@ class Executor:
         taking = _as_float(data.get("takingAmount"))
         fill_size = taking if taking > 0 else size
         fill_px = price
+        attr = _fill_attr(ticket, {"cycle_id": ticket.cycle_id or self.store.get_meta("cycle_id") or None})
         self.store.add_fill(
             condition_id=ticket.condition_id,
-            side=ticket.side,
+            side=attr["side"],
             price=fill_px,
             size=fill_size,
             cost=round(fill_px * fill_size, 2),
             dry_run=False,
-            raw={"order": data or str(signed), "status": data.get("status"), "takingAmount": data.get("takingAmount"), **payload, "tick": tick_s, "neg_risk": neg},
+            raw={"order": data or str(signed), "status": data.get("status"), "takingAmount": data.get("takingAmount"), **payload, "tick": tick_s, "neg_risk": neg, "source": attr.get("source"), "source_detail": attr.get("source_detail")},
+            **{k: v for k, v in attr.items() if k != "side"},
         )
         self.store.upsert_position(
             condition_id=ticket.condition_id,
@@ -639,6 +700,8 @@ class Executor:
             avg_cost=fill_px,
             current_value=round(fill_px * fill_size, 4),
             status="open",
+            entry_source=attr.get("source"),
+            entry_detail=attr.get("source_detail"),
         )
         return {"status": "live", "response": data or signed, "ticket": payload}
 
@@ -653,14 +716,16 @@ class Executor:
                 order.get("shares"),
                 order.get("reason"),
             )
+            attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
             self.store.add_fill(
                 condition_id=order.get("condition_id"),
-                side=f"SELL_{order.get('side')}",
+                side=attr["side"] or f"SELL_{order.get('side')}",
                 price=order.get("limit_price"),
                 size=order.get("shares"),
                 cost=order.get("size_usd"),
                 dry_run=True,
                 raw=payload,
+                **{k: v for k, v in attr.items() if k != "side"},
             )
             self.store.close_position(order["condition_id"], order.get("side"))
             return {"status": "paper_sell", "ticket": payload}
@@ -741,9 +806,10 @@ class Executor:
             filled, data = _order_filled(signed)
             last_signed = signed
             if filled:
+                attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
                 self.store.add_fill(
                     condition_id=order.get("condition_id"),
-                    side=f"SELL_{order.get('side')}",
+                    side=attr["side"] or f"SELL_{order.get('side')}",
                     price=attempt,
                     size=size,
                     cost=round(attempt * size, 4),
@@ -753,7 +819,10 @@ class Executor:
                         "status": data.get("status"),
                         "takingAmount": data.get("takingAmount"),
                         **payload,
+                        "source": attr.get("source"),
+                        "source_detail": attr.get("source_detail"),
                     },
+                    **{k: v for k, v in attr.items() if k != "side"},
                 )
                 self.store.close_position(order["condition_id"], order.get("side"))
                 return {"status": "live_sell", "response": data or signed, "ticket": payload}
@@ -997,17 +1066,24 @@ class Executor:
         if not already:
             self.store.add_fill(
                 condition_id=cid,
-                side=f"REDEEM_{pos.get('side') or 'YES'}",
+                side="REDEEM",
                 price=px,
                 size=shares,
                 cost=round(shares * px, 4),
                 dry_run=paper,
+                question=pos.get("question"),
+                token_id=pos.get("token_id"),
+                source="redeem",
+                source_detail="redeem_ok",
+                cycle_id=self.store.get_meta("cycle_id") or None,
                 raw={
                     "redeem": True,
                     "tx": txh,
                     "neg_risk": neg,
                     "takingAmount": str(shares),
                     "status": "matched",
+                    "source": "redeem",
+                    "question": pos.get("question"),
                 },
             )
             self.store.set_meta(f"redeem_ok:{cid}", str(int(time.time())))

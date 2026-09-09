@@ -53,7 +53,21 @@ def _finishing(m: dict) -> bool:
     return False
 
 
-def _ticket(market: dict, side: str, token: str, book: dict, cost: float, shares: float, thesis: str) -> Ticket:
+def _ticket(
+    market: dict,
+    side: str,
+    token: str,
+    book: dict,
+    cost: float,
+    shares: float,
+    thesis: str,
+    source: str = "tape",
+    source_detail: str | None = None,
+    kalshi_ticker: str | None = None,
+    kalshi_mid: float | None = None,
+    pm_mid: float | None = None,
+    gap_c: float | None = None,
+) -> Ticket:
     mid = float(book.get("mid") or cost)
     return Ticket(
         condition_id=market["condition_id"],
@@ -74,6 +88,12 @@ def _ticket(market: dict, side: str, token: str, book: dict, cost: float, shares
         limit_price=round(min(0.99, max(0.01, cost)), 2),
         size_usd=round(shares * cost, 2),
         shares=round(shares, 2),
+        source=source,
+        source_detail=(source_detail or thesis)[:160],
+        kalshi_ticker=kalshi_ticker,
+        kalshi_mid=kalshi_mid,
+        pm_mid=pm_mid if pm_mid is not None else mid,
+        gap_c=gap_c,
     )
 
 
@@ -203,8 +223,8 @@ class Arb:
             if ywhy or nwhy:
                 continue
             thesis = f"sum-til-én YES+NO ask {yask+nask:.3f}"
-            out.append(_ticket(m, "YES", m["yes_token"], yb, yask, y_sh, thesis))
-            out.append(_ticket(m, "NO", m["no_token"], nb, nask, n_sh, thesis))
+            out.append(_ticket(m, "YES", m["yes_token"], yb, yask, y_sh, thesis, source="complement"))
+            out.append(_ticket(m, "NO", m["no_token"], nb, nask, n_sh, thesis, source="complement"))
             open_ids.add(cid)
             if len(out) >= 4:
                 break
@@ -245,7 +265,7 @@ class Arb:
                 continue
             thesis = f"event-sett ask-sum {total:.3f} ({len(rows)} utfall)"
             for row, book, ask in zip(rows, books, asks):
-                out.append(_ticket(row, "YES", row["yes_token"], book, ask, shares, thesis))
+                out.append(_ticket(row, "YES", row["yes_token"], book, ask, shares, thesis, source="complement"))
                 open_ids.add(row["condition_id"])
             if len(out) >= 12:
                 break
@@ -288,7 +308,7 @@ class Arb:
                 continue
             hours = (now - end).total_seconds() / 3600
             thesis = f"låst utfall {side} mid={yes:.2f} slutt for {hours:.0f}t siden"
-            out.append(_ticket(m, side, token, book, cost, shares, thesis))
+            out.append(_ticket(m, side, token, book, cost, shares, thesis, source="tape"))
             open_ids.add(cid)
             if len(out) >= 4:
                 break
@@ -333,10 +353,29 @@ class Arb:
             usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])
             if why:
                 continue
+            ticker = str(ks.get("ticker") or "")
+            gap_c = round(gap * 100.0, 1)
             thesis = (
                 f"Kalshi-bekreftelse {k_yes:.2f} vs Poly {pm:.2f} gap={gap:+.2f} → {side}"
             )
-            out.append(_ticket(m, side, token, book, cost, shares, thesis))
+            detail = f"kalshi {ticker or '—'} gap {gap_c:+.0f}c vs {side}"
+            out.append(
+                _ticket(
+                    m,
+                    side,
+                    token,
+                    book,
+                    cost,
+                    shares,
+                    thesis,
+                    source="kalshi",
+                    source_detail=detail,
+                    kalshi_ticker=ticker or None,
+                    kalshi_mid=k_yes if 0 < k_yes < 1 else None,
+                    pm_mid=pm,
+                    gap_c=gap_c,
+                )
+            )
             open_ids.add(cid)
             if len(out) >= 3:
                 break

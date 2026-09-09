@@ -33,6 +33,15 @@ class Ticket:
     limit_price: float
     size_usd: float
     shares: float
+    source: str = ""
+    source_detail: str = ""
+    grok_p: float | None = None
+    grok_conf: str | None = None
+    kalshi_ticker: str | None = None
+    kalshi_mid: float | None = None
+    pm_mid: float | None = None
+    gap_c: float | None = None
+    cycle_id: str | None = None
 
 
 def taker_fee_rate(category: str) -> float:
@@ -663,6 +672,20 @@ class Risk:
         if probe:
             limit = round(min(0.99, cost + 0.01), 2)
 
+        ks = market.get("kalshi") or {}
+        k_ticker = str(ks.get("ticker") or "").strip() or None
+        try:
+            k_yes = float(ks.get("yes") or 0)
+        except (TypeError, ValueError):
+            k_yes = 0.0
+        try:
+            gap = float(ks.get("gap")) if ks.get("gap") not in (None, "") else None
+        except (TypeError, ValueError):
+            gap = None
+        gap_c = round(gap * 100.0, 2) if gap is not None else None
+        detail = f"grok p={p_hat:.2f} ask={cost:.2f} edge_net={edge_net:.2f}"
+        if k_ticker:
+            detail = f"{detail} kalshi {k_ticker}"
         ticket = Ticket(
             condition_id=market["condition_id"],
             question=market["question"],
@@ -682,6 +705,15 @@ class Risk:
             limit_price=limit,
             size_usd=sized,
             shares=round(shares, 2),
+            source="grok",
+            source_detail=detail,
+            grok_p=p_yes,
+            grok_conf=conf,
+            kalshi_ticker=k_ticker,
+            kalshi_mid=k_yes if k_ticker and 0 < k_yes < 1 else None,
+            pm_mid=mid,
+            gap_c=gap_c if k_ticker else None,
+            cycle_id=self.store.get_meta("cycle_id") or None,
         )
         return ticket, "ok"
 
@@ -891,6 +923,19 @@ class Risk:
             src = live if live >= 0.02 else px
             px = math.floor(src / tick + 1e-12) * tick
             px = round(max(tick, min(0.99, px)), 2)
+        low = str(reason or "").lower()
+        if kind == "dust":
+            src_name = "flatten"
+        elif kind == "tp" and "trail" in low:
+            src_name = "exit_trail"
+        elif kind == "tp":
+            src_name = "exit_take"
+        elif "kalshi" in low:
+            src_name = "exit_kalshi"
+        elif "flatten" in low or "trim" in low or "motsier" in low:
+            src_name = "flatten"
+        else:
+            src_name = "exit_stop"
         return {
             "condition_id": pos["condition_id"],
             "question": pos.get("question"),
@@ -908,5 +953,7 @@ class Risk:
             "dust": kind == "dust",
             "mark": float(pos.get("cur_price") or 0),
             "value": round(shares * float(pos.get("cur_price") or px), 4),
+            "source": src_name,
+            "source_detail": str(reason or "")[:160],
         }
 
