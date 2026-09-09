@@ -282,7 +282,11 @@ def _fed_want(text: str) -> str | None:
     if not any(x in t for x in ("fed", "fomc", "federal reserve")):
         return None
     plus = bool(
-        re.search(r"25\s*\+|more than 25|>\s*25|25\s*or more|(?<![\d.])50\s*(bps|bp)", t)
+        re.search(
+            r"25\s*\+|50\s*\+|more than 25|>\s*25|>\s*50|25\s*or more|50\s*or more|"
+            r"(?<![\d.])50\+?\s*(bps|bp)|(?<![\d.])50\b",
+            t,
+        )
     )
     has25 = bool(re.search(r"(?<![\d.])25(\s*\+)?\s*(bps|bp|basis)|(?<![\d.])25\b", t))
     is_cut = bool(re.search(r"\b(cut|cuts|decrease|lower|easing)\b", t))
@@ -463,40 +467,57 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                     }
                 )
             continue
-        gap = round(poly - k_yes, 3)
+        side = str(m.get("side") or "").upper()
+        held = 0.0
+        try:
+            held = float(m.get("cur_price") or m.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            held = 0.0
+        # Always compare Kalshi to the OPEN side. NO → 1 - kalshi_yes. Never YES vs our NO.
+        if side == "NO":
+            k_hat = 1.0 - k_yes
+            pm_hat = held if 0 < held < 1 else (1.0 - poly if 0 < poly < 1 else poly)
+        elif side == "YES":
+            k_hat = k_yes
+            pm_hat = held if 0 < held < 1 else poly
+        else:
+            k_hat = k_yes
+            pm_hat = poly
+        gap = round(pm_hat - k_hat, 3)
         payload = {
             "title": str(best["title"])[:90],
             "ticker": best.get("ticker"),
             "yes": round(k_yes, 3),
+            "side": side or "YES",
+            "side_px": round(k_hat, 3),
             "gap": gap,
             "overlap": int(best.get("overlap") or 0),
         }
         m["kalshi"] = payload
         hits += 1
-        action, reason = "skip", f"PM {poly:.2f} Kalshi {k_yes:.2f} gap {gap:+.2f}"
-        side = str(m.get("side") or "").upper()
+        side_lab = side or "YES"
+        action, reason = "skip", f"PM {side_lab} {pm_hat:.2f} Kalshi {side_lab} {k_hat:.2f} gap {gap:+.2f}"
         avg = float(m.get("avg_cost") or 0)
-        k_hat = k_yes if side != "NO" else 1.0 - k_yes
-        pm_hat = poly if side != "NO" else (1.0 - poly if poly else 0.0)
         if avg > 0 and side in {"YES", "NO"}:
             if k_hat <= pm_hat - 0.07 or k_hat + 0.07 < avg or (k_hat < 0.02 and pm_hat > 0.40):
-                action, reason = "sell", f"Kalshi {k_hat:.2f} vs PM {pm_hat:.2f} gap {gap:+.2f}"
+                action, reason = "sell", f"Kalshi {side_lab} {k_hat:.2f} vs our {side_lab} {pm_hat:.2f} (≥7c mot)"
             elif k_hat >= pm_hat + 0.05:
-                action, reason = "buy", f"Kalshi {k_hat:.2f} ≥ PM {pm_hat:.2f}+5c"
+                action, reason = "buy", f"Kalshi {side_lab} {k_hat:.2f} ≥ our {side_lab} {pm_hat:.2f}+5c"
             elif abs(gap) >= 0.04:
                 action, reason = "skip", "allerede inne"
-        elif k_yes >= poly + 0.05:
-            action, reason = "buy", f"bekreftelse YES gap {gap:+.2f}"
-        elif gap >= 0.05:
-            action, reason = "buy", f"bekreftelse NO gap {gap:+.2f}"
+        elif k_hat >= pm_hat + 0.05:
+            action, reason = "buy", f"bekreftelse {side_lab} gap {gap:+.2f}"
+        elif pm_hat >= k_hat + 0.05:
+            cheap = "NO" if not side else ("YES" if side == "NO" else "NO")
+            action, reason = "buy", f"bekreftelse {cheap} gap {gap:+.2f}"
         logs.append(
             {
                 "condition_id": m.get("condition_id"),
                 "question": q[:90],
                 "ticker": payload["ticker"],
                 "title": payload["title"],
-                "pm": round(poly, 3),
-                "kalshi": payload["yes"],
+                "pm": round(pm_hat, 3),
+                "kalshi": round(k_hat, 3),
                 "gap": gap,
                 "action": action,
                 "why": reason,

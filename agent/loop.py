@@ -195,6 +195,12 @@ class Desk:
             cid = pos.get("condition_id")
             if not cid or cid in by_id:
                 continue
+            side = str(pos.get("side") or "YES").upper()
+            try:
+                held = float(pos.get("cur_price") or pos.get("avg_cost") or 0.5)
+            except (TypeError, ValueError):
+                held = 0.5
+            yes_mid = held if side != "NO" else (round(1.0 - held, 4) if 0 < held < 1 else 0.5)
             by_id[cid] = {
                 "condition_id": cid,
                 "question": pos.get("question") or "",
@@ -202,12 +208,13 @@ class Desk:
                 "end_date": None,
                 "category": pos.get("category") or "other",
                 "event_key": pos.get("event_key") or cid,
-                "yes_token": pos.get("token_id") if pos.get("side") == "YES" else "",
-                "no_token": pos.get("token_id") if pos.get("side") == "NO" else "",
-                "yes_mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
-                "mid": float(pos.get("cur_price") or pos.get("avg_cost") or 0.5),
+                "yes_token": pos.get("token_id") if side == "YES" else "",
+                "no_token": pos.get("token_id") if side == "NO" else "",
+                "yes_mid": yes_mid,
+                "mid": yes_mid,
+                "cur_price": held,
                 "avg_cost": float(pos.get("avg_cost") or 0),
-                "side": str(pos.get("side") or "YES"),
+                "side": side,
                 "shares": float(pos.get("shares") or 0),
                 "liquidity": 0,
                 "_open_only": True,

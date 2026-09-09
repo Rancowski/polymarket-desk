@@ -826,6 +826,7 @@ class Risk:
             k_yes = 0.0
             ticker = ""
         if not sports and ticker:
+            # Kalshi YES → our side. Never compare k_yes to a NO mark.
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
             pm_hat = live if live > 0 else mark
             against_mid = k_hat <= pm_hat - 0.07
