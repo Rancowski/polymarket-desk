@@ -333,24 +333,30 @@ class Arb:
         for m in markets:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
-            if not cid or not ks or not ks.get("ticker"):
+            ticker = str(ks.get("ticker") or "").strip()
+            if not cid or not ticker:
                 continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
             if _finishing(m):
                 continue
-            pm = float(m.get("yes_mid") or m.get("mid") or 0)
+            pm = float(m.get("yes_mid") or m.get("mid") or ks.get("pm_yes") or 0)
             k_yes = float(ks.get("yes") or 0)
+            if not (0 < k_yes < 1 and 0 < pm < 1):
+                continue
             gap = pm - k_yes
             if abs(gap) < 0.05:
                 continue
             if k_yes >= pm + 0.05:
                 side = "YES"
-            elif cid not in held_side and gap >= 0.05:
+            elif gap >= 0.05:
                 side = "NO"
             else:
                 continue
-            if cid in held_side and held_side[cid] != side:
+            held = held_side.get(str(cid))
+            if held == side:
+                continue
+            if held and held != side:
                 continue
             book = self._book(m, "yes" if side == "YES" else "no")
             token = m.get("yes_token") if side == "YES" else m.get("no_token")

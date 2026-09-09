@@ -230,10 +230,18 @@ SERIES = (
     "KXGOVTSHUTDOWN",
     "KXGOVSHUTLENGTH",
     "CONTROLH",
+    "KXSENATE",
+    "KXSENATEMID",
+    "PRES",
+    "KXPRESNOMD",
+    "KXPRESNOMR",
+    "KXPRESPARTY",
     "POPVOTE",
 )
 
 _SERIES_CACHE: tuple[float, list[str]] = (0.0, [])
+_SERIES_META: list[dict] = []
+_FETCHED_N: dict[str, int] = {}
 _TAPE_FREQ = ("fifteen_min", "five_min", "five min", "15m", "5m", "1-minute", "1 min")
 _TAPE_TICK = re.compile(r"(15M|5M|1H)$", re.I)
 
@@ -288,14 +296,15 @@ def _series_is_tape(row: dict) -> bool:
 
 
 def _discover_series(host: str) -> list[str]:
-    """High-volume politics / named crypto levels / economics, not 5-min tape."""
-    global _SERIES_CACHE
+    """Core Fed/elections/crypto plus high-volume extras. Keep full meta for name lookup."""
+    global _SERIES_CACHE, _SERIES_META
     now = time.time()
     ts, cached = _SERIES_CACHE
-    if cached and now - ts < 600:
+    if cached and now - ts < 600 and _SERIES_META:
         return cached
     found: list[tuple[float, str]] = []
     seen: set[str] = set(SERIES)
+    meta: list[dict] = []
     for cat in ("Politics", "Elections", "Crypto", "Economics"):
         try:
             r = requests.get(
@@ -307,25 +316,169 @@ def _discover_series(host: str) -> list[str]:
                 continue
             for row in r.json().get("series") or []:
                 tick = str(row.get("ticker") or "").strip()
-                if not tick or tick in seen or _series_is_tape(row):
+                title = str(row.get("title") or "")
+                if not tick or _series_is_tape(row):
                     continue
                 try:
                     vol = float(row.get("volume_fp") or row.get("volume") or 0)
                 except (TypeError, ValueError):
                     vol = 0.0
+                meta.append({"ticker": tick, "title": title, "tokens": _tokens(f"{tick} {title}"), "vol": vol})
+                if tick in seen:
+                    continue
                 seen.add(tick)
                 found.append((vol, tick))
         except Exception as exc:
             log.warning("Kalshi series %s: %s", cat, exc)
     found.sort(reverse=True)
     extra = [t for _v, t in found[:16]]
-    out = list(SERIES) + extra
+    out = list(dict.fromkeys(list(SERIES) + extra))
+    _SERIES_META = meta
     _SERIES_CACHE = (now, out)
-    log.info("Kalshi serier %s (fed+named + %s oppdaget)", len(out), len(extra))
+    log.info("Kalshi serier %s (fed/valg/crypto + %s oppdaget, meta %s)", len(out), len(extra), len(meta))
     return out
 
 
+def _series_prefix(ticker: str) -> str:
+    return str(ticker or "").split("-")[0]
+
+
+def _wanted_series(q: str) -> list[str]:
+    t = (q or "").lower()
+    out: list[str] = []
+    if any(x in t for x in ("fed", "fomc", "federal reserve")):
+        out.extend(["KXFEDDECISION", "KXFED", "KXFEDHIKE", "KXFEDFUNDS", "KXFOMC"])
+    if "senate" in t:
+        out.extend(["KXSENATE", "KXSENATEMID"])
+    if "house" in t or "congress" in t:
+        out.append("CONTROLH")
+    if any(x in t for x in ("president", "presidential", "white house")):
+        out.extend(["PRES", "KXPRESPARTY"])
+    if "nominee" in t or "primary" in t or "presnom" in t:
+        out.extend(["KXPRESNOMD", "KXPRESNOMR"])
+    if "bitcoin" in t or re.search(r"\bbtc\b", t):
+        out.extend(["KXBTC", "KXBTCMAX", "KXBTCMAXY", "KXBTCMAX150"])
+    if "ethereum" in t or re.search(r"\beth\b", t):
+        out.extend(["KXETH", "KXETHMAX"])
+    return list(dict.fromkeys(out))
+
+
+def _outcome_tags(text: str) -> set[str]:
+    t = (text or "").lower()
+    tags: set[str] = set()
+    if re.search(r"(?<![\d.])25\s*(bps|bp|basis)|hike 25|25 bps", t) and "more than 25" not in t and "25+" not in t:
+        tags.add("hike25")
+    if re.search(r"25\s*\+|more than 25|>\s*25|50\s*(bps|bp)", t):
+        tags.add("hike25+")
+    if "no change" in t or re.search(r"\b(hold|pause|unchanged)\b", t) or re.search(r"(?<![\d.])0\s*(bps|bp)", t):
+        tags.add("hold")
+    if re.search(r"\b(cut|cuts|decrease|easing)\b", t):
+        tags.add("cut25")
+    if "senate" in t:
+        tags.add("senate")
+    if re.search(r"\bhouse\b", t):
+        tags.add("house")
+    if re.search(r"\b(republican|gop|r-)\b", t):
+        tags.add("gop")
+    if re.search(r"\b(democrat|democratic|d-)\b", t):
+        tags.add("dem")
+    return tags
+
+
+def _strikes(text: str) -> set[int]:
+    t = (text or "").lower().replace(",", "")
+    found: set[int] = set()
+    for n, suf in re.findall(r"(\d+(?:\.\d+)?)\s*(k|m)?", t):
+        try:
+            v = float(n)
+        except ValueError:
+            continue
+        if suf == "k":
+            v *= 1000
+        elif suf == "m":
+            v *= 1_000_000
+        iv = int(round(v))
+        if iv >= 1000:
+            found.add(iv)
+    return found
+
+
+def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[str], pages: int = 2) -> int:
+    n = 0
+    cursor = None
+    try:
+        for _page in range(pages):
+            params: dict[str, Any] = {"limit": 200, "status": "open", "series_ticker": series}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(f"{host}/markets", params=params, timeout=12)
+            if r.status_code >= 400:
+                break
+            data = r.json() or {}
+            rows = data.get("markets") or []
+            chunk = _rows_to_out(rows)
+            for item in chunk:
+                t = str(item.get("ticker") or item["title"])
+                if t in seen:
+                    continue
+                seen.add(t)
+                collected.append(item)
+                n += 1
+                _FETCHED_N[series] = _FETCHED_N.get(series, 0) + 1
+            log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
+            cursor = data.get("cursor") or data.get("next_cursor") or ""
+            if not rows or not str(cursor).strip() or len(rows) < 200:
+                break
+    except Exception as exc:
+        log.warning("Kalshi %s: %s", series, exc)
+    return n
+
+
+def expand_catalog(collected: list[dict], markets: list[dict], host: str | None = None) -> list[dict]:
+    """Fetch extra series that match open PM titles (Senate/House/Lula/Musk/…)."""
+    if not markets:
+        return collected
+    from agent.risk import is_sports
+
+    host = host or HOSTS[0]
+    seen = {str(i.get("ticker") or i.get("title")) for i in collected}
+    have = {_series_prefix(str(i.get("ticker") or "")) for i in collected}
+    want: list[str] = []
+    for m in markets:
+        if is_sports(m):
+            continue
+        q = str(m.get("question") or "")
+        want.extend(_wanted_series(q))
+        qtok = {w for w in _tokens(q) if len(w) >= 4}
+        if not qtok:
+            continue
+        ranked = []
+        for s in _SERIES_META:
+            hit = qtok & (s.get("tokens") or set())
+            if len(hit) >= 1:
+                ranked.append((len(hit), s.get("vol") or 0.0, s["ticker"]))
+        ranked.sort(reverse=True)
+        for _n, _v, tick in ranked[:3]:
+            want.append(tick)
+    extra = []
+    for tick in dict.fromkeys(want):
+        if tick in have:
+            continue
+        extra.append(tick)
+        if len(extra) >= 12:
+            break
+    added = 0
+    for series in extra:
+        added += _fetch_one_series(host, series, collected, seen, pages=2)
+        have.add(series)
+    if extra:
+        log.info("Kalshi extra lookup %s serier, +%s kontrakter", extra, added)
+    return collected
+
+
 def fetch_open(limit: int = 400) -> list[dict]:
+    global _FETCHED_N
+    _FETCHED_N = {}
     last_exc: Exception | None = None
     collected: list[dict] = []
     seen: set[str] = set()
@@ -362,6 +515,7 @@ def fetch_open(limit: int = 400) -> list[dict]:
                         collected.append(item)
                         host_n += 1
                         series_n += 1
+                        _FETCHED_N[str(series)] = _FETCHED_N.get(str(series), 0) + 1
                     log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
                     cursor = data.get("cursor") or data.get("next_cursor") or ""
                     if not rows or not str(cursor).strip() or len(rows) < 200:
@@ -451,17 +605,42 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         title = str(k.get("title") or "")
         kdates = k.get("dates") or _dates(f"{ticker} {title}")
         same_date = bool(qdates and kdates and (qdates & kdates))
-        same_outcome = n >= 2
+        q_out = _outcome_tags(q)
+        k_out = _outcome_tags(f"{ticker} {title}")
+        same_outcome = bool(q_out and k_out and (q_out & k_out)) or n >= 2
         date_pair = same_date and same_outcome
         if date_pair:
             score += 15
+        if q_out and k_out and (q_out & k_out):
+            score += 12
+        prefix = _series_prefix(ticker)
+        if "senate" in qtok and (prefix in {"KXSENATE", "KXSENATEMID"} or "senate" in k["tokens"]):
+            score += 12
+            same_outcome = True
+        if "house" in qtok and (prefix == "CONTROLH" or "house" in k["tokens"]):
+            score += 12
+            same_outcome = True
+        q_strike = _strikes(q)
+        k_strike = _strikes(f"{ticker} {title}")
+        same_strike = bool(q_strike and k_strike and (q_strike & k_strike))
+        if same_strike and (same_date or not qdates):
+            score += 20
+        names = {w for w in qtok if len(w) >= 5}
+        named = bool(names & k["tokens"])
+        if named:
+            score += 8
         theme_ok = (
             fed_ok
             or date_pair
+            or same_strike
+            or named
+            or ("senate" in qtok and prefix in {"KXSENATE", "KXSENATEMID"})
+            or ("house" in qtok and prefix == "CONTROLH")
+            or (q_out and k_out and (q_out & k_out))
             or (t >= 2 and bool(distinctive))
             or (t >= 1 and n >= 3 and bool(distinctive))
         )
-        tok_need = 3 if distinctive else 4
+        tok_need = 2 if distinctive or named or q_out else 4
         if not theme_ok and n < tok_need:
             continue
         # Ticker/series month is source of truth (26SEP). Title month is fallback only.
@@ -506,7 +685,12 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
             return None, "ulikt år"
         if month_conflict:
             return None, "ulik måned"
-        return None, "ingen sammenlignbar kontrakt"
+        wanted = _wanted_series(q)
+        labels = wanted or sorted({_series_prefix(str(k.get("ticker") or "")) for k in kalshi if k.get("ticker")})[:6]
+        counts = [f"{s}:{_FETCHED_N.get(s, 0)}" for s in labels[:6]]
+        if wanted and not any(_FETCHED_N.get(s, 0) for s in wanted):
+            return None, f"katalog mangler {'/'.join(wanted[:4])} (0 open, prøvd {', '.join(counts) or '—'})"
+        return None, f"ingen treff i {'/'.join(wanted[:4]) or 'katalog'} ({', '.join(counts) or '0 kontrakter'})"
     bticker = str(best.get("ticker") or "")
     btitle = str(best.get("title") or "")
     kyears = _years(bticker) or best.get("years") or _years(btitle)
@@ -546,6 +730,7 @@ def _named_target(m: dict) -> bool:
             "fed", "fomc", "bitcoin", "btc", "ethereum", "eth", "solana", "trump",
             "election", "senate", "congress", "president", "governor", "mayor",
             "shutdown", "cpi", "inflation", "gdp", "payroll", "harris", "nominee",
+            "lula", "musk", "senate", "house",
         )
     )
 
@@ -556,6 +741,7 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
 
     if kalshi is None:
         kalshi = fetch_open()
+    kalshi = expand_catalog(kalshi or [], markets)
     if not kalshi:
         return 0, []
     hits = 0
@@ -598,7 +784,9 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                         "question": q[:90],
                         "ticker": "",
                         "pm": round(poly, 3),
+                        "pm_yes": round(poly, 3),
                         "kalshi": None,
+                        "kalshi_yes": None,
                         "gap": None,
                         "action": "skip",
                         "why": why,
@@ -622,10 +810,13 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
             k_hat = k_yes
             pm_hat = poly
         gap = round(pm_hat - k_hat, 3)
+        gap_yes = round(poly - k_yes, 3) if poly and k_yes else gap
         payload = {
             "title": str(best["title"])[:90],
             "ticker": best.get("ticker"),
             "yes": round(k_yes, 3),
+            "pm_yes": round(poly, 3),
+            "gap_yes": gap_yes,
             "side": side or "YES",
             "side_px": round(k_hat, 3),
             "gap": gap,
@@ -654,9 +845,12 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                 "question": q[:90],
                 "ticker": payload["ticker"],
                 "title": payload["title"],
-                "pm": round(pm_hat, 3),
-                "kalshi": round(k_hat, 3),
-                "gap": gap,
+                "pm": round(poly, 3),
+                "pm_yes": round(poly, 3),
+                "kalshi": round(k_yes, 3),
+                "kalshi_yes": round(k_yes, 3),
+                "gap": gap_yes,
+                "side_gap": gap,
                 "action": action,
                 "why": reason,
             }

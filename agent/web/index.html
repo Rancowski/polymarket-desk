@@ -116,6 +116,7 @@
     <h2>Kjøp / attribution</h2>
     <div class="grid4" id="attr"></div>
     <div class="strip" id="attrSrc"></div>
+    <p class="cycle" id="attrNote"></p>
     <div class="tabs">
       <button class="active" data-tab="log" type="button">Logg</button>
       <button data-tab="fill" type="button">Fills</button>
@@ -262,15 +263,15 @@
           : "";
         const kg = p.kalshi_gap;
         const ky = Number(p.kalshi_yes);
-        const kline = p.kalshi_ticker && Number.isFinite(ky) && ky > 0 && kg != null && Number.isFinite(Number(kg))
-          ? `<div class="meta">Kalshi ${p.kalshi_ticker} ${ky.toFixed(2)} vs PM gap ${Number(kg) >= 0 ? "+" : ""}${(Number(kg) * 100).toFixed(0)}c</div>`
-          : "";
+        const pmy = Number(p.kalshi_pm_yes);
+        const live = p.live_thesis
+          || (p.kalshi_ticker && Number.isFinite(ky) && ky > 0 && Number.isFinite(pmy) && pmy > 0
+            ? `${p.kalshi_ticker} ${ky.toFixed(2)} vs PM ${pmy.toFixed(2)} gap ${Number.isFinite(Number(kg)) ? (Number(kg) >= 0 ? "+" : "") + (Number(kg) * 100).toFixed(0) + "c" : ""}`
+            : "");
         const src = p.entry_source || "ukjent";
-        const thesis = p.entry_detail
-          ? `<div class="thesis">${badge(src)} ${p.entry_detail}</div>`
-          : `<div class="thesis">${badge(src)}</div>`;
+        const thesis = `<div class="thesis">${badge(src)} ${live || p.entry_detail || ""}</div>`;
         return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
-          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${thesis}${kline}${hint}</div>`;
+          <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${thesis}${hint}</div>`;
       }).join("");
     }
     function cycleLine(s) {
@@ -320,6 +321,8 @@
           return `<div class="stat"><span>${badge(k)} fills</span><strong>${row.n || 0} · kjøpt ${usd(row.bought || 0)} · ${signed(row.realized || 0)}</strong></div>`;
         }).join("");
       }
+      const note = $("attrNote");
+      if (note) note.textContent = a.footnote || "";
     }
     function renderPanel(s) {
       const el = $("panel");

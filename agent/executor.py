@@ -9,7 +9,7 @@ import requests
 
 from agent.config import settings
 from agent.risk import Ticket, is_sports
-from agent.store import Store, normalize_side, normalize_source
+from agent.store import Store, kalshi_fields_ok, normalize_side, normalize_source
 
 log = logging.getLogger("exec")
 
@@ -66,6 +66,10 @@ def _fill_attr(src: Any, extra: dict | None = None) -> dict:
         "cycle_id": data.get("cycle_id") or None,
         "side": normalize_side(data.get("side")),
     }
+    if out["source"] == "kalshi" and not kalshi_fields_ok(
+        out.get("kalshi_ticker"), out.get("kalshi_mid"), out.get("pm_mid")
+    ):
+        out["source"] = "grok" if out.get("grok_p") is not None else None
     return out
 
 

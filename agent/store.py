@@ -70,17 +70,42 @@ def _raw_dict(raw: Any) -> dict:
     return {}
 
 
+def _num_ok(raw: Any) -> bool:
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < v < 1.0
+
+
+def kalshi_fields_ok(
+    ticker: Any = None,
+    kalshi_mid: Any = None,
+    pm_mid: Any = None,
+    raw: Any = None,
+) -> bool:
+    data = _raw_dict(raw) if raw is not None else {}
+    tick = str(ticker or data.get("kalshi_ticker") or data.get("ticker") or "").strip()
+    if not tick or tick in {"—", "-", "none", "null"}:
+        return False
+    kmid = kalshi_mid if kalshi_mid is not None else data.get("kalshi_mid")
+    pmid = pm_mid if pm_mid is not None else data.get("pm_mid")
+    return _num_ok(kmid) and _num_ok(pmid)
+
+
 def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
-    """Evidence from raw/thesis only. Never invent grok."""
+    """Evidence from raw/thesis only. source=kalshi only with ticker + both mids."""
     data = _raw_dict(raw)
     thesis = str(
         data.get("source_detail") or data.get("thesis") or data.get("reason") or ""
     ).strip()[:160]
     explicit = normalize_source(data.get("source"))
     su = normalize_side(side)
+    low = thesis.lower()
+    if explicit == "kalshi" and not kalshi_fields_ok(raw=data):
+        explicit = None
     if explicit:
         return explicit, thesis or None
-    low = thesis.lower()
     if su == "REDEEM" or data.get("redeem"):
         return "redeem", thesis or "redeem_ok"
     sell = su.startswith("SELL")
@@ -96,16 +121,18 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
         if "flatten" in low or "hedge-rollback" in low or "død sports" in low or "trim" in low:
             return "flatten", thesis or None
         return None, thesis or None
-    if "sum-til-én" in low or "event-sett" in low:
+    if "sum-til-én" in low or "event-sett" in low or low.startswith("complement "):
         return "complement", thesis or None
     if "låst utfall" in low:
         return "tape", thesis or None
-    if "kalshi-bekreftelse" in low:
+    if kalshi_fields_ok(raw=data) and (
+        "kalshi-bekreftelse" in low or explicit == "kalshi" or data.get("kalshi_ticker")
+    ):
         return "kalshi", thesis or None
-    if " | kalshi " in low or low.startswith("grok ") or "edge_net=" in low:
+    if " | kalshi " in low or low.startswith("grok ") or "edge_net=" in low or "no kalshi" in low:
         return "grok", thesis or None
     if "kalshi" in low:
-        return "kalshi", thesis or None
+        return "grok" if (data.get("grok_p") not in (None, "") or "p=" in low) else None, thesis or None
     return None, thesis or None
 
 
@@ -253,17 +280,30 @@ class Store:
     def _backfill_fill_attribution(self) -> None:
         try:
             cur = self.conn.execute(
-                "SELECT id, side, raw, source, source_detail, question, token_id FROM fills"
+                """
+                SELECT id, side, raw, source, source_detail, question, token_id,
+                       kalshi_ticker, kalshi_mid, pm_mid FROM fills
+                """
             )
             for row in cur.fetchall():
-                src = normalize_source(row["source"])
+                data = _raw_dict(row["raw"])
                 detail = (row["source_detail"] or "").strip() or None
                 question = (row["question"] or "").strip() or None
                 token = (row["token_id"] or "").strip() or None
-                data = _raw_dict(row["raw"])
-                inf, inf_detail = infer_fill_source(row["side"], data)
+                tick = row["kalshi_ticker"] or data.get("kalshi_ticker") or data.get("ticker")
+                kmid = row["kalshi_mid"] if row["kalshi_mid"] is not None else data.get("kalshi_mid")
+                pmid = row["pm_mid"] if row["pm_mid"] is not None else data.get("pm_mid")
+                src = normalize_source(row["source"])
+                if src == "kalshi" and not kalshi_fields_ok(tick, kmid, pmid, data):
+                    src = None
+                inf, inf_detail = infer_fill_source(
+                    row["side"],
+                    {**data, "source": src, "source_detail": detail, "kalshi_ticker": tick, "kalshi_mid": kmid, "pm_mid": pmid},
+                )
                 if not src:
                     src = inf
+                if src == "kalshi" and not kalshi_fields_ok(tick, kmid, pmid, data):
+                    src = inf if inf and inf != "kalshi" else None
                 if not detail:
                     detail = inf_detail
                 if not question:
@@ -272,11 +312,11 @@ class Store:
                 if not token:
                     t = data.get("token_id")
                     token = str(t).strip() if t else None
-                if src or detail or question or token:
+                if src != normalize_source(row["source"]) or detail or question or token:
                     self.conn.execute(
                         """
                         UPDATE fills SET
-                            source=COALESCE(NULLIF(source,''), ?),
+                            source=?,
                             source_detail=COALESCE(NULLIF(source_detail,''), ?),
                             question=COALESCE(NULLIF(question,''), ?),
                             token_id=COALESCE(NULLIF(token_id,''), ?)
@@ -311,8 +351,8 @@ class Store:
                 self.conn.execute(
                     """
                     UPDATE positions SET
-                        entry_source=COALESCE(NULLIF(entry_source,''), ?),
-                        entry_detail=COALESCE(NULLIF(entry_detail,''), ?)
+                        entry_source=?,
+                        entry_detail=COALESCE(NULLIF(?, ''), entry_detail)
                     WHERE condition_id=? AND UPPER(COALESCE(side,'YES'))=?
                     """,
                     (src, detail, cid, side),
@@ -519,14 +559,22 @@ class Store:
             src = inf
             if not detail:
                 detail = inf_detail
+        kalshi_ticker = row.get("kalshi_ticker") if "kalshi_ticker" in row else data.get("kalshi_ticker")
+        kalshi_mid = row.get("kalshi_mid") if "kalshi_mid" in row else data.get("kalshi_mid")
+        pm_mid = row.get("pm_mid") if "pm_mid" in row else data.get("pm_mid")
+        if src == "kalshi" and not kalshi_fields_ok(kalshi_ticker, kalshi_mid, pm_mid, {**data, "source_detail": detail}):
+            inf, inf_detail = infer_fill_source(
+                side,
+                {**data, "source": None, "source_detail": detail, "kalshi_ticker": kalshi_ticker, "kalshi_mid": kalshi_mid, "pm_mid": pm_mid},
+            )
+            src = inf if inf and inf != "kalshi" else None
+            if not detail:
+                detail = inf_detail
         question = row.get("question") or data.get("question")
         token_id = row.get("token_id") or data.get("token_id")
         grok_p = row.get("grok_p") if "grok_p" in row else data.get("grok_p")
         grok_conf = row.get("grok_conf") if "grok_conf" in row else data.get("grok_conf")
         edge_net = row.get("edge_net") if "edge_net" in row else data.get("edge_net")
-        kalshi_ticker = row.get("kalshi_ticker") if "kalshi_ticker" in row else data.get("kalshi_ticker")
-        kalshi_mid = row.get("kalshi_mid") if "kalshi_mid" in row else data.get("kalshi_mid")
-        pm_mid = row.get("pm_mid") if "pm_mid" in row else data.get("pm_mid")
         gap_c = row.get("gap_c") if "gap_c" in row else data.get("gap_c")
         cycle_id = row.get("cycle_id") if row.get("cycle_id") is not None else data.get("cycle_id")
         with self._lock:
@@ -612,10 +660,18 @@ class Store:
         raw = row.get("raw")
         src = normalize_source(row.get("source"))
         detail = (row.get("source_detail") or "").strip() or None
+        if src == "kalshi" and not kalshi_fields_ok(
+            row.get("kalshi_ticker"), row.get("kalshi_mid"), row.get("pm_mid"), raw
+        ):
+            src = None
         if not src or not detail:
             inf, inf_detail = infer_fill_source(row.get("side"), raw)
             if not src:
                 src = inf
+            if src == "kalshi" and not kalshi_fields_ok(
+                row.get("kalshi_ticker"), row.get("kalshi_mid"), row.get("pm_mid"), raw
+            ):
+                src = inf if inf and inf != "kalshi" else None
             if not detail:
                 detail = inf_detail
         if not row.get("question"):
@@ -1060,17 +1116,11 @@ class Store:
         open_keys = {
             (str(p.get("condition_id")), str(p.get("side") or "YES").upper()) for p in open_pos
         }
-        closed_keys: set[tuple[str, str]] = set()
-        for st in ("closed", "closed_dust"):
-            for p in self.positions(st):
-                closed_keys.add(
-                    (str(p.get("condition_id") or ""), str(p.get("side") or "YES").upper())
-                )
         closed: list[dict] = []
         for key, g in groups.items():
             if key in open_keys:
                 continue
-            if g["sell_n"] <= 0 and not g["via_redeem"] and key not in closed_keys:
+            if g["sell_n"] <= 0 and not g["via_redeem"]:
                 continue
             realized = g["sell_proceeds"] - g["buy_cost"]
             hold_h = None
@@ -1174,5 +1224,10 @@ class Store:
                 "mtm": round(open_mtm, 2),
             },
             "deposited": round(deposited, 2) if deposited >= 1 else 0.0,
+            "header_pnl": round(unrealized + all_s["realized"], 2),
+            "footnote": (
+                f"Realized er kun lukkede fills ({all_s['realized']:+.2f}). "
+                f"Header er MTM vs innskutt = realized + åpen uPnL ({unrealized:+.2f})."
+            ),
         }
 

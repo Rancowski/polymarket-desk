@@ -872,8 +872,25 @@ class Risk:
         if sports:
             k_yes = 0.0
             ticker = ""
-        if not sports and ticker:
-            # Kalshi YES → our side. Never compare k_yes to a NO mark.
+        if not sports and ticker and 0 < k_yes < 1:
+            # Kalshi YES vs PM YES. Never compare k_yes to a NO mark.
+            if side == "NO":
+                pm_yes = (1.0 - live) if 0 < live < 1 else (1.0 - mark if 0 < mark < 1 else 0.0)
+            else:
+                pm_yes = live if live > 0 else mark
+            if live >= 0.02 and 0 < pm_yes < 1:
+                if k_yes >= pm_yes + 0.05:
+                    want = "YES"
+                elif pm_yes >= k_yes + 0.05:
+                    want = "NO"
+                else:
+                    want = None
+                if want and want != side:
+                    return self._exit_ticket(
+                        pos, book, shares, live,
+                        f"Kalshi vil {want} ({k_yes:.2f} vs PM {pm_yes:.2f}) — flatten {side}",
+                        kind="stop", best_bid=live,
+                    ), "ok"
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
             pm_hat = live if live > 0 else mark
             against_mid = k_hat <= pm_hat - 0.07

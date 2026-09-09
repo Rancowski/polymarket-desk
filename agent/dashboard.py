@@ -133,6 +133,24 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
         q = (p.get("question") or "")[:80]
         cid = p.get("condition_id")
         hint = hints.get(f"{cid}:{p.get('side') or ''}") or hints.get(q) or {}
+        ks = kalshi_by.get(str(cid or "")) or {}
+        k_tick = ks.get("ticker")
+        try:
+            k_yes_raw = float(ks["kalshi_yes"] if ks.get("kalshi_yes") not in (None, "") else (ks.get("kalshi") if ks.get("kalshi") not in (None, "") else 0))
+        except (TypeError, ValueError):
+            k_yes_raw = 0.0
+        try:
+            pm_yes = float(ks["pm_yes"] if ks.get("pm_yes") not in (None, "") else (ks.get("pm") if ks.get("pm") not in (None, "") else 0))
+        except (TypeError, ValueError):
+            pm_yes = 0.0
+        try:
+            gap_yes = float(ks["gap"] if ks.get("gap") not in (None, "") else 0)
+        except (TypeError, ValueError):
+            gap_yes = (pm_yes - k_yes_raw) if k_yes_raw and pm_yes else None
+        live_thesis = None
+        if k_tick and 0 < k_yes_raw < 1 and 0 < pm_yes < 1:
+            gc = (gap_yes if gap_yes is not None else (pm_yes - k_yes_raw)) * 100
+            live_thesis = f"{k_tick} {k_yes_raw:.2f} vs PM {pm_yes:.2f} gap {gc:+.0f}c"
         out.append(
             {
                 "question": p.get("question"),
@@ -150,9 +168,11 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
                 "last_ts": p.get("last_ts"),
                 "exit_action": hint.get("action"),
                 "exit_reason": hint.get("reason"),
-                "kalshi_ticker": (kalshi_by.get(str(cid or "")) or {}).get("ticker"),
-                "kalshi_yes": (kalshi_by.get(str(cid or "")) or {}).get("kalshi"),
-                "kalshi_gap": (kalshi_by.get(str(cid or "")) or {}).get("gap"),
+                "kalshi_ticker": k_tick,
+                "kalshi_yes": k_yes_raw if k_yes_raw else ks.get("kalshi"),
+                "kalshi_gap": gap_yes,
+                "kalshi_pm_yes": pm_yes if pm_yes else None,
+                "live_thesis": live_thesis,
                 "entry_source": p.get("entry_source"),
                 "entry_detail": p.get("entry_detail"),
             }
