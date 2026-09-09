@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -72,6 +73,18 @@ SPORTS_HINTS = (
     "mma",
     "atp",
     "wta",
+    "us open",
+    "u.s. open",
+    "australian open",
+    "french open",
+    "roland garros",
+    "wimbledon",
+    "grand slam",
+    "atp finals",
+    "alcaraz",
+    "sinner",
+    "djokovic",
+    "swiatek",
     "soccer",
     "football",
     "tennis",
@@ -141,6 +154,97 @@ def is_sports(row: dict) -> bool:
         for k in ("event_key", "question", "eventSlug", "slug")
     ).lower()
     return any(h in blob for h in SPORTS_HINTS)
+
+
+TOURNEY_HINTS = (
+    "us open",
+    "u.s. open",
+    "australian open",
+    "french open",
+    "roland garros",
+    "wimbledon",
+    "grand slam",
+    "atp finals",
+    "win the us",
+    "win the australian",
+    "win the french",
+)
+_NAME_DROP = {
+    "will", "the", "open", "wins", "winner", "match", "tennis", "slam", "grand",
+    "australian", "french", "wimbledon", "roland", "garros", "finals", "title",
+    "champion", "championship", "versus", "beat", "over", "after", "meeting",
+    "carlos", "year", "this", "that", "from", "with", "into",
+}
+
+
+def _blob(row: dict) -> str:
+    return " ".join(
+        str(row.get(k) or "")
+        for k in ("question", "outcome", "event_key", "eventSlug", "slug")
+    ).lower()
+
+
+def is_tournament(row: dict) -> bool:
+    b = _blob(row)
+    return any(h in b for h in TOURNEY_HINTS)
+
+
+def is_match_market(row: dict) -> bool:
+    b = f" {_blob(row)} "
+    return " vs " in b or " versus " in b or "-vs-" in b
+
+
+def _name_tokens(row: dict) -> set[str]:
+    toks = re.findall(r"[a-z]{4,}", _blob(row))
+    return {t for t in toks if t not in _NAME_DROP and t not in {h.replace(" ", "") for h in TOURNEY_HINTS}}
+
+
+def _pos_cost(p: dict) -> float:
+    return float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+
+
+def same_player_conflicts(open_pos: list) -> dict[tuple, str]:
+    """Tournament YES on X vs match NO on X (and reverse). Flatten cheaper/smaller leg."""
+    force: dict[tuple, str] = {}
+    rows = [p for p in open_pos if is_sports(p) or is_tournament(p)]
+    for i, a in enumerate(rows):
+        ka = "match" if is_match_market(a) else ("tournament" if is_tournament(a) else "")
+        if not ka:
+            continue
+        na = _name_tokens(a)
+        if not na:
+            continue
+        for b in rows[i + 1 :]:
+            kb = "match" if is_match_market(b) else ("tournament" if is_tournament(b) else "")
+            if {ka, kb} != {"tournament", "match"}:
+                continue
+            shared = na & _name_tokens(b)
+            if not shared:
+                continue
+            sa = str(a.get("side") or "YES").upper()
+            sb = str(b.get("side") or "YES").upper()
+            if sa == sb:
+                continue
+            victim = a if _pos_cost(a) <= _pos_cost(b) else b
+            key = (str(victim.get("condition_id")), str(victim.get("side") or "YES"))
+            who = " ".join(sorted(shared)[:3])
+            force[key] = f"motsier {who} — flatten minste"
+    return force
+
+
+def ticket_player_conflict(market: dict, side: str, open_pos: list) -> str | None:
+    probe = {
+        "question": market.get("question"),
+        "outcome": market.get("outcome") or side,
+        "event_key": market.get("event_key"),
+        "category": market.get("category"),
+        "side": side,
+    }
+    fake = [{**p} for p in open_pos] + [probe]
+    hits = same_player_conflicts(fake)
+    if hits:
+        return next(iter(hits.values()))
+    return None
 
 
 def _row_upnl(p: dict) -> float:
@@ -412,6 +516,8 @@ class Risk:
             avg = float(p.get("avg_cost") or 0)
             if hwm > 0 and avg > 0 and hwm >= avg * 1.22:
                 return "sports trail åpen — ingen ny sports"
+        if same_player_conflicts(self.store.positions("open")):
+            return "motsigelse sports — flatten først"
         return None
 
     def evaluate(
@@ -487,14 +593,16 @@ class Risk:
             need = max(need, 0.022)
         if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
-        sports = is_sports(market)
+        sports = is_sports(market) or is_tournament(market)
+        open_pos = self.store.positions("open")
+        clash = ticket_player_conflict(market, side, open_pos) if sports else None
+        if clash:
+            return None, clash
         if sports and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
             return None, "sports ekstrem-pris"
         sport_halt = self.sports_blocked(equity, deposited, cash=bankroll)
         if sports and sport_halt:
             return None, sport_halt
-
-        open_pos = self.store.positions("open")
         event = market.get("event_key") or market["condition_id"]
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
         same_side = [p for p in same_cid if str(p.get("side") or "").upper() == side]
@@ -528,7 +636,8 @@ class Risk:
 
         size_base = sizing_base(deposited, equity)
         longshot = cost <= 0.28
-        if sports or longshot:
+        cheap_sports = (sports or is_tournament(market)) and cost < 0.40
+        if sports or longshot or cheap_sports:
             _floor_pct, cap_pct = SPORTS_PCT
         else:
             _floor_pct, cap_pct = CORE_PCT

@@ -10,7 +10,15 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import MAX_SPORTS, Risk, dust_cutoff, is_sports, resolved_state, sizing_base
+from agent.risk import (
+    MAX_SPORTS,
+    Risk,
+    dust_cutoff,
+    is_sports,
+    resolved_state,
+    same_player_conflicts,
+    sizing_base,
+)
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -163,6 +171,7 @@ class Desk:
         except (TypeError, ValueError):
             deposited = 0.0
         sports = [p for p in open_pos if is_sports(p)]
+        force.update(same_player_conflicts(open_pos))
         if len(sports) > MAX_SPORTS:
             extra = sorted(sports, key=self._upnl)[: len(sports) - MAX_SPORTS]
             for p in extra:

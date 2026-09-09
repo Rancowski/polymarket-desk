@@ -205,37 +205,48 @@ def _rows_to_out(rows: list) -> list[dict]:
     return out
 
 
-def fetch_open(limit: int = 200) -> list[dict]:
+def fetch_open(limit: int = 400) -> list[dict]:
     last_exc: Exception | None = None
     collected: list[dict] = []
     seen: set[str] = set()
     for host in HOSTS:
         host_n = 0
         for series in SERIES:
+            cursor = None
+            series_n = 0
             try:
-                r = requests.get(
-                    f"{host}/markets",
-                    params={"limit": 50, "status": "open", "series_ticker": series},
-                    timeout=12,
-                )
-                if r.status_code == 429:
-                    log.warning("Kalshi 429 på %s — stopper serier", series)
-                    break
-                if r.status_code >= 400:
-                    continue
-                rows = (r.json() or {}).get("markets") or []
-                chunk = _rows_to_out(rows)
-                for item in chunk:
-                    t = str(item.get("ticker") or item["title"])
-                    if t in seen:
-                        continue
-                    seen.add(t)
-                    collected.append(item)
-                    host_n += 1
-                log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
-            except Exception as exc:
-                last_exc = exc
-                log.warning("Kalshi %s: %s", series, exc)
+                for _page in range(6):
+                    params: dict[str, Any] = {
+                        "limit": 200,
+                        "status": "open",
+                        "series_ticker": series,
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+                    r = requests.get(f"{host}/markets", params=params, timeout=12)
+                    if r.status_code == 429:
+                        log.warning("Kalshi 429 på %s — stopper serier", series)
+                        break
+                    if r.status_code >= 400:
+                        break
+                    data = r.json() or {}
+                    rows = data.get("markets") or []
+                    chunk = _rows_to_out(rows)
+                    for item in chunk:
+                        t = str(item.get("ticker") or item["title"])
+                        if t in seen:
+                            continue
+                        seen.add(t)
+                        collected.append(item)
+                        host_n += 1
+                        series_n += 1
+                    log.info("Kalshi %s: %s rader, %s pris", series, len(rows), len(chunk))
+                    cursor = data.get("cursor") or data.get("next_cursor") or ""
+                    if not rows or not str(cursor).strip() or len(rows) < 200:
+                        break
+            except Exception as ext:
+                last_exc = ext
+                log.warning("Kalshi %s: %s", series, ext)
         if host_n:
             break
     log.info("Kalshi totalt %s markeder med pris (kun navngitte serier)", len(collected))
@@ -267,8 +278,11 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         tok_need = 3 if distinctive else 4
         if not theme_ok and n < tok_need:
             continue
-        km = k.get("months") or _months(f"{k.get('title') or ''} {k.get('ticker') or ''}")
-        ky = k.get("years") or _years(f"{k.get('title') or ''} {k.get('ticker') or ''}")
+        ticker = str(k.get("ticker") or "")
+        title = str(k.get("title") or "")
+        # Ticker/series month is source of truth (26SEP). Title month is fallback only.
+        km = _months(ticker) or k.get("months") or _months(title)
+        ky = _years(ticker) or k.get("years") or _years(title)
         if qmonths and km and not (qmonths & km):
             month_conflict = True
             continue
@@ -276,9 +290,9 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
             year_conflict = True
             continue
         if qmonths and km and (qmonths & km):
-            score += 4
+            score += 8
         if qyears and ky and (qyears & ky):
-            score += 4
+            score += 8
         if score > best_score:
             best_score = score
             best = k
@@ -288,10 +302,12 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         if month_conflict:
             return None, "ulik måned"
         return None, "ingen sammenlignbar kontrakt"
-    kyears = best.get("years") or _years(f"{best.get('title') or ''} {best.get('ticker') or ''}")
+    bticker = str(best.get("ticker") or "")
+    btitle = str(best.get("title") or "")
+    kyears = _years(bticker) or best.get("years") or _years(btitle)
     if qyears and kyears and not (qyears & kyears):
         return None, "ulikt år"
-    km = best.get("months") or _months(f"{best.get('title') or ''} {best.get('ticker') or ''}")
+    km = _months(bticker) or best.get("months") or _months(btitle)
     if qmonths and km and not (qmonths & km):
         return None, "ulik måned"
     qth, kth = qtheme, best["theme"]
