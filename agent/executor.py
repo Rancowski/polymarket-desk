@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import requests
@@ -435,6 +436,9 @@ class Executor:
                             "avg_cost": avg,
                             "cur_price": cur if cur else None,
                             "current_value": mtm if mtm else None,
+                            "redeemable": bool(p.get("redeemable")),
+                            "neg_risk": bool(p.get("negativeRisk") or p.get("negRisk") or p.get("neg_risk")),
+                            "closed": bool(p.get("closed") or p.get("resolved")),
                             "status": "open",
                         }
                     )
@@ -674,6 +678,11 @@ class Executor:
         tick_f = float(tick_s)
         dust = bool(order.get("dust") or order.get("kind") == "dust")
         book_bid = float(order.get("best_bid") or 0)
+        mark = float(order.get("mark") or 0)
+        if mark >= 0.90 and book_bid <= 0.01:
+            raise RuntimeError("resolved winner — redeem, ikke FAK")
+        if str(order.get("kind") or "") == "resolved_loser":
+            raise RuntimeError("resolved loser — close locally")
         if (dust or price < 0.10) and tick_f > 0.001:
             tick_s, tick_f = "0.001", 0.001
         attempts: list[float] = []
@@ -738,3 +747,292 @@ class Executor:
             "attempt_px": last_attempt,
             "best_bid": book_bid,
         }
+
+    def fetch_market_flags(self, condition_id: str) -> dict:
+        cid = str(condition_id or "").strip()
+        if not cid:
+            return {}
+        try:
+            r = requests.get(
+                f"{settings.gamma_host}/markets",
+                params={"condition_ids": cid},
+                headers={"User-Agent": "polymarket-desk/1.0"},
+                timeout=8,
+            )
+            if not r.ok:
+                return {}
+            rows = r.json() or []
+            if isinstance(rows, dict):
+                rows = rows.get("data") or rows.get("markets") or [rows]
+            m = rows[0] if rows else {}
+            return {
+                "closed": bool(m.get("closed") or m.get("resolved")),
+                "neg_risk": bool(m.get("negRisk") or m.get("enableNegRisk")),
+                "redeemable": bool(m.get("closed") or m.get("resolved")),
+            }
+        except Exception as exc:
+            log.warning("gamma flags %s: %s", cid[:16], exc)
+            return {}
+
+    def _cid_hex(self, cid: str) -> str:
+        h = str(cid or "").strip().lower()
+        if h.startswith("0x"):
+            h = h[2:]
+        return "0x" + h.zfill(64)
+
+    def _encode_redeem(self, condition_id: str, neg_risk: bool, shares: float) -> tuple[str, str]:
+        from eth_abi import encode
+        from eth_utils import keccak, to_checksum_address
+
+        cid = self._cid_hex(condition_id)
+        cid_b = bytes.fromhex(cid[2:])
+        pusd = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+        adapter = to_checksum_address(
+            "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+            if neg_risk
+            else "0xAdA100Db00Ca00073811820692005400218FcE1f"
+        )
+        parent = b"\x00" * 32
+        sel = keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        args = encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [pusd, parent, cid_b, [1, 2]],
+        )
+        return adapter, "0x" + (sel + args).hex()
+
+    def _encode_ctf_approval(self, operator: str) -> tuple[str, str]:
+        from eth_abi import encode
+        from eth_utils import keccak, to_checksum_address
+
+        ctf = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+        op = to_checksum_address(operator)
+        sel = keccak(text="setApprovalForAll(address,bool)")[:4]
+        args = encode(["address", "bool"], [op, True])
+        return ctf, "0x" + (sel + args).hex()
+
+    def _builder_config(self):
+        key = settings.builder_api_key or settings.poly_api_key
+        secret = settings.builder_secret or settings.poly_api_secret
+        phrase = settings.builder_passphrase or settings.poly_api_passphrase
+        if not (key and secret and phrase):
+            return None
+        from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+
+        return BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(key=key, secret=secret, passphrase=phrase)
+        )
+
+    def _relayer(self):
+        if not settings.private_key:
+            raise RuntimeError("POLYMARKET_PRIVATE_KEY mangler for redeem")
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_relayer_client.models import RelayerTxType
+
+        builder = self._builder_config()
+        wanted = int(settings.signature_type or 3)
+        tx_type = {
+            1: RelayerTxType.PROXY,
+            2: RelayerTxType.SAFE,
+        }.get(wanted, RelayerTxType.PROXY)
+        return RelayClient(
+            settings.relayer_url or "https://relayer-v2.polymarket.com",
+            int(settings.chain_id or 137),
+            settings.private_key,
+            builder,
+            tx_type,
+        ), wanted
+
+    def _wallet_calls(self, positions: list[dict]) -> list:
+        from py_builder_relayer_client.models import DepositWalletCall
+
+        seen: set[str] = set()
+        adapters: dict[str, str] = {}
+        redeems: list[tuple[str, str]] = []
+        for pos in positions:
+            cid = str(pos.get("condition_id") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            flags = self.fetch_market_flags(cid)
+            neg = bool(pos.get("neg_risk") or flags.get("neg_risk"))
+            adapter, calldata = self._encode_redeem(cid, neg, float(pos.get("shares") or 0))
+            adapters[adapter] = adapter
+            redeems.append((adapter, calldata))
+        calls = []
+        for adapter in adapters:
+            ctf, appr = self._encode_ctf_approval(adapter)
+            calls.append(DepositWalletCall(target=ctf, value="0", data=appr))
+        for adapter, calldata in redeems:
+            calls.append(DepositWalletCall(target=adapter, value="0", data=calldata))
+        return calls
+
+    def _tx_hash(self, resp: Any, waited: Any) -> str:
+        txh = ""
+        if isinstance(waited, dict):
+            txh = str(waited.get("transactionHash") or waited.get("transaction_hash") or "")
+        elif waited is not None:
+            txh = str(
+                getattr(waited, "transaction_hash", "")
+                or getattr(waited, "transactionHash", "")
+                or ""
+            )
+        if not txh and hasattr(resp, "transaction_hash"):
+            txh = str(resp.transaction_hash or "")
+        if not txh and hasattr(resp, "hash"):
+            txh = str(resp.hash or "")
+        return txh
+
+    def _submit_relayer(self, calls: list, metadata: str) -> tuple[Any, str]:
+        from py_builder_relayer_client.builder.deposit_wallet import build_deposit_wallet_batch_request
+        from py_builder_relayer_client.models import DepositWalletTransactionArgs, Transaction
+
+        client, wanted = self._relayer()
+        if wanted in {0, 3} and hasattr(client, "execute_deposit_wallet_batch"):
+            nonce_payload = client.get_nonce(client.signer.address(), "WALLET") or {}
+            if not isinstance(nonce_payload, dict):
+                nonce_payload = {}
+            nonce = str(nonce_payload.get("nonce") or "0")
+            deadline = str(int(time.time()) + 240)
+            wallet = (settings.funder or "").strip()
+            if not wallet:
+                wallet = client.get_expected_deposit_wallet()
+            if client.builder_config is not None:
+                resp = client.execute_deposit_wallet_batch(calls, wallet, nonce, deadline)
+            elif settings.relayer_api_key:
+                args = DepositWalletTransactionArgs(
+                    from_address=client.signer.address(),
+                    chain_id=int(settings.chain_id or 137),
+                    wallet_address=wallet,
+                    nonce=nonce,
+                    deadline=deadline,
+                    calls=calls,
+                )
+                body = build_deposit_wallet_batch_request(
+                    signer=client.signer, args=args, config=client.contract_config
+                ).to_dict()
+                body["metadata"] = metadata
+                url = (settings.relayer_url or "https://relayer-v2.polymarket.com").rstrip("/")
+                r = requests.post(
+                    f"{url}/submit",
+                    json=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "RELAYER_API_KEY": settings.relayer_api_key,
+                        "RELAYER_API_KEY_ADDRESS": (
+                            settings.relayer_api_key_address or client.signer.address()
+                        ),
+                    },
+                    timeout=30,
+                )
+                if r.status_code >= 400:
+                    raise RuntimeError(f"relayer {r.status_code}: {r.text[:240]}")
+                data = r.json() if r.content else {}
+
+                class _Resp:
+                    transaction_id = data.get("transactionID") or data.get("transaction_id")
+                    transaction_hash = data.get("transactionHash") or data.get("transaction_hash") or ""
+                    hash = transaction_hash
+
+                    def wait(self_inner):
+                        if not self_inner.transaction_id:
+                            return data
+                        return client.poll_until_state(
+                            transaction_id=self_inner.transaction_id,
+                            states=["STATE_MINED", "STATE_CONFIRMED"],
+                            fail_state="STATE_FAILED",
+                            max_polls=30,
+                        )
+
+                resp = _Resp()
+            else:
+                raise RuntimeError(
+                    "redeem trenger POLYMARKET_BUILDER_API_KEY eller RELAYER_API_KEY "
+                    "(POLY_API_KEY brukes som builder-fallback hvis satt)"
+                )
+        else:
+            txs = [Transaction(to=c.target, data=c.data, value=c.value) for c in calls]
+            if client.builder_config is None:
+                raise RuntimeError("redeem trenger builder-nøkkel for proxy/safe relayer")
+            resp = client.execute(txs, metadata)
+        waited = None
+        try:
+            waited = resp.wait() if hasattr(resp, "wait") else None
+        except Exception as exc:
+            log.warning("redeem wait: %s", exc)
+        txh = self._tx_hash(resp, waited)
+        if waited is None and not txh:
+            raise RuntimeError("redeem relayer timeout/failed uten tx")
+        if isinstance(waited, dict) and str(waited.get("state") or "").upper() == "STATE_FAILED":
+            raise RuntimeError(f"redeem on-chain failed tx={txh[:18]}")
+        return resp, txh
+
+    def _record_redeem(self, pos: dict, txh: str, neg: bool, paper: bool) -> None:
+        cid = str(pos.get("condition_id") or "")
+        shares = float(pos.get("shares") or 0)
+        try:
+            mark = float(pos.get("cur_price") or 0)
+        except (TypeError, ValueError):
+            mark = 0.0
+        px = 1.0 if mark >= 0.5 else 0.0
+        self.store.add_fill(
+            condition_id=cid,
+            side=f"REDEEM_{pos.get('side') or 'YES'}",
+            price=px,
+            size=shares,
+            cost=round(shares * px, 4),
+            dry_run=paper,
+            raw={
+                "redeem": True,
+                "tx": txh,
+                "neg_risk": neg,
+                "takingAmount": str(shares),
+                "status": "matched",
+            },
+        )
+        self.store.close_position(cid)
+        try:
+            self.store.clear_dust(cid, pos.get("side"))
+        except Exception:
+            pass
+
+    def redeem(self, pos: dict) -> dict:
+        """On-chain CTF redeem via proxy/relayer. Winners → pUSD. Never FAK."""
+        results = self.redeem_batch([pos])
+        cid = str(pos.get("condition_id") or "")
+        return results.get(cid) or next(iter(results.values()), {"status": "redeem_err", "condition_id": cid})
+
+    def redeem_batch(self, positions: list[dict]) -> dict[str, dict]:
+        """Redeem unique condition_ids in one relayer batch. Adapter wraps to pUSD."""
+        out: dict[str, dict] = {}
+        unique: list[dict] = []
+        seen: set[str] = set()
+        for pos in positions:
+            cid = str(pos.get("condition_id") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            unique.append(pos)
+        if not unique:
+            return out
+        if settings.dry_run:
+            for pos in unique:
+                cid = str(pos.get("condition_id"))
+                q = str(pos.get("question") or "")[:60]
+                log.info("PAPER REDEEM %s", q)
+                self._record_redeem(pos, "", bool(pos.get("neg_risk")), True)
+                out[cid] = {"status": "paper_redeem", "condition_id": cid}
+            return out
+        calls = self._wallet_calls(unique)
+        if not calls:
+            raise RuntimeError("ingen redeem-calls")
+        labels = ",".join(str(p.get("question") or "")[:24] for p in unique[:4])
+        _resp, txh = self._submit_relayer(calls, f"redeem {labels}")
+        for pos in unique:
+            cid = str(pos.get("condition_id"))
+            flags = self.fetch_market_flags(cid)
+            neg = bool(pos.get("neg_risk") or flags.get("neg_risk"))
+            q = str(pos.get("question") or "")[:60]
+            log.info("REDEEM ok %s tx=%s", q, txh[:18] if txh else "?")
+            self._record_redeem(pos, txh, neg, False)
+            out[cid] = {"status": "redeem_ok", "tx": txh, "condition_id": cid, "neg_risk": neg}
+        return out

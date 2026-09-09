@@ -12,7 +12,9 @@ from agent.risk import (
     HARD_NAME_PCT,
     MAX_SPORTS,
     Ticket,
+    is_near_resolution,
     is_sports,
+    parse_end,
     size_ticket,
     sizing_base,
 )
@@ -26,17 +28,7 @@ LOCKED_YES = 0.88
 LOCKED_NO = 0.12
 
 
-def _parse_end(raw: Any) -> datetime | None:
-    if not raw:
-        return None
-    text = str(raw).replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        return None
+_parse_end = parse_end
 
 
 def _ticket(market: dict, side: str, token: str, book: dict, cost: float, shares: float, thesis: str) -> Ticket:
@@ -116,7 +108,7 @@ class Arb:
         open_ids = {p["condition_id"] for p in open_pos}
         sports_pos = [p for p in open_pos if is_sports(p)]
         sports_n = len(sports_pos)
-        sports_halt = bool(Risk(self.store).sports_blocked(equity or deposited, deposited))
+        sports_halt = bool(Risk(self.store).sports_blocked(equity or deposited, deposited, cash=bankroll))
         at_cap = len(open_pos) >= settings.max_open_positions
         tickets: list[Ticket] = []
         tickets.extend(self._complements(markets, bankroll, open_ids, sports_n, sports_halt, at_cap))
@@ -166,12 +158,15 @@ class Arb:
                 continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
-            if yes_m <= 0.02 or no_m <= 0.02 or yes_m >= 0.94 or no_m >= 0.94:
+            if yes_m <= 0.02 or no_m <= 0.02:
                 continue
             if (yes_m + no_m) > 0.995:
                 continue
             yb = self._book(m, "yes")
             nb = self._book(m, "no")
+            near, _ = is_near_resolution(m, yb)
+            if near:
+                continue
             yask = float(yb.get("best_ask") or 1)
             nask = float(nb.get("best_ask") or 1)
             if yask + nask > COMPLEMENT_MAX_ASK_SUM or yask <= 0.01 or nask <= 0.01:

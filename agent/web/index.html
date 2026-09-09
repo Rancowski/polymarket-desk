@@ -224,8 +224,9 @@
           ? `<div class="hint">${p.exit_action}${p.exit_reason ? " · " + p.exit_reason : ""}</div>`
           : "";
         const kg = p.kalshi_gap;
-        const kline = kg != null && Number.isFinite(Number(kg))
-          ? `<div class="meta">Kalshi ${p.kalshi_ticker || ""} ${Number(p.kalshi_yes || 0).toFixed(2)} vs PM gap ${Number(kg) >= 0 ? "+" : ""}${(Number(kg) * 100).toFixed(0)}c</div>`
+        const ky = Number(p.kalshi_yes);
+        const kline = p.kalshi_ticker && Number.isFinite(ky) && ky > 0 && kg != null && Number.isFinite(Number(kg))
+          ? `<div class="meta">Kalshi ${p.kalshi_ticker} ${ky.toFixed(2)} vs PM gap ${Number(kg) >= 0 ? "+" : ""}${(Number(kg) * 100).toFixed(0)}c</div>`
           : "";
         return `<div class="pos ${tone}"><p class="q">${p.question || ""}</p>
           <div class="meta ${tone}">${label} · ${shares.toFixed(2)} · ${avg.toFixed(2)} → ${Number.isFinite(mid) && mid > 0 ? mid.toFixed(3) : "—"} · kost ${usd(cost)} · verdi ${hasMtm ? usd(mtm) : "—"} · ${upnlUsd == null ? "—" : signed(upnlUsd)} (${upnlPct == null ? "—" : pctn(upnlPct)}) · ${age(p.opened_ts) || age(p.last_ts)}</div>${kline}${hint}</div>`;
@@ -248,13 +249,14 @@
       }
       if (tab === "rules") {
         el.innerHTML = [
-          ["Syklus", "Hvert 5. minutt. Exits + Kalshi + tape først. Grok annenhver runde. FAK. Ingen X/web. Fortsetter å kjøpe når boka er beskjedent rød."],
-          ["Kjøp", "På ask med dybde, hvis én er sann: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen (ikke død sports-bok). 3) Kalshi-par gap ≥ 4 ¢ og PM-ask 0,22–0,82. 4) Grok-kant ≥ MIN_NET_EDGE på et likvid navn."],
-          ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Ett event = én tese. Inntil 75 % av innskutt i markedet."],
+          ["Syklus", "Hvert 5. minutt. Redeem først, deretter exits + Kalshi + tape. Grok annenhver runde. FAK kun på live bok. Ingen X/web."],
+          ["Redeem", "Resolverte vinnere (closed / mid≥0,99 og bud≤0,01 / data-api redeemable) innløses on-chain via proxy/relayer (CTF eller NegRisk-adapter) til pUSD. Tapere til 0 lukkes lokalt. Aldri FAK @ 0,001 på resolvert bok. Aldri closed_dust på mid≈1. redeem_ok/redeem_err én gang per condition_id, 30 min cooldown ved feil."],
+          ["Kjøp", "På ask med dybde, hvis én er sann: 1) YES+NO-ask < 0,985. 2) Låst/feilpris med tid igjen (ikke død sports-bok). 3) Kalshi-par gap ≥ 4 ¢ og PM-ask 0,22–0,82. 4) Grok-kant ≥ MIN_NET_EDGE på et likvid navn. Nær resolusjon kun hvis ≤72 t til slutt og mid ≥0,90/≤0,10, eller mid ≥0,94 med ekte bok. Mangler slutt-dato → ikke nær-res."],
+          ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Samme kamp/event_key maks 25 % av innskutt samlet. Inntil 75 % av innskutt i markedet."],
           ["Størrelse", "Alt i prosent av innskutt (ellers egenkapital). Gulv 5 %. Sports/longshot 6–8 %. Kjerne 10–14 %. Hard tak 18 % ett navn. Maks 50 % av ask-dybde og 90 % av kontant. Tynn bok (dybde < 5 %) hoppes. Påfyll kun kjerne ≥ +10 %, aldri average down, aldri rød sports. Aldri stub under 5 %."],
-          ["Sports", "Maks 4. Nye sports-kjøp er lov inntil 4 er åpne. Stopp −15 % / bud ≤ 0,03 / død bok. +22 % så trail 8 % fra topp. Mark ≤ 0,01 eller verdi < 0,1 % av base → closed_dust. Aldri Fed."],
-          ["Kjerne-exits", "Stopp −22 %. Ta gevinst bud ≥ 0,90 eller +28 %. Kalshi ≥ 7 ¢ mot kost, eller fersk p_hat ≥ 5 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes."],
-          ["Kalshi", "Kun bekreftelse/veto. Navngitte serier. 25 = 25 bps. Ingen par → ignorer. Ikke locked arb. Ingen Kalshi-konto."],
+          ["Sports", "Maks 4. Ingen ny sports hvis kontant < 15 % av innskutt (redeem først). Stopp/TP kun hvis bud ≥ 0,02. Resolvert → redeem, ikke stopp-tap −100 %. Mark ≤ 0,01 eller verdi < 0,1 % av base → closed_dust (aldri mid≈1). Aldri Fed."],
+          ["Kjerne-exits", "Stopp −22 % og TP kun på live bud ≥ 0,02 (TP også bud ≥ 0,90). Kalshi ≥ 7 ¢ mot kost, eller fersk p_hat ≥ 5 ¢ under kost. Ikke selg bare fordi Grok falt til mid. Hedge holdes. Fed holdes til den er live."],
+          ["Kalshi", "Kun bekreftelse/veto på navngitte serier. Ingen Kalshi på sports. Ingen par eller yes=0 → skip, ingen gap-maling. Måned fra tittel og ticker (26SEP ≡ september). 25 = 25 bps. Ikke locked arb. Ingen Kalshi-konto."],
           ["Sikring", "Ingen daglig handelsstopp. Ingen 85 %-halt. Eneste porteføljebrems: egenkapital ≤ 70 % av innskutt → ingen NY sports. Kjerne-kjøp og alle exits kjører."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;

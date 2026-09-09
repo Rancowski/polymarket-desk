@@ -54,23 +54,45 @@ def _theme(text: str) -> set[str]:
     return tags
 
 
-_MONTHS = (
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
-    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-)
+_MONTH_ALIAS = {
+    "january": "january", "jan": "january",
+    "february": "february", "feb": "february",
+    "march": "march", "mar": "march",
+    "april": "april", "apr": "april",
+    "may": "may",
+    "june": "june", "jun": "june",
+    "july": "july", "jul": "july",
+    "august": "august", "aug": "august",
+    "september": "september", "sep": "september", "sept": "september",
+    "october": "october", "oct": "october",
+    "november": "november", "nov": "november",
+    "december": "december", "dec": "december",
+}
+_NUM_MONTH = {
+    "01": "january", "02": "february", "03": "march", "04": "april",
+    "05": "may", "06": "june", "07": "july", "08": "august",
+    "09": "september", "10": "october", "11": "november", "12": "december",
+}
 
 
 def _months(text: str) -> set[str]:
+    """Full names, ticker codes (26SEP, SEP17), and 2026-09. sep ≡ september."""
     t = (text or "").lower()
-    found = {m for m in _MONTHS if re.search(rf"\b{m}\b", t)}
-    # map abbreviations onto full names so oct ≡ october
-    aliases = {
-        "jan": "january", "feb": "february", "mar": "march", "apr": "april",
-        "jun": "june", "jul": "july", "aug": "august", "sep": "september",
-        "oct": "october", "nov": "november", "dec": "december",
-    }
-    return {aliases.get(m, m) for m in found}
+    found: set[str] = set()
+    for full in (
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ):
+        if re.search(rf"\b{full}\b", t):
+            found.add(full)
+    for m in re.findall(
+        r"(?<![a-z])(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)(?![a-z])",
+        t,
+    ):
+        found.add(_MONTH_ALIAS.get(m, m))
+    for mm in re.findall(r"20\d{2}[-/]?(0[1-9]|1[0-2])", t):
+        found.add(_NUM_MONTH.get(mm[-2:], mm))
+    return found
 
 
 def _as_prob(raw: Any) -> float:
@@ -198,6 +220,7 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
     qmonths = _months(q)
     best = None
     best_score = 0.0
+    month_conflict = False
     for k in kalshi:
         n = len(qtok & k["tokens"])
         t = len(qtheme & k["theme"])
@@ -211,16 +234,24 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         tok_need = 3 if distinctive else 4
         if not theme_ok and n < tok_need:
             continue
+        km = _months(f"{k.get('title') or ''} {k.get('ticker') or ''}")
+        if qmonths and km and not (qmonths & km):
+            month_conflict = True
+            continue
+        if qmonths and km and (qmonths & km):
+            score += 4
         if score > best_score:
             best_score = score
             best = k
     if not best:
+        if month_conflict:
+            return None, "ulik måned"
         return None, "ingen sammenlignbar kontrakt"
     years = set(re.findall(r"20\d{2}", q))
     kyears = set(re.findall(r"20\d{2}", best["title"]))
     if years and kyears and not (years & kyears):
         return None, "ulikt år"
-    km = _months(best["title"])
+    km = _months(f"{best.get('title') or ''} {best.get('ticker') or ''}")
     if qmonths and km and not (qmonths & km):
         return None, "ulik måned"
     qth, kth = qtheme, best["theme"]
@@ -250,6 +281,8 @@ def _named_target(m: dict) -> bool:
 
 def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int, list[dict]]:
     """Attach Kalshi and return (hits, compare-log). Log every named-series attempt."""
+    from agent.risk import is_sports
+
     if kalshi is None:
         kalshi = fetch_open()
     if not kalshi:
@@ -260,10 +293,13 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
         q = m.get("question") or ""
         if not q:
             continue
+        if is_sports(m):
+            continue
         want = _named_target(m)
-        best, why = _pick(q, kalshi)
+        best, why = _pick(f"{q} {m.get('event_key') or ''}", kalshi)
         poly = float(m.get("yes_mid") or m.get("mid") or 0)
-        if not best:
+        k_yes = float(best["yes"]) if best else 0.0
+        if not best or k_yes <= 0:
             if want:
                 logs.append(
                     {
@@ -271,18 +307,18 @@ def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int,
                         "question": q[:90],
                         "ticker": "",
                         "pm": round(poly, 3),
-                        "kalshi": 0.0,
-                        "gap": 0.0,
+                        "kalshi": None,
+                        "gap": None,
                         "action": "skip",
-                        "why": why,
+                        "why": why if not best else "kalshi_yes=0",
                     }
                 )
             continue
-        gap = round(poly - float(best["yes"]), 3)
+        gap = round(poly - k_yes, 3)
         payload = {
             "title": str(best["title"])[:90],
             "ticker": best.get("ticker"),
-            "yes": round(float(best["yes"]), 3),
+            "yes": round(k_yes, 3),
             "gap": gap,
             "overlap": int(best.get("overlap") or 0),
         }

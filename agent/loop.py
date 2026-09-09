@@ -10,7 +10,7 @@ from agent.arb import Arb
 from agent.brain import Brain
 from agent.config import settings
 from agent.executor import Executor
-from agent.risk import MAX_SPORTS, Risk, dust_cutoff, is_sports, sizing_base
+from agent.risk import MAX_SPORTS, Risk, dust_cutoff, is_sports, resolved_state, sizing_base
 from agent.scanner import Scout
 from agent.store import Store
 
@@ -110,6 +110,21 @@ class Desk:
             api_mtm = self.exec.fetch_position_value()
         except Exception:
             api_mtm = None
+        live_flags: dict = {}
+        try:
+            raw_live = self.exec.fetch_live_positions()
+            if raw_live:
+                live_flags = {
+                    (str(r.get("condition_id")), str(r.get("side") or "YES").upper()): r
+                    for r in raw_live
+                }
+        except Exception:
+            live_flags = {}
+        for p in open_pos:
+            fl = live_flags.get((str(p.get("condition_id")), str(p.get("side") or "YES").upper())) or {}
+            for k in ("redeemable", "neg_risk", "closed"):
+                if fl.get(k) is not None:
+                    p[k] = fl.get(k)
         cash, equity, open_cost, open_mtm = self.store.split_cash_equity(bankroll, open_pos)
         if api_mtm is not None and api_mtm > 0 and abs(api_mtm - open_cost) > 0.05:
             open_mtm = api_mtm
@@ -190,6 +205,163 @@ class Desk:
             }
         return by_id
 
+    def _position_book(self, pos: dict) -> dict:
+        token = str(pos.get("token_id") or "")
+        if not token:
+            return {}
+        try:
+            book = self.scout.book(str(token), require_two_sided=False)
+        except Exception:
+            return {}
+        if not book or book.get("synthetic"):
+            return {"best_bid": 0, "mid": 0, "best_ask": 0, "spread": 0, "synthetic": True}
+        return book
+
+    def _redeem_cooldown(self, cid: str) -> bool:
+        raw = self.store.get_meta(f"redeem_err:{cid}", "")
+        if not raw:
+            return False
+        try:
+            return (time.time() - float(raw)) < 1800
+        except (TypeError, ValueError):
+            return False
+
+    def _run_redeems(self, open_pos: list, by_id: dict) -> tuple[int, list]:
+        """CTF redeem winners before any FAK. Losers close locally. Once per condition_id."""
+        n = 0
+        log_rows: list[dict] = []
+        winners: dict[str, list] = {}
+        logged: set[str] = set()
+
+        def _row(pos: dict, action: str, reason: str) -> dict:
+            return {
+                "question": (pos.get("question") or "")[:80],
+                "condition_id": pos.get("condition_id"),
+                "side": pos.get("side"),
+                "action": action,
+                "reason": reason,
+            }
+
+        for pos in list(open_pos):
+            cid = str(pos.get("condition_id") or "")
+            if not cid:
+                continue
+            book = self._position_book(pos)
+            mkt = by_id.get(cid) or {}
+            state = resolved_state(pos, book, mkt)
+            if state == "loser":
+                self.store.close_position(cid, pos.get("side"))
+                try:
+                    self.store.clear_dust(cid, str(pos.get("side") or "YES"))
+                except Exception:
+                    pass
+                why = "resolved loser — close locally, ikke FAK"
+                if cid not in logged:
+                    self.store.log_decision(
+                        condition_id=cid,
+                        question=pos.get("question"),
+                        side=pos.get("side"),
+                        action="closed",
+                        reason=why,
+                    )
+                    logged.add(cid)
+                log_rows.append(_row(pos, "closed", why))
+                n += 1
+                continue
+            if state == "winner":
+                winners.setdefault(cid, []).append(pos)
+
+        ready: list[dict] = []
+        for cid, rows in winners.items():
+            if self._redeem_cooldown(cid):
+                why = "redeem_err cooldown 30m"
+                if cid not in logged:
+                    self.store.log_decision(
+                        condition_id=cid,
+                        question=rows[0].get("question"),
+                        side=rows[0].get("side"),
+                        action="redeem_err",
+                        reason=why,
+                    )
+                    logged.add(cid)
+                log_rows.append(_row(rows[0], "redeem_err", why))
+                continue
+            ready.append(rows[0])
+
+        def _ok(cid: str, rows: list, result: dict) -> None:
+            nonlocal n
+            status = str(result.get("status") or "redeem_ok")
+            txh = str(result.get("tx") or "")
+            why = f"{status} tx={txh[:18] if txh else '—'}"
+            self.store.set_meta(f"redeem_err:{cid}", "")
+            if cid not in logged:
+                self.store.log_decision(
+                    condition_id=cid,
+                    question=rows[0].get("question"),
+                    side=rows[0].get("side"),
+                    action="redeem_ok",
+                    reason=why,
+                )
+                logged.add(cid)
+            log_rows.append(_row(rows[0], "redeem_ok", why))
+            n += 1
+            log.info("redeem_ok %s %s", (rows[0].get("question") or "")[:50], why)
+
+        def _err(cid: str, rows: list, exc: Exception) -> None:
+            why = f"redeem_err {exc}"[:220]
+            self.store.set_meta(f"redeem_err:{cid}", f"{time.time():.0f}")
+            if cid not in logged:
+                self.store.log_decision(
+                    condition_id=cid,
+                    question=rows[0].get("question"),
+                    side=rows[0].get("side"),
+                    action="redeem_err",
+                    reason=why,
+                )
+                logged.add(cid)
+            log_rows.append(_row(rows[0], "redeem_err", why))
+            log.warning("redeem_err %s %s", cid[:16], why)
+
+        if ready:
+            try:
+                results = self.exec.redeem_batch(ready)
+                failed: list[dict] = []
+                for pos in ready:
+                    cid = str(pos.get("condition_id"))
+                    result = results.get(cid) or {}
+                    st = str(result.get("status") or "")
+                    if st in {"redeem_ok", "paper_redeem"}:
+                        _ok(cid, winners.get(cid) or [pos], result)
+                    else:
+                        failed.append(pos)
+                if not results:
+                    failed = list(ready)
+                for pos in failed:
+                    cid = str(pos.get("condition_id"))
+                    try:
+                        result = self.exec.redeem(pos)
+                        st = str(result.get("status") or "")
+                        if st in {"redeem_ok", "paper_redeem"}:
+                            _ok(cid, winners.get(cid) or [pos], result)
+                        else:
+                            _err(cid, winners.get(cid) or [pos], RuntimeError(st or "ukjent"))
+                    except Exception as exc:
+                        _err(cid, winners.get(cid) or [pos], exc)
+            except Exception as exc:
+                log.warning("redeem_batch: %s — prøver per condition_id", exc)
+                for pos in ready:
+                    cid = str(pos.get("condition_id"))
+                    try:
+                        result = self.exec.redeem(pos)
+                        st = str(result.get("status") or "")
+                        if st in {"redeem_ok", "paper_redeem"}:
+                            _ok(cid, winners.get(cid) or [pos], result)
+                        else:
+                            _err(cid, winners.get(cid) or [pos], RuntimeError(st or "ukjent"))
+                    except Exception as one:
+                        _err(cid, winners.get(cid) or [pos], one)
+        return n, log_rows
+
     def _run_exits(self, open_pos: list, estimates: dict, by_id: dict, equity: float = 0.0) -> tuple[int, list]:
         """Flatten on live bid. Always log hold | selling | sold | reject. Independent of Grok."""
         sold = 0
@@ -210,7 +382,16 @@ class Desk:
                     "reason": reason,
                 }
 
-            if self.store.is_dust(str(cid or ""), str(side or "YES")):
+            try:
+                mark_pre = float(pos.get("cur_price") or 0)
+            except (TypeError, ValueError):
+                mark_pre = 0.0
+            if mark_pre >= 0.90:
+                try:
+                    self.store.clear_dust(str(cid or ""), str(side or "YES"))
+                except Exception:
+                    pass
+            elif self.store.is_dust(str(cid or ""), str(side or "YES")):
                 why = "closed_dust — hopper FAK"
                 self.store.log_decision(
                     condition_id=cid,
@@ -265,6 +446,23 @@ class Desk:
                 )
                 log_rows.append(_row("hold", why))
                 continue
+            if str(ticket_ex.get("kind") or "") == "resolved_loser":
+                self.store.close_position(str(cid or ""), side)
+                try:
+                    self.store.clear_dust(str(cid or ""), str(side or "YES"))
+                except Exception:
+                    pass
+                why = ticket_ex.get("reason") or "resolved loser — close locally"
+                self.store.log_decision(
+                    condition_id=cid,
+                    question=pos.get("question"),
+                    side=side,
+                    action="closed",
+                    reason=why,
+                )
+                log_rows.append(_row("closed", why))
+                sold += 1
+                continue
             try:
                 result = self.exec.sell(ticket_ex)
                 status = str(result.get("status") or "")
@@ -278,10 +476,13 @@ class Desk:
                 if status in {"live_sell", "paper_sell"}:
                     action = "sold"
                     sold += 1
-                elif status == "unmatched_dust" or (
-                    ticket_ex.get("dust")
-                    and status in {"resting_sell", "resting"}
-                    and (value < dust_cutoff(sizing_base(self.store.deposited_usd(0.0), equity)) or mark <= 0.01)
+                elif mark < 0.90 and (
+                    status == "unmatched_dust"
+                    or (
+                        ticket_ex.get("dust")
+                        and status in {"resting_sell", "resting"}
+                        and (value < dust_cutoff(sizing_base(self.store.deposited_usd(0.0), equity)) or mark <= 0.01)
+                    )
                 ):
                     px = result.get("attempt_px")
                     self.store.add_fill(
@@ -342,18 +543,33 @@ class Desk:
             if key in seen:
                 continue
             seen.add(key)
-            gap = float(row.get("gap") or 0)
+            raw_gap = row.get("gap")
+            raw_k = row.get("kalshi")
+            ticker = str(row.get("ticker") or "")
+            try:
+                k_yes = float(raw_k) if raw_k not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                k_yes = 0.0
+            try:
+                gap = float(raw_gap) if raw_gap not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                gap = 0.0
+            unpaired = not ticker or k_yes <= 0
             self.store.log_decision(
                 condition_id=cid or None,
                 question=row.get("question"),
                 mid=row.get("pm"),
-                p_hat=row.get("kalshi"),
-                edge_net=gap,
+                p_hat=None if unpaired else raw_k,
+                edge_net=None if unpaired else gap,
                 action=f"kalshi-{row.get('action') or 'skip'}",
                 reason=(
-                    f"{row.get('ticker') or '—'} PM {float(row.get('pm') or 0):.2f} "
-                    f"Kalshi {float(row.get('kalshi') or 0):.2f} gap {gap:+.2f} "
-                    f"{row.get('why') or ''}"
+                    f"{ticker or '—'} skip {row.get('why') or 'unpaired'}"
+                    if unpaired
+                    else (
+                        f"{ticker} PM {float(row.get('pm') or 0):.2f} "
+                        f"Kalshi {k_yes:.2f} gap {gap:+.2f} "
+                        f"{row.get('why') or ''}"
+                    )
                 ).strip(),
                 payload=row,
             )
@@ -370,6 +586,14 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi fetch: %s", exc)
         by_open = self._market_stubs(open_pos)
+        redeems, redeem_log = self._run_redeems(open_pos, by_open)
+        if redeems:
+            try:
+                bankroll, equity, open_pos = self._refresh_portfolio()
+                by_open = self._market_stubs(open_pos)
+            except Exception as exc:
+                log.warning("post-redeem sync: %s", exc)
+                open_pos = self.store.positions("open")
         try:
             _n, log1 = kalshi_compare(list(by_open.values()), kalshi_rows)
             kalshi_log.extend(log1)
@@ -377,6 +601,8 @@ class Desk:
             log.warning("Kalshi (åpne): %s", exc)
         self._log_kalshi(kalshi_log)
         exits, exit_log = self._run_exits(open_pos, {}, by_open, equity=equity)
+        exit_log = redeem_log + exit_log
+        exits = redeems + exits
         open_pos = self.store.positions("open")
         if halt:
             log.warning("Stoppet: %s", halt)

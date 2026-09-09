@@ -33,6 +33,27 @@ class Settings:
     poly_api_key: str = os.getenv("POLY_API_KEY", "").strip()
     poly_api_secret: str = os.getenv("POLY_API_SECRET", "").strip()
     poly_api_passphrase: str = os.getenv("POLY_API_PASSPHRASE", "").strip()
+    builder_api_key: str = (
+        os.getenv("POLYMARKET_BUILDER_API_KEY") or os.getenv("BUILDER_API_KEY") or ""
+    ).strip()
+    builder_secret: str = (
+        os.getenv("POLYMARKET_BUILDER_SECRET") or os.getenv("BUILDER_SECRET") or ""
+    ).strip()
+    builder_passphrase: str = (
+        os.getenv("POLYMARKET_BUILDER_PASSPHRASE")
+        or os.getenv("BUILDER_PASS_PHRASE")
+        or os.getenv("BUILDER_PASSPHRASE")
+        or ""
+    ).strip()
+    relayer_url: str = os.getenv("POLYMARKET_RELAYER_URL", "https://relayer-v2.polymarket.com").strip()
+    relayer_api_key: str = (
+        os.getenv("POLYMARKET_RELAYER_API_KEY") or os.getenv("RELAYER_API_KEY") or ""
+    ).strip()
+    relayer_api_key_address: str = (
+        os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS")
+        or os.getenv("RELAYER_API_KEY_ADDRESS")
+        or ""
+    ).strip()
     xai_api_key: str = os.getenv("XAI_API_KEY", "").strip()
     grok_model: str = os.getenv("GROK_MODEL", "grok-4.6").strip()
     max_position_pct: float = _f("MAX_POSITION_PCT", 0.18)

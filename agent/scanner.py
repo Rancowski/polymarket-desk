@@ -9,7 +9,7 @@ from typing import Any
 import requests
 
 from agent.config import SKIP_QUESTION_PATTERNS, settings
-from agent.risk import is_sports
+from agent.risk import hours_to_end, is_sports, parse_end
 
 log = logging.getLogger("scout")
 
@@ -93,16 +93,10 @@ def _category(raw: dict) -> str:
 
 
 def _hours_left(raw: Any) -> float | None:
-    if not raw:
+    dt = parse_end(raw)
+    if dt is None:
         return None
-    text = str(raw).replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return round((dt - datetime.now(timezone.utc)).total_seconds() / 3600.0, 1)
-    except ValueError:
-        return None
+    return round((dt - datetime.now(timezone.utc)).total_seconds() / 3600.0, 1)
 
 
 def _event_key(raw: dict) -> str:
@@ -176,10 +170,26 @@ class Scout:
                 item["category"] = "sports"
             if item["condition_id"]:
                 out.append(item)
+        hours_by_event: dict[str, float] = {}
+        for item in out:
+            key = item.get("event_key") or ""
+            h = hours_to_end(item)
+            if key and h is not None:
+                prev = hours_by_event.get(key)
+                hours_by_event[key] = h if prev is None else max(prev, h)
+        for item in out:
+            key = item.get("event_key") or ""
+            if key in hours_by_event:
+                item["hours_left"] = hours_by_event[key]
         by_event: dict[str, list[dict]] = {}
         for item in out:
             by_event.setdefault(item["event_key"], []).append(
-                {"q": (item["question"] or "")[:90], "yes": round(float(item.get("yes_mid") or 0), 3)}
+                {
+                    "q": (item["question"] or "")[:90],
+                    "yes": round(float(item.get("yes_mid") or 0), 3),
+                    "hours_left": item.get("hours_left"),
+                    "end_date": item.get("end_date"),
+                }
             )
         for item in out:
             key = item["event_key"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from agent.config import FEE_RATE, settings
 from agent.store import Store
@@ -166,6 +167,8 @@ DEPLOYED_MAX = 0.75
 EQUITY_SPORTS_HALT = 0.70
 MAX_SPORTS = 4
 HARD_NAME_PCT = 0.18
+EVENT_COST_PCT = 0.25
+CASH_SPORTS_MIN = 0.15
 SPORTS_PCT = (0.06, 0.08)
 CORE_PCT = (0.10, 0.14)
 MIN_NOTIONAL_PCT = 0.05
@@ -249,6 +252,125 @@ def size_ticket(
     return usd, shares, ""
 
 
+def parse_end(raw: Any) -> datetime | None:
+    """Parse Polymarket end dates. None if missing/unparsed — never treat as due now."""
+    if raw is None or raw is False or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        ts = float(raw)
+        if ts > 1e12:
+            ts /= 1000.0
+        if 1e9 < ts < 2e10:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in {"none", "null", "undefined"}:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def hours_to_end(market: dict) -> float | None:
+    try:
+        h = market.get("hours_left")
+        if h is not None and h != "":
+            return float(h)
+    except (TypeError, ValueError):
+        pass
+    dt = parse_end(
+        market.get("end_date") or market.get("endDate") or market.get("endDateIso")
+    )
+    if dt is None:
+        return None
+    return (dt - datetime.now(timezone.utc)).total_seconds() / 3600.0
+
+
+def event_hours_to_end(market: dict) -> float | None:
+    """One clock per event: use the furthest parsed sibling so a bad short date cannot split Fed hike/hold/cut."""
+    hours: list[float] = []
+    h = hours_to_end(market)
+    if h is not None:
+        hours.append(h)
+    for s in market.get("siblings") or []:
+        if not isinstance(s, dict):
+            continue
+        sh = hours_to_end(s)
+        if sh is not None:
+            hours.append(sh)
+    if not hours:
+        return None
+    return max(hours)
+
+
+def is_near_resolution(market: dict, book: dict | None = None) -> tuple[bool, str]:
+    """Near-res only with time+mid, or 94c lottery on a live book. Missing end_date is not near-res."""
+    book = book or {}
+    try:
+        mid = float(book.get("mid") or market.get("mid") or market.get("yes_mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    try:
+        live_bid = float(book.get("best_bid") or 0)
+    except (TypeError, ValueError):
+        live_bid = 0.0
+    live = (not book.get("synthetic")) and live_bid > 0
+    hours = event_hours_to_end(market)
+    if hours is None:
+        log.info("no_end %s", (market.get("question") or "")[:80])
+        if live and mid >= 0.94:
+            return True, "nær resolusjon"
+        return False, "no_end"
+    if hours <= 72 and (mid >= 0.90 or mid <= 0.10):
+        return True, "nær resolusjon"
+    if mid >= 0.94 and live:
+        return True, "nær resolusjon"
+    return False, ""
+
+
+def resolved_state(pos: dict, book: dict | None = None, market: dict | None = None) -> str | None:
+    """winner | loser | None. Resolved winners must be redeemed, never FAK/dust."""
+    book = book or {}
+    market = market or {}
+    try:
+        mid = float(pos.get("cur_price") or book.get("mid") or market.get("mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    try:
+        bid = float(book.get("best_bid") or 0)
+    except (TypeError, ValueError):
+        bid = 0.0
+    if book.get("synthetic"):
+        bid = 0.0
+    redeemable = bool(pos.get("redeemable") or market.get("redeemable"))
+    closed = bool(market.get("closed") or market.get("resolved") or pos.get("closed"))
+    if redeemable or (mid >= 0.99 and bid <= 0.01) or (closed and mid >= 0.90):
+        if mid <= 0.05 and not redeemable:
+            return "loser"
+        return "winner"
+    if closed and mid <= 0.05:
+        return "loser"
+    if mid <= 0.01 and bid <= 0.01 and closed:
+        return "loser"
+    return None
+
+
 def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
     """Kelly clip in percent space. Floor is 5% of bankroll, never a dollar stub."""
     kelly = kelly_usd(p_hat, cost, bankroll)
@@ -272,9 +394,11 @@ class Risk:
         _ = (equity, deposited)
         return self.halted()
 
-    def sports_blocked(self, equity: float, deposited: float) -> str | None:
+    def sports_blocked(self, equity: float, deposited: float, cash: float | None = None) -> str | None:
         if deposited >= 1 and equity > 0 and equity <= EQUITY_SPORTS_HALT * deposited:
             return "equity ≤70% — ingen ny sports"
+        if cash is not None and deposited >= 1 and cash < CASH_SPORTS_MIN * deposited:
+            return "cash <15% — redeem først"
         return None
 
     def evaluate(
@@ -299,8 +423,11 @@ class Risk:
         conf = str(estimate.get("confidence") or "medium").lower()
         p_yes = float(estimate["p_yes"])
         mid = float(book.get("mid") or market.get("mid") or 0.5)
-        if mid >= 0.94 or mid <= 0.06:
-            return None, "nær resolusjon"
+        near, near_why = is_near_resolution(market, book)
+        if near:
+            return None, near_why
+        if near_why == "no_end":
+            log.info("no_end — hopper nær-res, andre filter %s", (market.get("question") or "")[:60])
         if is_sports(market) and (mid >= 0.88 or mid <= 0.12):
             return None, "sports nær avgjort"
         disagreement = abs(p_yes - mid)
@@ -347,12 +474,10 @@ class Risk:
             need = max(need, 0.022)
         if edge_net < (0.0 if probe else need):
             return None, f"edge_net {edge_net:.3f} < {need}"
-        if cost <= 0.15 or cost >= 0.85:
-            return None, "nær resolusjon"
         sports = is_sports(market)
         if sports and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
             return None, "sports ekstrem-pris"
-        sport_halt = self.sports_blocked(equity, deposited)
+        sport_halt = self.sports_blocked(equity, deposited, cash=bankroll)
         if sports and sport_halt:
             return None, sport_halt
 
@@ -371,8 +496,6 @@ class Risk:
             if held_cost <= 0 or upnl < REUP_MIN_PNL * held_cost:
                 return None, "aldri average down"
             reup = True
-        if not hedge and not reup and any(p.get("event_key") == event and p.get("condition_id") != cid for p in open_pos):
-            return None, "ett event en tese"
         if len(open_pos) >= settings.max_open_positions and not hedge and not reup:
             return None, "max 10 åpne (kun hedge/påfyll)"
         sports_pos = [p for p in open_pos if is_sports(p)]
@@ -397,7 +520,7 @@ class Risk:
         else:
             _floor_pct, cap_pct = CORE_PCT
         cap = min(cap_pct * size_base, HARD_NAME_PCT * size_base)
-        remaining_event = max(0.0, cap - same_event_cost)
+        remaining_event = max(0.0, EVENT_COST_PCT * size_base - same_event_cost)
         remaining_cat = max(0.0, settings.max_category_pct * size_base - cat_cost)
         powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
         sized, shares, skip_sz = size_ticket(
@@ -466,11 +589,19 @@ class Risk:
         missing = book_bid <= 0
         mark = bid
         value = shares * mark
+        state = resolved_state(pos, book, market)
+        if state == "winner":
+            return None, "resolved — redeem"
+        if state == "loser":
+            return self._exit_ticket(
+                pos, book, shares, 0.0, "resolved loser — close locally",
+                kind="resolved_loser", best_bid=book_bid,
+            ), "ok"
         dep = self.store.deposited_usd(0.0)
         base = sizing_base(dep, bankroll)
         dust_cut = dust_cutoff(base)
-        # Dust/dead SPORTS only — never Fed. Mark ≤ 0.01 or value < 0.1% of base.
-        if sports and (missing or book_bid <= 0.01 or mark <= 0.01 or (dust_cut > 0 and value < dust_cut)):
+        # Dust/dead SPORTS only — never Fed, never a mid≈1 winner.
+        if sports and mark < 0.90 and (missing or book_bid <= 0.01 or mark <= 0.01 or (dust_cut > 0 and value < dust_cut)):
             px = min(0.01, book_bid) if book_bid > 0 else 0.01
             return self._exit_ticket(
                 pos, book, shares, px,
@@ -479,6 +610,8 @@ class Risk:
                 best_bid=book_bid,
             ), "ok"
         if force_reason:
+            if book_bid < 0.02:
+                return None, f"hold trim — ingen live bud ({force_reason})"
             return self._exit_ticket(
                 pos, book, shares, max(bid, 0.01), force_reason, kind="stop", best_bid=book_bid or bid
             ), "ok"
@@ -499,23 +632,25 @@ class Risk:
         if bid > hwm:
             hwm = bid
             self.store.set_meta(hwm_key, f"{hwm:.4f}")
-        if sports and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and hwm > 0 and bid <= hwm * 0.92:
+        if sports and bid >= 0.02 and (hwm >= avg * 1.22 or pnl_pct >= 0.22) and hwm > 0 and bid <= hwm * 0.92:
             return self._exit_ticket(
                 pos, book, shares, bid, f"sports trail −8% fra topp {hwm:.3f} → {bid:.3f}",
                 kind="tp", best_bid=bid,
             ), "ok"
 
-        if sports and (bid <= avg * 0.85 or pnl_pct <= -0.15 or bid <= 0.03):
+        if sports and bid >= 0.02 and (bid <= avg * 0.85 or pnl_pct <= -0.15):
             return self._exit_ticket(
-                pos, book, shares, max(bid, 0.01), f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
+                pos, book, shares, bid, f"sports stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
                 kind="stop", best_bid=bid,
             ), "ok"
-        if not sports and pnl_pct <= -0.22:
+        if sports and bid < 0.02:
+            return None, f"hold tom/resolved bok bid {bid:.4f} — ikke FAK"
+        if not sports and bid >= 0.02 and pnl_pct <= -0.22:
             return self._exit_ticket(
                 pos, book, shares, bid, f"stopp-tap {pnl_pct:.1%} bid {bid:.3f}",
                 kind="stop", best_bid=bid,
             ), "ok"
-        if not sports and (bid >= 0.90 or pnl_pct >= 0.28):
+        if not sports and (bid >= 0.90 or (bid >= 0.02 and pnl_pct >= 0.28)):
             return self._exit_ticket(
                 pos, book, shares, bid, f"ta gevinst {pnl_pct:.1%} bid {bid:.3f}",
                 kind="tp", best_bid=bid,
@@ -534,7 +669,7 @@ class Risk:
         hours_left = None
         if market:
             hours_left = market.get("hours_left")
-        if sports and mid < 0.15 and (hours_open >= 3 or (hours_left is not None and float(hours_left) < -3)):
+        if sports and book_bid >= 0.02 and mid < 0.15 and (hours_open >= 3 or (hours_left is not None and float(hours_left) < -3)):
             return self._exit_ticket(
                 pos, book, shares, max(bid, 0.01), f"kamp >3t og mid {mid:.3f}<0.15",
                 kind="dust", best_bid=book_bid,
@@ -542,7 +677,9 @@ class Risk:
 
         ks = kalshi or {}
         k_yes = float(ks.get("yes") or 0)
-        if 0.02 < k_yes < 0.98:
+        if sports:
+            k_yes = 0.0
+        if not sports and 0.02 < k_yes < 0.98:
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
             if k_hat + 0.07 < avg:
                 return self._exit_ticket(

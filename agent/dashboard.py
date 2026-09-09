@@ -113,7 +113,12 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
             hints[f"{cid}:{row.get('side') or ''}"] = row
     for row in (last_cycle or {}).get("kalshi_log") or []:
         cid = row.get("condition_id")
-        if cid:
+        ticker = str(row.get("ticker") or "")
+        try:
+            k_yes = float(row.get("kalshi")) if row.get("kalshi") not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            k_yes = 0.0
+        if cid and ticker and k_yes > 0:
             kalshi_by[str(cid)] = row
     out = []
     for p in open_pos:
