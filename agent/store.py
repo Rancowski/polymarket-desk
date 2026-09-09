@@ -103,8 +103,26 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
     explicit = normalize_source(data.get("source"))
     su = normalize_side(side)
     low = thesis.lower()
-    if explicit == "kalshi" and not kalshi_fields_ok(raw=data):
-        explicit = None
+    if explicit == "kalshi":
+        tick = data.get("kalshi_ticker") or data.get("ticker")
+        if not kalshi_fields_ok(tick, data.get("kalshi_mid"), data.get("pm_mid"), data):
+            explicit = None
+        else:
+            q = data.get("question")
+            if not q:
+                explicit = None
+            else:
+                from agent.kalshi import pair_ok
+
+                ok, _why = pair_ok(
+                    str(q),
+                    str(tick),
+                    str(data.get("title") or ""),
+                    data.get("kalshi_mid"),
+                    data.get("pm_mid"),
+                )
+                if not ok:
+                    explicit = None
     if explicit:
         return explicit, thesis or None
     if su == "REDEEM" or data.get("redeem"):
@@ -126,10 +144,20 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
         return "complement", thesis or None
     if "låst utfall" in low:
         return "tape", thesis or None
-    if kalshi_fields_ok(raw=data) and (
-        "kalshi-bekreftelse" in low or explicit == "kalshi" or data.get("kalshi_ticker")
+    if kalshi_fields_ok(raw=data) and data.get("question") and (
+        "kalshi-bekreftelse" in low or data.get("kalshi_ticker")
     ):
-        return "kalshi", thesis or None
+        from agent.kalshi import pair_ok
+
+        ok, _why = pair_ok(
+            str(data.get("question")),
+            str(data.get("kalshi_ticker") or data.get("ticker") or ""),
+            str(data.get("title") or ""),
+            data.get("kalshi_mid"),
+            data.get("pm_mid"),
+        )
+        if ok:
+            return "kalshi", thesis or None
     if " | kalshi " in low or low.startswith("grok ") or "edge_net=" in low or "no kalshi" in low:
         return "grok", thesis or None
     if "kalshi" in low:
@@ -563,15 +591,25 @@ class Store:
         kalshi_ticker = row.get("kalshi_ticker") if "kalshi_ticker" in row else data.get("kalshi_ticker")
         kalshi_mid = row.get("kalshi_mid") if "kalshi_mid" in row else data.get("kalshi_mid")
         pm_mid = row.get("pm_mid") if "pm_mid" in row else data.get("pm_mid")
-        if src == "kalshi" and not kalshi_fields_ok(kalshi_ticker, kalshi_mid, pm_mid, {**data, "source_detail": detail}):
-            inf, inf_detail = infer_fill_source(
-                side,
-                {**data, "source": None, "source_detail": detail, "kalshi_ticker": kalshi_ticker, "kalshi_mid": kalshi_mid, "pm_mid": pm_mid},
-            )
-            src = inf if inf and inf != "kalshi" else None
-            if not detail:
-                detail = inf_detail
         question = row.get("question") or data.get("question")
+        if src == "kalshi":
+            from agent.kalshi import pair_ok
+
+            legal = kalshi_fields_ok(kalshi_ticker, kalshi_mid, pm_mid, {**data, "source_detail": detail}) and bool(question) and pair_ok(
+                str(question),
+                str(kalshi_ticker or ""),
+                str(data.get("title") or ""),
+                kalshi_mid,
+                pm_mid,
+            )[0]
+            if not legal:
+                inf, inf_detail = infer_fill_source(
+                    side,
+                    {**data, "source": None, "source_detail": detail, "kalshi_ticker": kalshi_ticker, "kalshi_mid": kalshi_mid, "pm_mid": pm_mid, "question": question},
+                )
+                src = inf if inf and inf != "kalshi" else None
+                if not detail:
+                    detail = inf_detail
         token_id = row.get("token_id") or data.get("token_id")
         grok_p = row.get("grok_p") if "grok_p" in row else data.get("grok_p")
         grok_conf = row.get("grok_conf") if "grok_conf" in row else data.get("grok_conf")

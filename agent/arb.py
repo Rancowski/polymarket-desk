@@ -336,6 +336,12 @@ class Arb:
             ticker = str(ks.get("ticker") or "").strip()
             if not cid or not ticker:
                 continue
+            from agent.kalshi import pair_ok
+
+            pm = float(m.get("yes_mid") or m.get("mid") or ks.get("pm_yes") or 0)
+            k_yes = float(ks.get("yes") or 0)
+            if not pair_ok(str(m.get("question") or ""), ticker, str(ks.get("title") or ""), k_yes, pm)[0]:
+                continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
             if _finishing(m):

@@ -66,10 +66,14 @@ def _fill_attr(src: Any, extra: dict | None = None) -> dict:
         "cycle_id": data.get("cycle_id") or None,
         "side": normalize_side(data.get("side")),
     }
-    if out["source"] == "kalshi" and not kalshi_fields_ok(
-        out.get("kalshi_ticker"), out.get("kalshi_mid"), out.get("pm_mid")
-    ):
-        out["source"] = "grok" if out.get("grok_p") is not None else None
+    if out["source"] == "kalshi":
+        from agent.kalshi import pair_ok
+
+        q = data.get("question")
+        if not kalshi_fields_ok(out.get("kalshi_ticker"), out.get("kalshi_mid"), out.get("pm_mid")) or not q:
+            out["source"] = "grok" if out.get("grok_p") is not None else None
+        elif not pair_ok(str(q), str(out.get("kalshi_ticker") or ""), str(data.get("title") or ""), out.get("kalshi_mid"), out.get("pm_mid"))[0]:
+            out["source"] = "grok" if out.get("grok_p") is not None else None
     return out
 
 

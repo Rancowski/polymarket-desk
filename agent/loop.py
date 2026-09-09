@@ -142,6 +142,9 @@ class Desk:
         self._cycle_id = ""
         self._bought = 0
         self._reject_counts = {k: 0 for k in REJECT_KEYS}
+        from agent.kalshi import pair_ok_selfcheck
+
+        pair_ok_selfcheck()
         threading.Thread(target=self._bootstrap_portfolio, daemon=True, name="desk-boot").start()
 
     def begin_cycle_async(self) -> bool:
@@ -292,7 +295,7 @@ class Desk:
         return force
 
     def _illegal_pair_flatten(self, open_pos: list, by_id: dict) -> dict[tuple, str]:
-        """FAK-sell legs whose stored/live Kalshi ticker fails the hard pair rule."""
+        """FAK-sell legs whose live/stored Kalshi ticker fails pair_ok, or kalshi without ticker."""
         force: dict[tuple, str] = {}
         for p in open_pos:
             q = str(p.get("question") or "")
@@ -300,36 +303,46 @@ class Desk:
             side = str(p.get("side") or "YES")
             if not cid:
                 continue
-            ticks: list[str] = []
             live = (by_id.get(cid) or {}).get("kalshi") or {}
-            if live.get("ticker"):
-                ticks.append(str(live.get("ticker")))
-            ticks.extend(extract_tickers(str(p.get("entry_detail") or "")))
+            title = str(live.get("title") or "")
             try:
-                ticks.extend(self.store.kalshi_tickers_for(cid))
+                ky = float(live.get("yes") or 0) or None
+            except (TypeError, ValueError):
+                ky = None
+            try:
+                py = float(live.get("pm_yes") or p.get("cur_price") or 0) or None
+            except (TypeError, ValueError):
+                py = None
+
+            def _legal(tick: str) -> tuple[bool, str]:
+                t = str(tick or "").strip()
+                if not t:
+                    return False, "ingen ticker"
+                if keep_fed_h25(q, t):
+                    return True, ""
+                return pair_ok(q, t, title, ky, py)
+
+            live_tick = str(live.get("ticker") or "").strip()
+            if live_tick:
+                ok, why = _legal(live_tick)
+                if not ok:
+                    force[(cid, side)] = f"ulovlig par {live_tick} — {why}"
+                continue
+            stored: list[str] = []
+            stored.extend(extract_tickers(str(p.get("entry_detail") or "")))
+            try:
+                stored.extend(self.store.kalshi_tickers_for(cid))
             except Exception:
                 pass
-            seen: set[str] = set()
-            for tick in ticks:
-                t = str(tick or "").strip()
-                if not t or t in seen:
+            stored = list(dict.fromkeys(t for t in stored if t))
+            if stored:
+                if any(_legal(t)[0] for t in stored):
                     continue
-                seen.add(t)
-                if keep_fed_h25(q, t):
-                    continue
-                title = str(live.get("title") or "")
-                try:
-                    ky = float(live.get("yes") or 0) or None
-                except (TypeError, ValueError):
-                    ky = None
-                try:
-                    py = float(live.get("pm_yes") or p.get("cur_price") or 0) or None
-                except (TypeError, ValueError):
-                    py = None
-                ok, why = pair_ok(q, t, title, ky, py)
-                if not ok:
-                    force[(cid, side)] = f"ulovlig par {t} — {why}"
-                    break
+                t0 = stored[0]
+                force[(cid, side)] = f"ulovlig par {t0} — {_legal(t0)[1]}"
+                continue
+            if str(p.get("entry_source") or "") == "kalshi":
+                force[(cid, side)] = "kalshi uten gyldig ticker — flatten"
         return force
 
     def _market_stubs(self, open_pos: list) -> dict:

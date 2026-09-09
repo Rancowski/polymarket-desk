@@ -6,6 +6,7 @@ import sys
 
 from agent.config import settings
 from agent.dashboard import start_in_thread
+from agent.kalshi import pair_ok_selfcheck
 from agent.loop import Desk
 
 
@@ -19,6 +20,7 @@ def setup_logging() -> None:
 
 def main() -> None:
     setup_logging()
+    pair_ok_selfcheck()
     p = argparse.ArgumentParser(description="Autonom Polymarket-desk")
     p.add_argument("cmd", nargs="?", default="run", choices=["run", "once", "status"])
     args = p.parse_args()

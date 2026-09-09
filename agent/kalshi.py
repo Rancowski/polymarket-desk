@@ -355,7 +355,7 @@ def _pm_family(q: str) -> str:
         return "dsa"
     if any(x in t for x in ("fed", "fomc", "federal reserve")):
         return "fed"
-    if "lula" in t or ("brazil" in t and "president" in t):
+    if any(x in t for x in ("lula", "cury", "caiado")) or ("brazil" in t and "president" in t):
         return "br_pres"
     if "brazil" in t and any(x in t for x in ("senate", "congress", "deput", "chamber", "legislature")):
         return "br_leg"
@@ -537,6 +537,8 @@ def pair_ok(
     if pf in {"btc", "eth"}:
         q_strike = _strikes(pm_q)
         k_strike = _strikes(f"{tick} {k_title}")
+        if not q_strike:
+            return False, "ingen strike i PM"
         if not _strike_close(q_strike, k_strike, 0.02):
             return False, f"strike mismatch {sorted(q_strike)[:3]} vs {sorted(k_strike)[:3]}"
         qmd, kmd = _md(pm_q), _md(f"{tick} {k_title}")
@@ -552,6 +554,43 @@ def pair_ok(
         if not pinned and not (0.01 < ky < 0.99 and 0.01 < py < 0.99):
             return False, f"mid utenfor (0.01,0.99) k={ky:.3f} pm={py:.3f}"
     return True, ""
+
+
+ILLEGAL_PAIR_FIXTURES: tuple[tuple[str, str, str], ...] = (
+    ("Lula president of Brazil 2026", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+    ("Will Republicans control the US Senate?", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+    ("US House majority 2026", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+    ("Russian New People party in the Duma", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+    ("Will Elon tweet 40-64 times this week?", "KXBTC-26SEP0907-T87299", "Bitcoin above 87299"),
+    ("Bitcoin above $72000 on Sep 9", "KXBTC-26SEP0907-T87299", "Bitcoin T87299"),
+    ("Bitcoin above $74000 on Sep 9", "KXBTC-26SEP0907-T87299", "Bitcoin T87299"),
+    ("Bitcoin above $76000 on Sep 9", "KXBTC-26SEP0907-T87299", "Bitcoin T87299"),
+    ("Bitcoin above $78000 on Sep 9", "KXBTC-26SEP0907-T87299", "Bitcoin T87299"),
+    ("Laptop FDV $100M one day after launch", "KXHORMUZNORM", "Hormuz traffic normal"),
+    ("Cury president Brazil", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+    ("Caiado president Brazil", "KXBRSENMOSTSEATS", "Brazil senate most seats"),
+)
+
+
+def pair_ok_selfcheck() -> None:
+    """Kill the process if the 12:19 illegal fixtures would still attach."""
+    bad: list[str] = []
+    for q, tick, title in ILLEGAL_PAIR_FIXTURES:
+        ok, why = pair_ok(q, tick, title, 0.45, 0.47)
+        if ok:
+            bad.append(f"{q[:48]} + {tick} ({why})")
+    legal_ok, legal_why = pair_ok(
+        "Fed hike 25 bps in September",
+        "KXFEDDECISION-26SEP-H25",
+        "Fed decision 25bp",
+        0.45,
+        0.47,
+    )
+    if not legal_ok:
+        raise RuntimeError(f"pair_ok selfcheck: legal Fed H25 rejected ({legal_why})")
+    if bad:
+        raise RuntimeError("pair_ok selfcheck FAILED, would attach: " + " | ".join(bad))
+    log.info("pair_ok selfcheck ok — %s illegal fixtures blocked", len(ILLEGAL_PAIR_FIXTURES))
 
 
 def keep_fed_h25(pm_q: str, ticker: str) -> bool:

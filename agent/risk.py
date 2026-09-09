@@ -544,7 +544,22 @@ class Risk:
         if is_sports(market) and (mid >= 0.88 or mid <= 0.12):
             return None, "sports nær avgjort"
         ks_pair = market.get("kalshi") or {}
-        clean_kalshi = bool(ks_pair.get("ticker")) and 0 < float(ks_pair.get("yes") or 0) < 1
+        from agent.kalshi import pair_ok
+
+        k_tick = str(ks_pair.get("ticker") or "").strip()
+        try:
+            k_mid = float(ks_pair.get("yes") or 0)
+        except (TypeError, ValueError):
+            k_mid = 0.0
+        clean_kalshi = bool(k_tick) and 0 < k_mid < 1 and pair_ok(
+            str(market.get("question") or ""),
+            k_tick,
+            str(ks_pair.get("title") or ""),
+            k_mid,
+            mid,
+        )[0]
+        if k_tick and not clean_kalshi:
+            ks_pair = {}
         if conf == "low":
             return None, "confidence=low"
         if mid >= 0.90 and not clean_kalshi:
@@ -872,6 +887,17 @@ class Risk:
         if sports:
             k_yes = 0.0
             ticker = ""
+        if not sports and ticker and 0 < k_yes < 1:
+            from agent.kalshi import pair_ok
+
+            q = str(pos.get("question") or "")
+            if side == "NO":
+                pm_yes_gate = (1.0 - live) if 0 < live < 1 else (1.0 - mark if 0 < mark < 1 else 0.0)
+            else:
+                pm_yes_gate = live if live > 0 else mark
+            if not pair_ok(q, ticker, str(ks.get("title") or ""), k_yes, pm_yes_gate if pm_yes_gate else None)[0]:
+                ticker = ""
+                k_yes = 0.0
         if not sports and ticker and 0 < k_yes < 1:
             # Kalshi YES vs PM YES. Never compare k_yes to a NO mark.
             if side == "NO":
