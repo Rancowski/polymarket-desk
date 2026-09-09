@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 import requests
@@ -48,10 +49,20 @@ def _theme(text: str) -> set[str]:
         tags.add("btc")
     if "ethereum" in t or re.search(r"\beth\b", t):
         tags.add("eth")
+    if "solana" in t or re.search(r"\bsol\b", t):
+        tags.add("sol")
     if "trump" in t:
         tags.add("trump")
     if "harris" in t:
         tags.add("harris")
+    if any(x in t for x in ("election", "electoral", "president", "senate", "congress", "governor", "mayor")):
+        tags.add("election")
+    if "shutdown" in t:
+        tags.add("shutdown")
+    if "cpi" in t or "inflation" in t:
+        tags.add("cpi")
+    if re.search(r"\bgdp\b", t):
+        tags.add("gdp")
     if "israel" in t and any(x in t for x in ("airspace", "air space", "idf")):
         tags.add("israel-air")
     if any(x in t for x in ("us open", "atp", "wimbledon")):
@@ -128,6 +139,37 @@ def _months(text: str) -> set[str]:
     return found
 
 
+_MON_NUM = {
+    "january": "01", "jan": "01", "february": "02", "feb": "02",
+    "march": "03", "mar": "03", "april": "04", "apr": "04",
+    "may": "05", "june": "06", "jun": "06", "july": "07", "jul": "07",
+    "august": "08", "aug": "08", "september": "09", "sep": "09", "sept": "09",
+    "october": "10", "oct": "10", "november": "11", "nov": "11",
+    "december": "12", "dec": "12",
+}
+
+
+def _dates(text: str) -> set[str]:
+    """ISO dates from titles and tickers (2026-09-17, 26SEP17, Sep 17 2026)."""
+    t = _human_text(text).lower()
+    found: set[str] = set()
+    for y, m, d in re.findall(r"(20\d{2})[-/](\d{2})[-/](\d{2})", t):
+        found.add(f"{y}-{m}-{d}")
+    for yy, mon, dd in re.findall(
+        r"(?<![0-9])([12][0-9])(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)(\d{2})(?![0-9])",
+        t,
+    ):
+        mm = _MON_NUM.get(mon, "00")
+        found.add(f"{2000 + int(yy):04d}-{mm}-{dd}")
+    for mon, dd, y in re.findall(
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sept|sep|oct|nov|dec)[a-z]*\s+(\d{1,2}),?\s+(20\d{2})",
+        t,
+    ):
+        mm = _MON_NUM.get(mon, "00")
+        found.add(f"{y}-{mm}-{int(dd):02d}")
+    return found
+
+
 def _as_prob(raw: Any) -> float:
     """Kalshi yes as dollars (0.45) or cents (45). Never treat 25 as 0.25 of 4.25%."""
     if raw is None or raw is False or raw == "":
@@ -171,16 +213,29 @@ SERIES = (
     "KXFEDFUNDS",
     "KXFOMC",
     "KXBTC",
-    "KXBTCD",
     "KXBTCMAX",
+    "KXBTCMAXY",
+    "KXBTCMAX150",
     "KXETH",
-    "KXETHD",
     "KXETHMAX",
     "KXTRUMP",
     "KXHARRIS",
     "KXCPI",
+    "KXCPIYOY",
     "KXGPD",
+    "KXGDP",
+    "KXPAYROLLS",
+    "KXRATECUTCOUNT",
+    "KXGOVSHUT",
+    "KXGOVTSHUTDOWN",
+    "KXGOVSHUTLENGTH",
+    "CONTROLH",
+    "POPVOTE",
 )
+
+_SERIES_CACHE: tuple[float, list[str]] = (0.0, [])
+_TAPE_FREQ = ("fifteen_min", "five_min", "five min", "15m", "5m", "1-minute", "1 min")
+_TAPE_TICK = re.compile(r"(15M|5M|1H)$", re.I)
 
 
 def _rows_to_out(rows: list) -> list[dict]:
@@ -189,13 +244,17 @@ def _rows_to_out(rows: list) -> list[dict]:
         if str(row.get("market_type") or "binary") not in {"binary", ""}:
             continue
         title = str(row.get("title") or row.get("yes_sub_title") or row.get("subtitle") or "")
-        low = title.lower()
+        ticker = str(row.get("ticker") or "")
+        low = f"{title} {ticker}".lower()
         if any(x in low for x in ("parlay", "combo", "same game", "sgp", "multivariate", "which of the following")):
+            continue
+        if any(x in low for x in ("15 min", "15-minute", "5 min", "5-minute", "5m ", "15m ", "next 15", "next 5")):
+            continue
+        if _TAPE_TICK.search(ticker):
             continue
         px = _yes_px(row)
         if not title or not px:
             continue
-        ticker = str(row.get("ticker") or "")
         blob = f"{title} {ticker}"
         out.append(
             {
@@ -206,8 +265,63 @@ def _rows_to_out(rows: list) -> list[dict]:
                 "theme": _theme(title),
                 "years": _years(blob),
                 "months": _months(blob),
+                "dates": _dates(blob),
             }
         )
+    return out
+
+
+def _series_is_tape(row: dict) -> bool:
+    tick = str(row.get("ticker") or "")
+    freq = str(row.get("frequency") or "").lower()
+    title = str(row.get("title") or "").lower()
+    cat = str(row.get("category") or "").lower()
+    if cat == "sports":
+        return True
+    if any(x in freq for x in _TAPE_FREQ) or "fifteen" in freq:
+        return True
+    if _TAPE_TICK.search(tick):
+        return True
+    if any(x in title for x in ("15 min", "5 min", "15-minute", "5-minute", "up or down", "up/down")):
+        return True
+    return False
+
+
+def _discover_series(host: str) -> list[str]:
+    """High-volume politics / named crypto levels / economics, not 5-min tape."""
+    global _SERIES_CACHE
+    now = time.time()
+    ts, cached = _SERIES_CACHE
+    if cached and now - ts < 600:
+        return cached
+    found: list[tuple[float, str]] = []
+    seen: set[str] = set(SERIES)
+    for cat in ("Politics", "Elections", "Crypto", "Economics"):
+        try:
+            r = requests.get(
+                f"{host}/series",
+                params={"category": cat, "include_volume": True},
+                timeout=12,
+            )
+            if not r.ok:
+                continue
+            for row in r.json().get("series") or []:
+                tick = str(row.get("ticker") or "").strip()
+                if not tick or tick in seen or _series_is_tape(row):
+                    continue
+                try:
+                    vol = float(row.get("volume_fp") or row.get("volume") or 0)
+                except (TypeError, ValueError):
+                    vol = 0.0
+                seen.add(tick)
+                found.append((vol, tick))
+        except Exception as exc:
+            log.warning("Kalshi series %s: %s", cat, exc)
+    found.sort(reverse=True)
+    extra = [t for _v, t in found[:16]]
+    out = list(SERIES) + extra
+    _SERIES_CACHE = (now, out)
+    log.info("Kalshi serier %s (fed+named + %s oppdaget)", len(out), len(extra))
     return out
 
 
@@ -217,11 +331,13 @@ def fetch_open(limit: int = 400) -> list[dict]:
     seen: set[str] = set()
     for host in HOSTS:
         host_n = 0
-        for series in SERIES:
+        series_list = _discover_series(host)
+        for series in series_list:
             cursor = None
             series_n = 0
             try:
-                for _page in range(6):
+                pages = 6 if str(series).startswith("KXFED") else 2
+                for _page in range(pages):
                     params: dict[str, Any] = {
                         "limit": 200,
                         "status": "open",
@@ -255,7 +371,7 @@ def fetch_open(limit: int = 400) -> list[dict]:
                 log.warning("Kalshi %s: %s", series, ext)
         if host_n:
             break
-    log.info("Kalshi totalt %s markeder med pris (kun navngitte serier)", len(collected))
+    log.info("Kalshi totalt %s markeder med pris (politikk/crypto/fed)", len(collected))
     if not collected and last_exc:
         log.warning("Kalshi-henting feilet: %s", last_exc)
     return collected[:limit]
@@ -314,6 +430,7 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
     qtheme = _theme(_human_text(q))
     qmonths = _months(q)
     qyears = _years(q)
+    qdates = _dates(q)
     want = _fed_want(q)
     best = None
     best_score = 0.0
@@ -325,16 +442,28 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         t = len(qtheme & k["theme"])
         score = n + 3 * t
         distinctive = qtheme & k["theme"] & {
-            "fed", "btc", "eth", "trump", "harris", "israel-air", "tennis",
+            "fed", "btc", "eth", "sol", "trump", "harris", "israel-air", "tennis",
+            "election", "shutdown", "cpi", "gdp",
         }
         bps = qtheme & k["theme"] & {"25", "50", "hike", "cut", "hold"}
         fed_ok = "fed" in distinctive and (bool(bps) or t >= 2)
-        theme_ok = fed_ok or (t >= 2 and bool(distinctive)) or (t >= 1 and n >= 3 and bool(distinctive))
+        ticker = str(k.get("ticker") or "")
+        title = str(k.get("title") or "")
+        kdates = k.get("dates") or _dates(f"{ticker} {title}")
+        same_date = bool(qdates and kdates and (qdates & kdates))
+        same_outcome = n >= 2
+        date_pair = same_date and same_outcome
+        if date_pair:
+            score += 15
+        theme_ok = (
+            fed_ok
+            or date_pair
+            or (t >= 2 and bool(distinctive))
+            or (t >= 1 and n >= 3 and bool(distinctive))
+        )
         tok_need = 3 if distinctive else 4
         if not theme_ok and n < tok_need:
             continue
-        ticker = str(k.get("ticker") or "")
-        title = str(k.get("title") or "")
         # Ticker/series month is source of truth (26SEP). Title month is fallback only.
         km = _months(ticker) or k.get("months") or _months(title)
         ky = _years(ticker) or k.get("years") or _years(title)
@@ -355,6 +484,8 @@ def _pick(q: str, kalshi: list[dict]) -> tuple[dict | None, str]:
         if qmonths and km and (qmonths & km):
             score += 8
         if qyears and ky and (qyears & ky):
+            score += 8
+        if same_date:
             score += 8
         if score > best_score:
             best_score = score
@@ -409,7 +540,14 @@ def _named_target(m: dict) -> bool:
     if cat in {"economics", "finance", "crypto", "politics", "geopolitics"}:
         return True
     blob = f"{m.get('question') or ''} {m.get('event_key') or ''}".lower()
-    return any(x in blob for x in ("fed", "fomc", "bitcoin", "btc", "ethereum", "eth", "trump"))
+    return any(
+        x in blob
+        for x in (
+            "fed", "fomc", "bitcoin", "btc", "ethereum", "eth", "solana", "trump",
+            "election", "senate", "congress", "president", "governor", "mayor",
+            "shutdown", "cpi", "inflation", "gdp", "payroll", "harris", "nominee",
+        )
+    )
 
 
 def compare(markets: list[dict], kalshi: list[dict] | None = None) -> tuple[int, list[dict]]:

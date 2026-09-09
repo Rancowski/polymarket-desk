@@ -285,6 +285,7 @@ EVENT_COST_PCT = 0.25
 CASH_SPORTS_MIN = 0.15
 SPORTS_PCT = (0.06, 0.08)
 CORE_PCT = (0.10, 0.14)
+HALF_CORE_PCT = (0.05, 0.07)
 MIN_NOTIONAL_PCT = 0.05
 DEPTH_USE_PCT = 0.50
 CASH_USE_PCT = 0.90
@@ -544,7 +545,7 @@ class Risk:
             return None, "sports nær avgjort"
         ks_pair = market.get("kalshi") or {}
         clean_kalshi = bool(ks_pair.get("ticker")) and 0 < float(ks_pair.get("yes") or 0) < 1
-        if conf == "low" and not clean_kalshi:
+        if conf == "low":
             return None, "confidence=low"
         if mid >= 0.90 and not clean_kalshi:
             return None, "mid≥0.90 uten Kalshi-par"
@@ -647,8 +648,13 @@ class Risk:
         size_base = sizing_base(deposited, equity)
         longshot = cost <= 0.28
         cheap_sports = (sports or is_tournament(market)) and cost < 0.40
+        live_sport = sports and is_match_market(market)
+        if live_sport and conf == "medium":
+            return None, "cs_live"
         if sports or longshot or cheap_sports:
             _floor_pct, cap_pct = SPORTS_PCT
+        elif conf == "medium":
+            _floor_pct, cap_pct = HALF_CORE_PCT
         else:
             _floor_pct, cap_pct = CORE_PCT
         cap = min(cap_pct * size_base, HARD_NAME_PCT * size_base)

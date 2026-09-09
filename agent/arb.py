@@ -11,6 +11,7 @@ from agent.risk import (
     DEPLOYED_MAX,
     HARD_NAME_PCT,
     MAX_SPORTS,
+    SPORTS_PCT,
     Ticket,
     is_near_resolution,
     is_sports,
@@ -21,8 +22,8 @@ from agent.risk import (
 
 log = logging.getLogger("arb")
 
-# Etter fee: krev minst ~2 ¢ per sett
-COMPLEMENT_MAX_ASK_SUM = 0.985
+# Cheaper-leg complement: YES+NO live asks must sum strictly under this.
+COMPLEMENT_MAX_ASK_SUM = 0.980
 EVENT_MAX_ASK_SUM = 0.970
 LOCKED_YES = 0.88
 LOCKED_NO = 0.12
@@ -194,11 +195,13 @@ class Arb:
                 continue
             if at_cap and cid not in open_ids:
                 continue
-            if len(self.store.positions("open")) + len(out) + 2 > settings.max_open_positions:
+            if len(self.store.positions("open")) + len(out) + 1 > settings.max_open_positions:
                 break
-            if self._skip_sports(m, sports_n, sports_halt, out, need=2):
+            if self._skip_sports(m, sports_n, sports_halt, out, need=1):
                 continue
             if _finishing(m):
+                continue
+            if not (m.get("yes_token") and m.get("no_token")):
                 continue
             yes_m = float(m.get("yes_mid") or 0)
             no_m = float(m.get("no_mid") or (1 - yes_m if yes_m else 0))
@@ -208,25 +211,30 @@ class Arb:
                 continue
             yb = self._book(m, "yes")
             nb = self._book(m, "no")
+            if not yb or not nb or yb.get("synthetic") or nb.get("synthetic"):
+                continue
             near, _ = is_near_resolution(m, yb)
             if near:
                 continue
-            yask = float(yb.get("best_ask") or 1)
-            nask = float(nb.get("best_ask") or 1)
-            if yask + nask > COMPLEMENT_MAX_ASK_SUM or yask <= 0.01 or nask <= 0.01:
+            yask = float(yb.get("best_ask") or 0)
+            nask = float(nb.get("best_ask") or 0)
+            ybid = float(yb.get("best_bid") or 0)
+            nbid = float(nb.get("best_bid") or 0)
+            if yask <= 0.01 or nask <= 0.01 or ybid <= 0 or nbid <= 0:
                 continue
-            ysz = float(yb.get("ask_size") or 0)
-            nsz = float(nb.get("ask_size") or 0)
-            half = CORE_PCT[1] / 2
-            y_usd, y_sh, ywhy = self._leg(yask, ysz, size_base, cash, half)
-            n_usd, n_sh, nwhy = self._leg(nask, nsz, size_base, cash, half)
-            if ywhy or nwhy:
+            if yask + nask >= COMPLEMENT_MAX_ASK_SUM:
                 continue
-            thesis = f"sum-til-én YES+NO ask {yask+nask:.3f}"
-            out.append(_ticket(m, "YES", m["yes_token"], yb, yask, y_sh, thesis, source="complement"))
-            out.append(_ticket(m, "NO", m["no_token"], nb, nask, n_sh, thesis, source="complement"))
+            if yask <= nask:
+                side, token, book, cost, sz = "YES", m["yes_token"], yb, yask, float(yb.get("ask_size") or 0)
+            else:
+                side, token, book, cost, sz = "NO", m["no_token"], nb, nask, float(nb.get("ask_size") or 0)
+            usd, shares, why = self._leg(cost, sz, size_base, cash, SPORTS_PCT[1])
+            if why:
+                continue
+            thesis = f"complement cheaper {side} ask {cost:.3f} YES+NO {yask+nask:.3f}"
+            out.append(_ticket(m, side, token, book, cost, shares, thesis, source="complement"))
             open_ids.add(cid)
-            if len(out) >= 4:
+            if len(out) >= 3:
                 break
         return out
 

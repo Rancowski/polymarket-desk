@@ -4,7 +4,8 @@ import logging
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from agent.arb import Arb
@@ -79,11 +80,28 @@ def _grok_drop_reason(m: dict) -> str | None:
     h = _hours(m)
     if h is not None and h < 6:
         return "short_horizon"
+    if (" vs " in f" {q} " or "-vs-" in q) and h is not None and h < 48:
+        return "cs_live"
     esport = any(x in blob for x in _ESPORT_TITLE)
     tourney = any(x in q for x in _TOURNEY_WIN)
     if esport and not (tourney and h is not None and h > 7 * 24):
         return "cs_live"
     if any(x in blob for x in _LIVE_TAPE):
+        return "cs_live"
+    win_on = re.search(r"win on (\d{4}-\d{2}-\d{2})", q)
+    if win_on:
+        try:
+            day = datetime.strptime(win_on.group(1), "%Y-%m-%d").date()
+            today = datetime.now(timezone.utc).date()
+            if day <= today + timedelta(days=1):
+                return "cs_live"
+        except ValueError:
+            pass
+    if "fdv" in q or "one day after launch" in q or "1 day after launch" in q:
+        return "short_horizon"
+    tennis_tour = any(x in blob for x in ("atp", "wta", "challenger"))
+    match_line = " vs " in f" {q} " or "win on" in q or "match winner" in q
+    if tennis_tour and match_line:
         return "cs_live"
     return None
 
@@ -973,11 +991,18 @@ class Desk:
                 gap = abs(float(ks.get("gap") or 0))
                 w_k = 0.70 if gap >= 0.04 else 0.55
                 blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
+                orig_conf = str(est.get("confidence") or "medium").lower()
+                if orig_conf == "low":
+                    new_conf = "low"
+                elif gap >= 0.04:
+                    new_conf = "high"
+                else:
+                    new_conf = orig_conf or "medium"
                 estimates[cid] = {
                     **est,
                     "p_yes": blended,
                     "skip": False,
-                    "confidence": "high" if gap >= 0.04 else (est.get("confidence") or "medium"),
+                    "confidence": new_conf,
                     "thesis": ((est.get("thesis") or "") + f" | Kalshi {k_yes:.2f} (w={w_k}) gap {ks.get('gap')}").strip(" |"),
                 }
                 n_blend += 1

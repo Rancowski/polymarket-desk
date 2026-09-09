@@ -1060,11 +1060,17 @@ class Store:
         open_keys = {
             (str(p.get("condition_id")), str(p.get("side") or "YES").upper()) for p in open_pos
         }
+        closed_keys: set[tuple[str, str]] = set()
+        for st in ("closed", "closed_dust"):
+            for p in self.positions(st):
+                closed_keys.add(
+                    (str(p.get("condition_id") or ""), str(p.get("side") or "YES").upper())
+                )
         closed: list[dict] = []
         for key, g in groups.items():
             if key in open_keys:
                 continue
-            if g["sell_n"] <= 0 and not g["via_redeem"]:
+            if g["sell_n"] <= 0 and not g["via_redeem"] and key not in closed_keys:
                 continue
             realized = g["sell_proceeds"] - g["buy_cost"]
             hold_h = None
@@ -1100,7 +1106,7 @@ class Store:
                 "n_win": len(wins),
                 "n_loss": len(losses),
                 "usd_win": round(sum(r["realized"] for r in wins), 2),
-                "usd_loss": round(sum(r["realized"] for r in losses), 2),
+                "usd_loss": round(abs(sum(r["realized"] for r in losses)), 2),
                 "win_pct": round(len(wins) / n, 4) if n else 0.0,
                 "expectancy": round(pnl / n, 4) if n else 0.0,
                 "avg_hold_h": round(sum(holds) / len(holds), 2) if holds else None,
@@ -1144,13 +1150,16 @@ class Store:
             "unrealized": round(unrealized, 2),
             "win_rate": {
                 "n_win": all_s["n_win"],
+                "n_loss": all_s["n_loss"],
                 "n_closed": all_s["n"],
                 "pct": all_s["win_pct"],
                 "usd_win": all_s["usd_win"],
                 "usd_loss": all_s["usd_loss"],
                 "n_win_24h": d24["n_win"],
+                "n_loss_24h": d24["n_loss"],
                 "n_closed_24h": d24["n"],
                 "n_win_7d": d7["n_win"],
+                "n_loss_7d": d7["n_loss"],
                 "n_closed_7d": d7["n"],
             },
             "expectancy": all_s["expectancy"],
