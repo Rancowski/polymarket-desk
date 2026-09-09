@@ -535,7 +535,7 @@ class Risk:
             return None, "sports nær avgjort"
         ks_pair = market.get("kalshi") or {}
         clean_kalshi = bool(ks_pair.get("ticker")) and 0 < float(ks_pair.get("yes") or 0) < 1
-        if not clean_kalshi and conf == "low":
+        if conf == "low" and not clean_kalshi:
             return None, "confidence=low"
         if mid >= 0.90 and not clean_kalshi:
             return None, "mid≥0.90 uten Kalshi-par"

@@ -24,31 +24,76 @@ from agent.store import Store
 
 log = logging.getLogger("desk")
 GROK_BATCH_N = 15
+_ESPORT_TITLE = (
+    "counter-strike", "counter strike", "cs2", "cs 2", " cs ",
+    "dota", "league of legends", "league-of-legends", "valorant",
+)
+_LIVE_TAPE = (
+    "bo1", "bo2", "bo3", "bo5", "bo7", "best of",
+    "map 1", "map 2", "map 3", "map 4", "map 5",
+    "handicap", "spread", "over/under", "o/u",
+    " -1.5", "+1.5", " -2.5", "+2.5", " -3.5", "+3.5",
+)
+_TOURNEY_WIN = ("to win", "win the", "winner of", "champion", "lift the")
+_PREFER = (
+    "election", "elect ", "president", "senate", "congress", "parliament",
+    "bill", " act", "legislation",
+    "fed", "fomc", "ecb", "bank of england", "central bank", "interest rate",
+    "oscar", "award", "grammy", "emmy", "golden globe", "nobel",
+)
 
 
-def _grok_eligible(m: dict) -> bool:
-    """Top-volume names only. No in-play, no collapsed mids, no 5/15-min crypto."""
+def _hours(m: dict) -> float | None:
+    raw = m.get("hours_left")
+    try:
+        if raw is None or raw == "":
+            return None
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grok_drop_reason(m: dict) -> str | None:
+    """Why this name is not in the Grok-15. None = eligible."""
     if m.get("_open_only"):
-        return False
+        return "short_horizon"
     q = (m.get("question") or "").lower()
+    blob = f"{q} {m.get('event_key') or ''} {m.get('category') or ''}".lower()
     if any(p in q for p in SKIP_QUESTION_PATTERNS):
-        return False
+        return "short_horizon"
     try:
         mid = float(m.get("yes_mid") or m.get("mid") or 0)
     except (TypeError, ValueError):
         mid = 0.0
-    if mid <= 0.10 or mid >= 0.90:
-        return False
-    hours = m.get("hours_left")
-    try:
-        h = float(hours) if hours is not None and hours != "" else None
-    except (TypeError, ValueError):
-        h = None
+    if mid <= 0.15 or mid >= 0.85:
+        return "mid_extreme"
+    h = _hours(m)
     if h is not None and h < 6:
-        return False
-    if is_sports(m) and h is not None and h < 12:
-        return False
-    return True
+        return "short_horizon"
+    esport = any(x in blob for x in _ESPORT_TITLE)
+    tourney = any(x in q for x in _TOURNEY_WIN)
+    if esport and not (tourney and h is not None and h > 7 * 24):
+        return "cs_live"
+    if any(x in blob for x in _LIVE_TAPE):
+        return "cs_live"
+    return None
+
+
+def _grok_eligible(m: dict) -> bool:
+    return _grok_drop_reason(m) is None
+
+
+def _grok_prefer(m: dict) -> bool:
+    blob = f"{m.get('question') or ''} {m.get('event_key') or ''} {m.get('category') or ''}".lower()
+    h = _hours(m)
+    if any(x in blob for x in _PREFER):
+        return True
+    cat = str(m.get("category") or "")
+    if cat == "crypto" and (h is None or h > 7 * 24):
+        return True
+    if cat in {"geopolitics", "politics"} and h is not None and h > 7 * 24:
+        return True
+    return False
 
 
 class Desk:
@@ -742,8 +787,32 @@ class Desk:
                 by_id[cid]["kalshi"] = stub["kalshi"]
         for cid, stub in self._market_stubs(open_pos).items():
             by_id.setdefault(cid, stub)
-        ranked = [m for m in markets if _grok_eligible(m)]
-        ranked.sort(key=lambda m: -float(m.get("volume_24h") or m.get("liquidity") or 0))
+        vol_ranked = sorted(
+            [m for m in markets if not m.get("_open_only")],
+            key=lambda m: -float(m.get("volume_24h") or m.get("liquidity") or 0),
+        )
+        eligible: list = []
+        logged_drop = 0
+        for m in vol_ranked:
+            why = _grok_drop_reason(m)
+            if why:
+                if logged_drop < GROK_BATCH_N:
+                    self.store.log_decision(
+                        condition_id=m.get("condition_id"),
+                        question=m.get("question"),
+                        mid=m.get("mid") or m.get("yes_mid"),
+                        action="skip",
+                        reason=f"grok-drop {why}",
+                    )
+                    logged_drop += 1
+                continue
+            eligible.append(m)
+        eligible.sort(
+            key=lambda m: (
+                0 if _grok_prefer(m) else 1,
+                -float(m.get("volume_24h") or m.get("liquidity") or 0),
+            )
+        )
         prepaid = self.store.xai_prepaid_usd()
         spent = self.store.api_spend(hours=None)
         remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
@@ -758,7 +827,7 @@ class Desk:
             batch.append(m)
 
         if remaining >= 0.15:
-            for m in ranked:
+            for m in eligible:
                 _take(m)
                 if len(batch) >= GROK_BATCH_N:
                     break

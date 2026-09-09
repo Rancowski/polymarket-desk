@@ -249,7 +249,7 @@
       }
       if (tab === "rules") {
         el.innerHTML = [
-          ["Syklus", "Hvert 5. minutt. Redeem først, deretter exits + Kalshi + tape. Grok hver runde: topp 15 åpne etter 24t-volum (ikke in-play, ikke mid≥0,90/≤0,10, ikke 5/15-min, ikke hours_left<6). Én batch. FAK på live bud. Ingen X/web."],
+          ["Syklus", "Hvert 5. minutt. Redeem først, deretter exits + Kalshi + tape. Grok hver runde: 15 navn etter 24t-volum, etter dropp (cs_live / mid_extreme / short_horizon). Foretrekk valg, lover, sentralbank, awards, lang crypto, geopolitikk >7d. Én batch. FAK på live bud."],
           ["Redeem", "Hver syklus først: closed / data-api redeemable / (mid≥0,99 og bud≤0,02) → CTF/NegRisk redeem til pUSD. Tapere til 0 lukkes lokalt. Bud ≥ 0,98 på live bok → FAK @ bud (0,99/0,98). Aldri FAK 0,001 på resolvert bok. Aldri hold 0,999. redeem_ok/redeem_err én gang per condition_id, 30 min cooldown."],
           ["Kjøp", "To spor. 1) Rent Kalshi-par (samme serie/møte/utfall, begge mids 0–1): |gap|≥5¢ og ask 0,18–0,82, størrelse 10–14 %. Grok kan ikke blokke. 2) Uten par: Grok confidence≠low OG edge_net≥MIN_NET_EDGE OG YES+NO-ask<0,985. Ingen par er ikke kjøpsforbud. Sports/CS/tennis/Fed/crypto er lov."],
           ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Samme kamp/event_key maks 25 % av innskutt samlet. Inntil 75 % av innskutt i markedet."],
