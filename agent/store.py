@@ -17,6 +17,8 @@ VALID_SOURCES = frozenset(
         "kalshi",
         "complement",
         "stats",
+        "partition",
+        "maker",
         "tape",
         "exit_stop",
         "exit_take",
@@ -145,6 +147,10 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
         return "complement", thesis or None
     if "favorite_near" in low or low.startswith("stats "):
         return "stats", thesis or None
+    if "sum_ask_lt_1" in low or "sum_bid_gt_1" in low or low.startswith("partition "):
+        return "partition", thesis or None
+    if low.startswith("maker "):
+        return "maker", thesis or None
     if "låst utfall" in low:
         return "tape", thesis or None
     if kalshi_fields_ok(raw=data) and data.get("question") and (

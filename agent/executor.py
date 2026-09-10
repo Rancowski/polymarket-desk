@@ -106,17 +106,20 @@ def _tif(sdk: str) -> Any:
     return tif
 
 
-def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1") -> Any:
+def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1", tif_name: str = "FAK") -> Any:
     import inspect
 
-    tif = _tif(sdk)
+    if sdk == "v2":
+        from py_clob_client_v2 import OrderType, PartialCreateOrderOptions
+    else:
+        from py_clob_client.clob_types import OrderType, PartialCreateOrderOptions
+    tif = getattr(OrderType, str(tif_name or "FAK").upper(), None)
+    if tif is None and str(tif_name).upper() == "GTC":
+        tif = getattr(OrderType, "GTC", None)
+    if tif is None:
+        tif = _tif(sdk)
     if tif is None:
         raise RuntimeError("CLOB SDK mangler FAK — avviser ordre i stedet for GTC")
-    if sdk == "v2":
-        from py_clob_client_v2 import PartialCreateOrderOptions
-    else:
-        from py_clob_client.clob_types import PartialCreateOrderOptions
-
     options = PartialCreateOrderOptions(tick_size=tick_s, neg_risk=neg)
     fn = client.create_and_post_order
     names = list(inspect.signature(fn).parameters)
@@ -679,8 +682,9 @@ class Executor:
 
         if getattr(ticket, "synthetic", False):
             raise RuntimeError("live-kjøp avvist: syntetisk bok")
-        if is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
-            if not (0.22 < float(ticket.limit_price) < 0.82):
+        src = str(getattr(ticket, "source", "") or "")
+        if src not in {"complement", "partition", "maker"} and is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
+            if not (0.18 < float(ticket.limit_price) < 0.82):
                 raise RuntimeError("sports ekstrem-pris")
             sports_pos = [p for p in self.store.positions("open") if is_sports(p)]
             if len(sports_pos) >= 4:
@@ -727,9 +731,11 @@ class Executor:
 
         tick_f = float(tick_s)
         price = _quantize(float(ticket.limit_price), tick_f)
-        price = _quantize(min(0.99, price + tick_f), tick_f)
+        tif_name = str(getattr(ticket, "tif", None) or ("GTC" if src == "maker" else "FAK")).upper()
+        if tif_name != "GTC" and src not in {"complement", "kalshi", "partition"}:
+            price = _quantize(min(0.99, price + tick_f), tick_f)
         size = _amount_size(price, max(min_sz, float(ticket.shares), 10.0))
-        log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s…", price, size, tick_s, neg, token[:14])
+        log.info("CLOB buy px=%s sz=%s tick=%s neg=%s token=%s tif=%s…", price, size, tick_s, neg, token[:14], tif_name)
         try:
             args = OrderArgs(token_id=token, price=price, size=size, side=side, builder_code="")
         except TypeError:
@@ -739,7 +745,7 @@ class Executor:
         signed = None
         for nflag in (neg, (not neg)):
             try:
-                signed = _place_limit(client, args, tick_s, nflag, sdk=sdk)
+                signed = _place_limit(client, args, tick_s, nflag, sdk=sdk, tif_name=tif_name)
                 last_err = None
                 log.info("LIVE ORDER ok neg=%s %s", nflag, signed)
                 break

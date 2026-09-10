@@ -712,12 +712,14 @@ class Desk:
                         _err(cid, winners.get(cid) or [pos], one)
         return n, log_rows
 
-    def _run_exits(self, open_pos: list, estimates: dict, by_id: dict, equity: float = 0.0) -> tuple[int, list]:
+    def _run_exits(self, open_pos: list, estimates: dict, by_id: dict, equity: float = 0.0, extra_force: dict | None = None) -> tuple[int, list]:
         """Flatten on live bid. Always log hold | selling | sold | reject. Independent of Grok."""
         sold = 0
         log_rows: list[dict] = []
         force = self._trim_reasons(open_pos, equity=equity)
         force.update(self._illegal_pair_flatten(open_pos, by_id))
+        if extra_force:
+            force.update(extra_force)
         for pos in list(open_pos):
             q = (pos.get("question") or "")[:80]
             cid = pos.get("condition_id")
@@ -780,6 +782,16 @@ class Desk:
                 pbook = {"best_bid": 0, "mid": 0, "best_ask": 0, "spread": 0}
             key = (str(cid), str(side or "YES"))
             mkt = by_id.get(cid or "") or {}
+            if mkt.get("yes_token") and not mkt.get("book"):
+                try:
+                    mkt["book"] = self.scout.book(str(mkt.get("yes_token")), require_two_sided=False)
+                except Exception:
+                    pass
+            if mkt.get("no_token") and not mkt.get("no_book"):
+                try:
+                    mkt["no_book"] = self.scout.book(str(mkt.get("no_token")), require_two_sided=False)
+                except Exception:
+                    pass
             ticket_ex, why = self.risk.evaluate_exit(
                 pos,
                 pbook,
@@ -1020,16 +1032,6 @@ class Desk:
             except Exception as exc:
                 log.warning("post-redeem sync: %s", exc)
                 open_pos = self.store.positions("open")
-        try:
-            _n, log1 = kalshi_compare(list(by_open.values()), kalshi_rows)
-            kalshi_log.extend(log1)
-        except Exception as exc:
-            log.warning("Kalshi (åpne): %s", exc)
-        self._log_kalshi(kalshi_log)
-        sold_n, exit_log = self._run_exits(open_pos, {}, by_open, equity=equity)
-        exit_log = redeem_log + exit_log
-        exits = redeems + sold_n
-        open_pos = self.store.positions("open")
         n_redeem_ok = sum(1 for r in redeem_log if r.get("action") == "redeem_ok")
         if halt:
             log.warning("Stoppet: %s", halt)
@@ -1043,10 +1045,10 @@ class Desk:
                 kalshi=len(kalshi_log),
                 kalshi_log=kalshi_log,
                 xai_usd=0.0,
-                exits=exits,
-                sold=sold_n,
+                exits=redeems,
+                sold=0,
                 redeem_ok=n_redeem_ok,
-                exit_log=exit_log,
+                exit_log=redeem_log,
                 reason=halt,
                 bankroll=bankroll,
                 equity=equity,
@@ -1075,9 +1077,38 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi: %s", exc)
         kalshi_n = len(kalshi_log)
+        by_id = {m["condition_id"]: m for m in markets if m.get("condition_id")}
+        for cid, stub in by_open.items():
+            by_id.setdefault(cid, stub)
+            if stub.get("kalshi") and not (by_id.get(cid) or {}).get("kalshi"):
+                by_id[cid]["kalshi"] = stub["kalshi"]
+        try:
+            self.arb.annotate_partitions(markets)
+            for m in markets:
+                cid = m.get("condition_id")
+                if cid and cid in by_id:
+                    by_id[cid]["partition_complete"] = m.get("partition_complete")
+                    by_id[cid]["s_ask"] = m.get("s_ask")
+                    by_id[cid]["s_bid"] = m.get("s_bid")
+                    if m.get("book"):
+                        by_id[cid]["book"] = m.get("book")
+                    if m.get("no_book"):
+                        by_id[cid]["no_book"] = m.get("no_book")
+        except Exception as exc:
+            log.warning("partition annotate: %s", exc)
+        part_force = {}
+        try:
+            part_force = self.arb.partition_flatten(markets, open_pos)
+        except Exception as exc:
+            log.warning("partition flatten: %s", exc)
+        sold_n, exit_log = self._run_exits(open_pos, {}, by_id, equity=equity, extra_force=part_force)
+        exit_log = redeem_log + exit_log
+        exits = redeems + sold_n
+        open_pos = self.store.positions("open")
+        bankroll, equity, open_pos = bankroll, equity, open_pos
         arb_tickets = self.arb.scan(markets, bankroll, equity=equity)
         arb_n = 0
-        src_fill = {"stats": 0, "kalshi": 0, "complement": 0, "grok": 0}
+        src_fill = {"stats": 0, "kalshi": 0, "complement": 0, "partition": 0, "maker": 0, "grok": 0}
         failed_events: set[str] = set()
         pending_hedge = None
         for ticket in arb_tickets:
@@ -1138,307 +1169,68 @@ class Desk:
         if arb_n:
             open_pos = self.store.positions("open")
 
-        by_id = {m["condition_id"]: m for m in markets}
-        for cid, stub in by_open.items():
-            by_id.setdefault(cid, stub)
-            if stub.get("kalshi") and not (by_id.get(cid) or {}).get("kalshi"):
-                by_id[cid]["kalshi"] = stub["kalshi"]
-        for cid, stub in self._market_stubs(open_pos).items():
-            by_id.setdefault(cid, stub)
-        vol_ranked = sorted(
-            [m for m in markets if not m.get("_open_only")],
-            key=lambda m: -float(m.get("volume_24h") or m.get("liquidity") or 0),
-        )
-        eligible: list = []
-        logged_drop = 0
-        for m in vol_ranked:
-            why = _grok_drop_reason(m)
-            if why:
-                if logged_drop < GROK_BATCH_N:
-                    self._bump_reject(why)
-                    self.store.log_decision(
-                        condition_id=m.get("condition_id"),
-                        question=m.get("question"),
-                        mid=m.get("mid") or m.get("yes_mid"),
-                        action="skip",
-                        reason=f"grok-drop {why}",
-                    )
-                    logged_drop += 1
-                continue
-            eligible.append(m)
-        prepaid = self.store.xai_prepaid_usd()
-        spent = self.store.api_spend(hours=None)
-        remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
-        batch, bucket_n = _build_grok_batch(eligible) if remaining >= 0.15 else ([], {"A": 0, "B": 0, "C": 0})
-        a_n = int(bucket_n.get("A", 0) or 0)
-        log.info(
-            "Grok-batch %s navn A=%s B=%s C=%s (eligible=%s)",
-            len(batch),
-            a_n,
-            bucket_n.get("B", 0),
-            bucket_n.get("C", 0),
-            len(eligible),
-        )
-        try:
-            prev_a = int(float(self.store.get_meta("bucket_A_count", "0") or 0))
-        except (TypeError, ValueError):
-            prev_a = 0
-        if a_n == 0 and prev_a == 0 and self._cycle_i > 1:
-            log.warning("Grok-batch A=0 two cycles — 8–48h 0.58–0.85 favorites still dropped")
-        self.store.set_meta("bucket_A_count", str(a_n))
-        if not batch:
-            log.info("Ingen markeder passerte filter")
-            self._finish_cycle(
-                scanned=len(markets),
-                estimated=0,
-                grok=0,
-                accepted=0,
-                rejected=0,
-                exits=exits,
-                sold=sold_n,
-                redeem_ok=n_redeem_ok,
-                exit_log=exit_log,
-                arb=arb_n,
-                kalshi=kalshi_n,
-                kalshi_log=kalshi_log,
-                stats=src_fill.get("stats", 0),
-                complement=src_fill.get("complement", 0),
-                by_source=src_fill,
-                bucket_A_count=a_n,
-                bankroll=bankroll,
-                equity=equity,
-                xai_usd=0.0,
-            )
-            return {"ok": True, "scanned": 0}
-
-        for m in batch:
-            m["_grok_bucket"] = _grok_bucket(m) or ""
-            try:
-                mid = float(m.get("yes_mid") or m.get("mid") or 0)
-                if m.get("yes_token"):
-                    m["book"] = self.scout.book(m["yes_token"], fallback_mid=mid)
-                if m.get("no_token"):
-                    no_mid = float(m.get("no_mid") or (1 - mid if mid else 0))
-                    m["no_book"] = self.scout.book(m["no_token"], fallback_mid=no_mid)
-            except Exception as exc:
-                log.warning("Bok-feil %s: %s", m.get("question", "")[:40], exc)
-                m["book"] = {}
-            if (m.get("book") or {}).get("synthetic"):
-                m["book"] = {}
-            if (m.get("no_book") or {}).get("synthetic"):
-                m["no_book"] = {}
-
-        self.scout.enrich(batch)
-
         xai_cycle = 0.0
-        try:
-            if remaining < 0.02:
-                estimates = {}
-                log.info("Hopper Grok — xAI-budsjett tomt")
-                setattr(self.brain, "last_skip", "filter")
-            else:
-                estimates = self.brain.estimate(batch) if batch else {}
-                log.info("Grok-batch %s navn (syklus %s)", len(batch), self._cycle_i)
-                grok_why = str(getattr(self.brain, "last_skip", "") or "")
-                if batch and not estimates:
-                    log.warning("Grok batch tom etter kjøring (%s navn): %s", len(batch), grok_why or "timeout/parse/filter")
-                elif batch:
-                    n_miss = sum(1 for m in batch if m.get("condition_id") not in estimates)
-                    if n_miss:
-                        log.warning("Grok parse miss %s/%s navn (%s)", n_miss, len(batch), grok_why or "parse")
-            usage = getattr(self.brain, "last_usage", {}) or {}
-            xai_cycle = float(usage.get("usd") or 0)
-            if xai_cycle:
-                self.store.add_api_cost(xai_cycle, str(usage.get("model") or ""), int(usage.get("tokens") or 0))
-            n_blend = 0
-            for m in batch:
-                ks = m.get("kalshi") or {}
-                k_yes = float(ks.get("yes") or 0)
-                if not (0.02 < k_yes < 0.98):
-                    continue
-                cid = m["condition_id"]
-                est = estimates.get(cid) or {}
-                p = est.get("p_yes")
-                gap = abs(float(ks.get("gap") or 0))
-                w_k = 0.70 if gap >= 0.04 else 0.55
-                blended = round(w_k * k_yes + (1 - w_k) * float(p), 4) if p is not None else k_yes
-                orig_conf = str(est.get("confidence") or "medium").lower()
-                if orig_conf == "low":
-                    new_conf = "low"
-                elif gap >= 0.04:
-                    new_conf = "high"
-                else:
-                    new_conf = orig_conf or "medium"
-                estimates[cid] = {
-                    **est,
-                    "p_yes": blended,
-                    "skip": False,
-                    "confidence": new_conf,
-                    "thesis": ((est.get("thesis") or "") + f" | Kalshi {k_yes:.2f} (w={w_k}) gap {ks.get('gap')}").strip(" |"),
-                }
-                n_blend += 1
-            if n_blend:
-                log.info("Kalshi blend på %s markeder", n_blend)
-            self.last_error = None
-        except Exception as exc:
-            log.exception("Brain krasjet: %s", exc)
-            self.last_error = str(exc)
-            self._finish_cycle(
-                scanned=len(markets),
-                estimated=0,
-                grok=0,
-                accepted=0,
-                arb=arb_n,
-                kalshi=kalshi_n,
-                kalshi_log=kalshi_log,
-                rejected=0,
-                exits=exits,
-                sold=sold_n,
-                redeem_ok=n_redeem_ok,
-                exit_log=exit_log,
-                xai_usd=round(xai_cycle, 4),
-                bankroll=bankroll,
-                equity=equity,
-                stats=src_fill.get("stats", 0),
-                complement=src_fill.get("complement", 0),
-                by_source=src_fill,
-                bucket_A_count=a_n,
-                reason=str(exc),
-            )
-            return {"ok": False, "reason": str(exc), **self.last_cycle}
-
-        open_pos = self.store.positions("open")
-        if estimates:
-            more, log2 = self._run_exits(open_pos, estimates, by_id, equity=equity)
-            exits += more
-            sold_n += more
-            exit_log.extend(log2)
-            open_pos = self.store.positions("open")
-        locked = sum(float(p["shares"]) * float(p["avg_cost"]) for p in open_pos)
-
-        accepted = 0
-        rejected = 0
-        for m in batch:
-            if m.get("_open_only"):
-                continue
-            est = estimates.get(m["condition_id"])
+        grok_n = 0
+        run_grok = (self._cycle_i % 6 == 0) and len(open_pos) <= 3
+        if run_grok:
             try:
-                mid_log = float(m.get("yes_mid") or m.get("mid") or 0.5)
-            except (TypeError, ValueError):
-                mid_log = 0.5
-            if not est:
-                est = {
-                    "p_yes": mid_log,
-                    "confidence": "low",
-                    "skip": True,
-                    "skip_reason": "no read",
-                    "thesis": "",
-                }
-            if est.get("skip") or str(est.get("skip_reason") or "").lower() in {"no read", "no_read"}:
-                if est.get("p_yes") in (None, ""):
-                    est = {**est, "p_yes": mid_log}
-                self.store.log_decision(
-                    condition_id=m["condition_id"],
-                    question=m["question"],
-                    mid=mid_log,
-                    p_hat=est.get("p_yes"),
-                    action="skip",
-                    reason="grok-skip (no read) — andre spor kjører",
-                    payload=est,
-                )
-                continue
-            if str(est.get("confidence") or "").lower() == "low":
-                rejected += 1
-                self._bump_reject("confidence=low")
-                self.store.log_decision(
-                    condition_id=m["condition_id"],
-                    question=m["question"],
-                    mid=mid_log,
-                    p_hat=est.get("p_yes"),
-                    action="reject",
-                    reason="confidence=low",
-                    payload=est,
-                )
-                continue
-            try:
-                book = m.get("book") or self.scout.book(
-                    m["yes_token"], fallback_mid=float(m.get("yes_mid") or m.get("mid") or 0)
-                )
+                prepaid = self.store.xai_prepaid_usd()
+                spent = self.store.api_spend(hours=None)
+                remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
+                if remaining >= 0.02:
+                    sample = [m for m in markets if not m.get("_open_only")][:3]
+                    estimates = self.brain.estimate(sample) if sample else {}
+                    grok_n = len(estimates)
+                    usage = getattr(self.brain, "last_usage", {}) or {}
+                    xai_cycle = float(usage.get("usd") or 0)
+                    if xai_cycle:
+                        self.store.add_api_cost(
+                            xai_cycle,
+                            str(usage.get("model") or ""),
+                            int(usage.get("tokens") or 0),
+                        )
+                    for cid, est in estimates.items():
+                        q = next((m.get("question") for m in sample if m.get("condition_id") == cid), cid)
+                        self.store.log_decision(
+                            condition_id=cid,
+                            question=q,
+                            p_hat=est.get("p_yes"),
+                            action="grok-log",
+                            reason="log-only conf=%s skip=%s" % (est.get("confidence"), est.get("skip")),
+                            payload=est,
+                        )
+                    log.info("Grok log-only n=%s cycle=%s seats=%s", grok_n, self._cycle_i, len(open_pos))
             except Exception as exc:
-                self.store.log_decision(
-                    condition_id=m["condition_id"],
-                    question=m["question"],
-                    action="skip",
-                    reason=f"bok-feil: {exc}",
-                )
-                rejected += 1
-                continue
-            ticket, reason = self.risk.evaluate(m, book, est, bankroll, equity)
-            if not ticket:
-                rejected += 1
-                self._bump_reject(reason)
-                self.store.log_decision(
-                    condition_id=m["condition_id"],
-                    question=m["question"],
-                    mid=book.get("mid"),
-                    p_hat=est.get("p_yes"),
-                    action="reject",
-                    reason=reason,
-                    payload=est,
-                )
-                continue
-            try:
-                result = self.exec.submit(ticket)
-                accepted += 1
-                self.store.log_decision(
-                    condition_id=ticket.condition_id,
-                    question=ticket.question,
-                    side=ticket.side,
-                    mid=ticket.mid,
-                    p_hat=ticket.p_hat,
-                    edge_net=ticket.edge_net,
-                    action=result.get("status"),
-                    reason=ticket.thesis,
-                    payload=result,
-                )
-                if result.get("status") in {"live", "paper"}:
-                    bankroll = max(0.0, bankroll - ticket.size_usd)
-                    equity = bankroll + locked + ticket.size_usd
-                    locked += ticket.size_usd
-                    self._bought += 1
-                    src_fill["grok"] += 1
-            except Exception as exc:
-                log.exception("Ordre feilet")
-                self.last_error = str(exc)
-                self.store.log_decision(
-                    condition_id=ticket.condition_id,
-                    question=ticket.question,
-                    action="error",
-                    reason=str(exc),
-                )
+                log.warning("Grok log-only: %s", exc)
 
         try:
             bankroll, equity, _ = self._refresh_portfolio()
         except Exception:
             pass
+        n_comp = src_fill.get("complement", 0)
+        n_k = src_fill.get("kalshi", 0)
+        n_part = src_fill.get("partition", 0)
+        n_maker = src_fill.get("maker", 0)
+        n_block = int(getattr(self.arb, "n_blocked_spread", 0) or 0)
         log.info(
-            "Syklus ferdig. stats=%s kalshi=%s grok=%s complement=%s kjøpt=%s A=%s",
-            src_fill.get("stats", 0),
-            src_fill.get("kalshi", 0),
-            src_fill.get("grok", 0),
-            src_fill.get("complement", 0),
+            "Syklus ferdig. n_complement=%s n_kalshi_clean=%s n_partition=%s n_blocked_spread=%s n_maker=%s kjoept=%s sold=%s",
+            n_comp,
+            n_k,
+            n_part,
+            n_block,
+            n_maker,
             self._bought,
-            a_n,
+            sold_n,
         )
         self._finish_cycle(
             scanned=len(markets),
-            estimated=len(estimates),
-            grok=len(batch),
-            accepted=accepted,
+            estimated=grok_n,
+            grok=grok_n,
+            accepted=self._bought,
             arb=arb_n,
             kalshi=kalshi_n,
             kalshi_log=kalshi_log,
-            rejected=rejected,
+            rejected=0,
             exits=exits,
             sold=sold_n,
             redeem_ok=n_redeem_ok,
@@ -1446,10 +1238,15 @@ class Desk:
             xai_usd=round(xai_cycle, 4),
             bankroll=bankroll,
             equity=equity,
-            stats=src_fill.get("stats", 0),
-            complement=src_fill.get("complement", 0),
+            stats=0,
+            complement=n_comp,
+            partition=n_part,
+            maker=n_maker,
+            n_complement=n_comp,
+            n_kalshi_clean=n_k,
+            n_partition=n_part,
+            n_blocked_spread=n_block,
             by_source=src_fill,
-            bucket_A_count=a_n,
         )
         return {"ok": True, **self.last_cycle}
 

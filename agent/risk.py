@@ -42,6 +42,7 @@ class Ticket:
     pm_mid: float | None = None
     gap_c: float | None = None
     cycle_id: str | None = None
+    tif: str = "FAK"  # FAK lift or GTC join-bid (maker)
 
 
 def taker_fee_rate(category: str) -> float:
@@ -327,15 +328,16 @@ PRIMARY_HINTS = (
     "trump",
 )
 SPORTS_PX = (0.22, 0.82)
-DEPLOYED_MAX = 0.85
+DEPLOYED_MAX = 0.75
 EQUITY_SPORTS_HALT = 0.70
 MAX_SPORTS = 4
 HARD_NAME_PCT = 0.18
 EVENT_COST_PCT = 0.25
 CASH_SPORTS_MIN = 0.15
-SPORTS_PCT = (0.08, 0.12)  # scheduled match-winner 8–48h
-CORE_PCT = (0.12, 0.18)
-HALF_CORE_PCT = (0.08, 0.12)  # medium on >7d names only
+SPORTS_PCT = (0.08, 0.12)
+CORE_PCT = (0.14, 0.18)
+HALF_CORE_PCT = (0.08, 0.12)
+EDGE_PCT = (0.14, 0.18)  # complement / kalshi / partition total
 MIN_NOTIONAL_PCT = 0.05
 DEPTH_USE_PCT = 0.50
 CASH_USE_PCT = 0.90
@@ -545,6 +547,49 @@ def clip_usd(p_hat: float, cost: float, bankroll: float, cap: float) -> float:
     return min(cap, max(kelly, floor))
 
 
+def _position_edge_kind(pos: dict, book: dict | None, market: dict | None, kalshi: dict | None) -> str | None:
+    """Active A/B/E edge still on this name? Grok is never an edge."""
+    market = market or {}
+    book = book or {}
+    side = str(pos.get("side") or "YES").upper()
+    try:
+        yask = float((market.get("book") or {}).get("best_ask") or 0)
+    except (TypeError, ValueError):
+        yask = 0.0
+    try:
+        nask = float((market.get("no_book") or {}).get("best_ask") or 0)
+    except (TypeError, ValueError):
+        nask = 0.0
+    try:
+        held_ask = float(book.get("best_ask") or 0)
+    except (TypeError, ValueError):
+        held_ask = 0.0
+    if side == "YES" and not yask:
+        yask = held_ask
+    if side == "NO" and not nask:
+        nask = held_ask
+    if yask > 0 and nask > 0 and yask + nask <= 0.975:
+        return "complement"
+    ks = kalshi or market.get("kalshi") or {}
+    try:
+        k_yes = float(ks.get("yes") or 0)
+        pm = float(market.get("yes_mid") or market.get("mid") or book.get("mid") or 0)
+    except (TypeError, ValueError):
+        k_yes, pm = 0.0, 0.0
+    ticker = str(ks.get("ticker") or "")
+    if ticker and 0 < k_yes < 1 and 0 < pm < 1:
+        from agent.kalshi import pair_ok
+
+        ok, _ = pair_ok(str(pos.get("question") or ""), ticker, str(ks.get("title") or ""), k_yes, pm)
+        if ok and abs(pm - k_yes) >= 0.06:
+            cheap = "YES" if k_yes >= pm + 0.06 else "NO"
+            if cheap == side:
+                return "kalshi"
+    if market.get("partition_complete") and float(market.get("s_ask") or 99) <= 0.97:
+        return "partition"
+    return None
+
+
 class Risk:
     def __init__(self, store: Store) -> None:
         self.store = store
@@ -565,6 +610,20 @@ class Risk:
         return None
 
     def evaluate(
+        self,
+        market: dict,
+        book: dict,
+        estimate: dict,
+        bankroll: float,
+        equity: float,
+        min_edge: float | None = None,
+        probe: bool = False,
+    ) -> tuple[Ticket | None, str]:
+        """Grok is log-only. Never open a Grok ticket."""
+        _ = (market, book, estimate, bankroll, equity, min_edge, probe)
+        return None, "grok-log-only"
+
+    def _evaluate_disabled(
         self,
         market: dict,
         book: dict,
@@ -890,113 +949,64 @@ class Risk:
             return None, "complement-hold"
         pnl_pct = (live - avg) / avg if avg and live > 0 else 0.0
         mid = float((book or {}).get("mid") or live or mark)
-
-        trail_px = hwm * 0.92 if hwm > 0 else 0.0
-        armed = hwm > 0 and avg > 0 and (hwm >= avg * 1.18 or pnl_pct >= 0.18)
-        if sports and live >= 0.02 and armed and live <= trail_px:
-            return self._exit_ticket(
-                pos, book, shares, live,
-                f"sports trail −8% fra topp {hwm:.3f} (≤{trail_px:.3f}) bud {live:.3f}",
-                kind="tp", best_bid=live,
-            ), "ok"
-
-        if sports and live > 0 and (live <= avg * 0.85 or live <= 0.03):
-            return self._exit_ticket(
-                pos, book, shares, live, f"sports stopp-tap {pnl_pct:.1%} bid {live:.3f}",
-                kind="stop", best_bid=live,
-            ), "ok"
-        if sports and live <= 0:
+        if live <= 0:
             return None, f"hold tom/resolved bok bid {live:.4f} — ikke FAK"
-        if not sports and live >= 0.02 and pnl_pct <= -0.18:
-            return self._exit_ticket(
-                pos, book, shares, live, f"stopp-tap {pnl_pct:.1%} bid {live:.3f}",
-                kind="stop", best_bid=live,
-            ), "ok"
-        if not sports and live >= 0.02 and (live >= 0.92 or pnl_pct >= 0.22):
-            return self._exit_ticket(
-                pos, book, shares, live, f"ta gevinst {pnl_pct:.1%} bid {live:.3f}",
-                kind="tp", best_bid=live,
-            ), "ok"
-
-        hours_open = 0.0
-        raw_ts = pos.get("opened_ts") or pos.get("last_ts")
-        if raw_ts:
-            try:
-                ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                hours_open = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
-            except ValueError:
-                hours_open = 0.0
-        hours_left = None
-        if market:
-            hours_left = market.get("hours_left")
-        if sports and live >= 0.02 and mid < 0.15 and (hours_open >= 3 or (hours_left is not None and float(hours_left) < -3)):
-            return self._exit_ticket(
-                pos, book, shares, live, f"kamp >3t og mid {mid:.3f}<0.15",
-                kind="stop", best_bid=live,
-            ), "ok"
 
         ks = kalshi or {}
         k_yes = float(ks.get("yes") or 0)
         ticker = str(ks.get("ticker") or "")
-        if sports:
-            k_yes = 0.0
-            ticker = ""
-        if not sports and ticker and 0 < k_yes < 1:
+        q = str(pos.get("question") or "")
+        if ticker and 0 < k_yes < 1:
             from agent.kalshi import pair_ok
 
-            q = str(pos.get("question") or "")
             if side == "NO":
                 pm_yes_gate = (1.0 - live) if 0 < live < 1 else (1.0 - mark if 0 < mark < 1 else 0.0)
             else:
                 pm_yes_gate = live if live > 0 else mark
-            if not pair_ok(q, ticker, str(ks.get("title") or ""), k_yes, pm_yes_gate if pm_yes_gate else None)[0]:
+            ok_pair, _ = pair_ok(q, ticker, str(ks.get("title") or ""), k_yes, pm_yes_gate if pm_yes_gate else None)
+            if not ok_pair:
                 ticker = ""
                 k_yes = 0.0
-        if not sports and ticker and 0 < k_yes < 1:
-            # Kalshi YES vs PM YES. Never compare k_yes to a NO mark.
-            if side == "NO":
-                pm_yes = (1.0 - live) if 0 < live < 1 else (1.0 - mark if 0 < mark < 1 else 0.0)
-            else:
-                pm_yes = live if live > 0 else mark
-            if live >= 0.02 and 0 < pm_yes < 1:
-                if k_yes >= pm_yes + 0.05:
-                    want = "YES"
-                elif pm_yes >= k_yes + 0.05:
-                    want = "NO"
-                else:
-                    want = None
-                if want and want != side:
-                    return self._exit_ticket(
-                        pos, book, shares, live,
-                        f"Kalshi vil {want} ({k_yes:.2f} vs PM {pm_yes:.2f}) — flatten {side}",
-                        kind="stop", best_bid=live,
-                    ), "ok"
+        if ticker and 0 < k_yes < 1 and live >= 0.02:
+            pm_yes = (1.0 - live) if side == "NO" and 0 < live < 1 else (live if live > 0 else mark)
             k_hat = k_yes if side == "YES" else 1.0 - k_yes
             pm_hat = live if live > 0 else mark
-            against_mid = k_hat <= pm_hat - 0.07
-            against_cost = k_hat + 0.07 < avg
-            crash = k_hat < 0.02 and pm_hat > 0.40
-            if live >= 0.02 and (against_mid or against_cost or crash):
+            if k_hat + 0.06 <= pm_hat or k_hat + 0.06 < avg:
                 return self._exit_ticket(
                     pos, book, shares, live,
-                    f"Kalshi {k_hat:.2f} vs PM {pm_hat:.2f} kost {avg:.2f} — selg",
+                    f"Kalshi {k_hat:.2f} ≥6c mot {side} — flatten",
                     kind="stop", best_bid=live,
                 ), "ok"
 
-        if estimate and not estimate.get("skip") and live >= 0.02:
-            try:
-                p_yes = float(estimate["p_yes"])
-            except (TypeError, ValueError, KeyError):
-                p_yes = None
-            if p_yes is not None:
-                p_hat = p_yes if side == "YES" else 1.0 - p_yes
-                faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
-                if p_hat + 0.05 <= avg and not faded_to_mid:
-                    qn = str(pos.get("question") or "")[:60]
-                    log.info("grok-exit-blocked %s p_hat=%.2f avg=%.2f", qn, p_hat, avg)
-                    return None, f"grok-exit-blocked p_hat {p_hat:.2f} vs kost {avg:.2f}"
+        edge = _position_edge_kind(pos, book, market, ks)
+        if edge:
+            return None, f"hold edge={edge} bid {live:.3f}"
+
+        against_c = (avg - live) if live > 0 else 0.0
+        if live >= 0.02 and against_c >= 0.08:
+            return self._exit_ticket(
+                pos, book, shares, live,
+                f"edge-gone flatten −{against_c:.2f} vs avg {avg:.2f}",
+                kind="stop", best_bid=live,
+            ), "ok"
+        if live >= 0.02 and live <= avg * 0.90:
+            return self._exit_ticket(
+                pos, book, shares, live, f"stopp-tap bid {live:.3f} ≤ avg×0.90",
+                kind="stop", best_bid=live,
+            ), "ok"
+        trail_px = hwm * 0.94 if hwm > 0 else 0.0
+        armed = hwm > 0 and avg > 0 and (hwm >= avg * 1.12 or hwm >= 0.90)
+        if live >= 0.02 and armed and live <= trail_px:
+            return self._exit_ticket(
+                pos, book, shares, live,
+                f"trail −6% fra topp {hwm:.3f} (≤{trail_px:.3f}) bud {live:.3f}",
+                kind="tp", best_bid=live,
+            ), "ok"
+        if live >= 0.02 and (live >= avg * 1.12 or live >= 0.90):
+            return self._exit_ticket(
+                pos, book, shares, live, f"ta gevinst bid {live:.3f} avg {avg:.2f}",
+                kind="tp", best_bid=live,
+            ), "ok"
         return None, f"hold bid {live:.3f} pnl {pnl_pct:.1%}"
 
     def _exit_ticket(
