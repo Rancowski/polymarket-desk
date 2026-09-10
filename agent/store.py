@@ -568,7 +568,21 @@ class Store:
                     (utc_now(), condition_id),
                 )
             self.conn.commit()
-        self.set_meta(self._dust_key(condition_id, side), utc_now())
+        now = utc_now()
+        self.set_meta(self._dust_key(condition_id, side), now)
+        self.set_meta(f"dust_close:{condition_id}", now)
+
+    def dust_close_fresh(self, condition_id: str, side: str | None = None, window_s: float = 1800) -> bool:
+        raw = self.get_meta(f"dust_close:{condition_id}", "") or self.get_meta(self._dust_key(condition_id, side), "")
+        if not raw:
+            return False
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds() < window_s
+        except (TypeError, ValueError):
+            return True
 
     def clear_dust(self, condition_id: str, side: str | None) -> None:
         self.set_meta(self._dust_key(condition_id, side), "")
@@ -919,7 +933,7 @@ class Store:
         for r in cleaned:
             cid = str(r.get("condition_id") or "")
             side = str(r.get("side") or "YES")
-            if self.is_dust(cid, side):
+            if self.is_dust(cid, side) or self.dust_close_fresh(cid, side):
                 try:
                     cur = float(r.get("cur_price") or 0)
                 except (TypeError, ValueError):
@@ -936,9 +950,17 @@ class Store:
                 except (TypeError, ValueError):
                     dep = 0.0
                 dust_cut = 0.001 * dep if dep > 0 else 0.0
-                if (dust_cut > 0 and mtm < dust_cut) or cur <= 0.01:
+                keep_dust = (
+                    shares < 1.0
+                    or mtm < 1.0
+                    or (dust_cut > 0 and mtm < dust_cut)
+                    or cur <= 0.01
+                    or self.dust_close_fresh(cid, side)
+                )
+                if keep_dust:
                     continue
                 self.clear_dust(cid, side)
+                self.set_meta(f"dust_close:{cid}", "")
             self.upsert_position(**r)
 
     def first_mark(self) -> dict | None:

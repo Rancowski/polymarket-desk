@@ -27,6 +27,18 @@ from agent.store import Store
 
 log = logging.getLogger("desk")
 GROK_BATCH_N = 15
+_KX_TICKER_RE = re.compile(
+    r"\b(?:KX[A-Z0-9-]{4,}|CONTROLH-[A-Z0-9-]+|PRES-[A-Z0-9-]+|KXSENATE[A-Z0-9-]*)\b",
+    re.I,
+)
+
+
+def _scrub_exit_reason(reason: str) -> str:
+    """Exit logs must not print a rejected Kalshi ticker."""
+    t = _KX_TICKER_RE.sub("", reason or "")
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"\s+[—-]\s+", " — ", t)
+    return t.strip(" -—") or (reason or "")
 REJECT_KEYS = (
     "confidence=low",
     "edge_net",
@@ -330,7 +342,7 @@ class Desk:
             if live_tick:
                 ok, why = _legal(live_tick)
                 if not ok:
-                    force[(cid, side)] = f"ulovlig par {live_tick} — {why}"
+                    force[(cid, side)] = f"ulovlig par — {why}"
                 continue
             stored: list[str] = []
             stored.extend(extract_tickers(str(p.get("entry_detail") or "")))
@@ -343,7 +355,7 @@ class Desk:
                 if any(_legal(t)[0] for t in stored):
                     continue
                 t0 = stored[0]
-                force[(cid, side)] = f"ulovlig par {t0} — {_legal(t0)[1]}"
+                force[(cid, side)] = f"ulovlig par — {_legal(t0)[1]}"
                 continue
             if str(p.get("entry_source") or "") == "kalshi":
                 force[(cid, side)] = "kalshi uten gyldig ticker — flatten"
@@ -651,7 +663,7 @@ class Desk:
                     "condition_id": cid,
                     "side": side,
                     "action": action,
-                    "reason": reason,
+                    "reason": _scrub_exit_reason(reason),
                 }
 
             try:
@@ -663,7 +675,9 @@ class Desk:
                     self.store.clear_dust(str(cid or ""), str(side or "YES"))
                 except Exception:
                     pass
-            elif self.store.is_dust(str(cid or ""), str(side or "YES")):
+            elif self.store.is_dust(str(cid or ""), str(side or "YES")) or self.store.dust_close_fresh(
+                str(cid or ""), str(side or "YES")
+            ):
                 why = "closed_dust — hopper FAK"
                 self.store.log_decision(
                     condition_id=cid,
@@ -760,6 +774,24 @@ class Desk:
                 if status in {"live_sell", "paper_sell"}:
                     action = "sold"
                     sold += 1
+                elif status == "dust_close":
+                    fam = _pm_family(str(pos.get("question") or ""))
+                    cid_s = str(cid or "")
+                    if fam == "fed":
+                        action = "hold"
+                        reason = f"ikke dust Fed · {_scrub_exit_reason(reason)}"
+                    elif self.store.dust_close_fresh(cid_s, str(side or "YES")):
+                        action = "hold"
+                        reason = "dust_close cooldown 30m"
+                    else:
+                        self.store.close_dust(cid_s, str(side or "YES"))
+                        action = "dust_close"
+                        sold += 1
+                        notion = result.get("notional")
+                        reason = (
+                            f"dust_close shares={result.get('shares') or pos.get('shares')} "
+                            f"bid={book_bid:.3f} notional={notion} · {_scrub_exit_reason(reason)}"
+                        )
                 elif status == "no_bid":
                     mkt = by_id.get(cid or "") or {}
                     state = resolved_state(pos, pbook, mkt)
@@ -837,6 +869,7 @@ class Desk:
                     )
                 else:
                     action = "selling"
+                reason = _scrub_exit_reason(reason)
                 self.store.log_decision(
                     condition_id=cid,
                     question=pos.get("question"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from typing import Any
 
@@ -137,9 +138,7 @@ def _place_limit(client: Any, args: Any, tick_s: str, neg: bool, sdk: str = "v1"
 
 
 def _amount_size(price: float, size: float) -> float:
-    """CLOB krever at price*size i 1e6-enheter går opp. 10 andeler på tick-pris er trygt."""
-    import math
-
+    """BUY only. CLOB krever at price*size i 1e6-enheter går opp. Min 5 andeler."""
     px = max(0.01, min(0.99, float(price)))
     p_int = int(round(px * 10000))
     if p_int <= 0:
@@ -149,6 +148,95 @@ def _amount_size(price: float, size: float) -> float:
     units = (int(round(float(size) * 10000)) // step) * step or step
     out = round(units / 10000, 4)
     return max(5.0, out)
+
+
+def _floor_shares(n: float, places: int = 4) -> float:
+    scale = 10 ** places
+    return math.floor(max(0.0, float(n)) * scale + 1e-12) / scale
+
+
+def sell_shares_cap(booked: float, on_chain: float | None) -> float:
+    """min(booked, floor(on_chain * 1e4) / 1e4). Never round a sell up."""
+    booked_f = _floor_shares(booked, 4)
+    if on_chain is None:
+        return booked_f
+    return min(booked_f, _floor_shares(on_chain, 4))
+
+
+def sell_size_ladder(shares_sell: float) -> list[float]:
+    """[1.00, 0.75, 0.50, 0.25] × shares_sell. Sizes < 5 stay. Strictly decreasing."""
+    cap = _floor_shares(shares_sell, 4)
+    if cap <= 0:
+        return []
+    out: list[float] = []
+    for frac in (1.0, 0.75, 0.50, 0.25):
+        sz = _floor_shares(cap * frac, 4)
+        if out and sz >= out[-1]:
+            sz = _floor_shares(out[-1] - 0.0001, 4)
+        if sz <= 0 or sz in out:
+            continue
+        out.append(sz)
+    return out
+
+
+def sell_is_dust(shares: float, live_bid: float, deposited: float = 0.0) -> bool:
+    if shares < 1.0:
+        return True
+    notional = float(shares) * float(live_bid or 0)
+    if notional < 1.0:
+        return True
+    if deposited > 0 and notional < 0.001 * deposited:
+        return True
+    return False
+
+
+def plan_sell(
+    booked: float,
+    on_chain: float | None,
+    live_bid: float,
+    deposited: float = 0.0,
+) -> dict:
+    """Pure sell plan. No CLOB. Used by sell() and the 2.56-share fixture."""
+    shares_sell = sell_shares_cap(booked, on_chain)
+    ladder = sell_size_ladder(shares_sell)
+    dust = sell_is_dust(shares_sell, live_bid, deposited)
+    return {
+        "shares_sell": shares_sell,
+        "ladder": ladder,
+        "dust": dust,
+        "notional": round(shares_sell * float(live_bid or 0), 6),
+        "fak": (not dust) and bool(ladder),
+    }
+
+
+_BAL_VS_RE = re.compile(r"balance\s+(\d+(?:\.\d+)?)\s+vs\s+order", re.I)
+
+
+def _parse_clob_token_balance(msg: str) -> float | None:
+    m = _BAL_VS_RE.search(msg or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sell_amount_size(price: float, size: float, cap: float) -> float:
+    """Floor size to CLOB step. Never round up, never min-5, never above cap."""
+    cap_f = _floor_shares(min(float(size), float(cap)), 4)
+    if cap_f <= 0:
+        return 0.0
+    px = max(0.01, min(0.99, float(price)))
+    p_int = int(round(px * 10000))
+    if p_int <= 0:
+        return cap_f
+    maker_step = 1_000_000 // math.gcd(p_int, 1_000_000)
+    step = maker_step * 100 // math.gcd(maker_step, 100)
+    units = (int(math.floor(cap_f * 10000 + 1e-12)) // step) * step
+    if units <= 0:
+        return 0.0
+    return min(cap_f, round(units / 10000, 4))
 
 
 def _quantize(price: float, tick: float) -> float:
@@ -713,15 +801,91 @@ class Executor:
         )
         return {"status": "live", "response": data or signed, "ticket": payload}
 
+    def _conditional_balance(self, token_id: str) -> float | None:
+        """On-chain ERC-1155 size for this token. None = fetch failed, do not invent."""
+        token = str(token_id or "").strip()
+        if not token or settings.dry_run:
+            return None
+        try:
+            client = self._live_client()
+            if hasattr(client, "get_balance_allowance"):
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+                try:
+                    params = BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL,
+                        token_id=token,
+                        signature_type=settings.signature_type,
+                    )
+                except TypeError:
+                    try:
+                        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token)
+                    except TypeError:
+                        params = None
+                if params is not None:
+                    bal = client.get_balance_allowance(params)
+                    parsed = _parse_balance(bal)
+                    if parsed > 0:
+                        return parsed
+        except Exception as exc:
+            log.warning("token balance %s: %s", token[:14], exc)
+        return None
+
     def sell(self, order: dict) -> dict:
         payload = {**order}
-        if settings.dry_run:
+        token = str(order.get("token_id") or "").strip()
+        booked = float(order.get("shares") or 0)
+        dust_kind = bool(order.get("dust") or order.get("kind") == "dust")
+        book_bid = float(order.get("best_bid") or 0)
+        mark = float(order.get("mark") or 0)
+        if mark >= 0.90 and book_bid <= 0.01:
+            raise RuntimeError("resolved winner — redeem, ikke FAK")
+        if str(order.get("kind") or "") == "resolved_loser":
+            raise RuntimeError("resolved loser — close locally")
+        live = book_bid if book_bid > 0 else 0.0
+        if live < 0.02:
+            return {
+                "status": "no_bid",
+                "response": {"error": "ingen live bud"},
+                "ticket": payload,
+                "attempt_px": None,
+                "best_bid": live,
+            }
+        on_chain = None if settings.dry_run else self._conditional_balance(token)
+        try:
+            deposited = float(self.store.deposited_usd(0.0) or 0)
+        except Exception:
+            deposited = 0.0
+        plan = plan_sell(booked, on_chain, live, deposited)
+        shares_sell = float(plan["shares_sell"])
+        size_ladder = list(plan["ladder"])
+        payload = {**payload, "shares": shares_sell, "size_usd": round(shares_sell * live, 4)}
+        if plan["dust"] or not size_ladder:
+            log.info(
+                "SELL dust_close shares=%.4f bid=%.3f notional=%.4f (booked=%.4f on_chain=%s)",
+                shares_sell,
+                live,
+                plan["notional"],
+                booked,
+                on_chain,
+            )
+            return {
+                "status": "dust_close",
+                "response": {"error": "dust_close — ikke FAK"},
+                "ticket": payload,
+                "attempt_px": None,
+                "best_bid": live,
+                "shares": shares_sell,
+                "notional": plan["notional"],
+            }
+
+        def _record_paper() -> dict:
             log.info(
                 "PAPER SELL %s %s @ %s size=%s (%s)",
                 order.get("side"),
                 str(order.get("question") or "")[:60],
                 order.get("limit_price"),
-                order.get("shares"),
+                shares_sell,
                 order.get("reason"),
             )
             attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
@@ -729,8 +893,8 @@ class Executor:
                 condition_id=order.get("condition_id"),
                 side=attr["side"] or f"SELL_{order.get('side')}",
                 price=order.get("limit_price"),
-                size=order.get("shares"),
-                cost=order.get("size_usd"),
+                size=shares_sell,
+                cost=round(float(order.get("limit_price") or live) * shares_sell, 4),
                 dry_run=True,
                 raw=payload,
                 **{k: v for k, v in attr.items() if k != "side"},
@@ -754,11 +918,11 @@ class Executor:
                 self.store.close_position(order["condition_id"], order.get("side"))
             return {"status": "paper_sell", "ticket": payload}
 
+        if settings.dry_run:
+            return _record_paper()
+
         client = self._live_client()
         sdk = getattr(self, "_sdk", "v1")
-        token = str(order.get("token_id") or "").strip()
-        price = float(order["limit_price"])
-        size = float(order["shares"])
         if sdk == "v2":
             from py_clob_client_v2 import OrderArgs, Side
 
@@ -774,28 +938,11 @@ class Executor:
                 side = "SELL"
         tick_s, neg = _clob_meta(token)
         tick_f = float(tick_s) if tick_s else 0.01
-        # Never FAK on 0.001. Snap to the market tick, at least 0.01.
         if tick_f <= 0.001 + 1e-12 or tick_f < 0.01:
             tick_f = 0.01
             tick_s = "0.01"
         else:
             tick_s = _tick_literal(tick_f)
-        dust = bool(order.get("dust") or order.get("kind") == "dust")
-        book_bid = float(order.get("best_bid") or 0)
-        mark = float(order.get("mark") or 0)
-        if mark >= 0.90 and book_bid <= 0.01:
-            raise RuntimeError("resolved winner — redeem, ikke FAK")
-        if str(order.get("kind") or "") == "resolved_loser":
-            raise RuntimeError("resolved loser — close locally")
-        live = book_bid if book_bid > 0 else 0.0
-        if live < 0.02:
-            return {
-                "status": "no_bid",
-                "response": {"error": "ingen live bud"},
-                "ticket": payload,
-                "attempt_px": None,
-                "best_bid": live,
-            }
         attempts: list[float] = []
         for drop in (0, 1):
             attempt = _floor_tick(live - drop * tick_f, tick_f)
@@ -807,12 +954,10 @@ class Executor:
             attempts.append(_floor_tick(live, 0.01))
         last_signed: Any = None
         data: dict = {}
-        last_attempt = attempts[0] if attempts else price
-        size_ladder = [size]
-        if size > 5:
-            size_ladder.append(max(5.0, round(size * 0.5, 2)))
-        if size > 15:
-            size_ladder.append(max(5.0, round(size * 0.25, 2)))
+        last_attempt = attempts[0] if attempts else live
+        last_sz = size_ladder[0]
+        failed_sz = shares_sell + 1.0
+        cap = shares_sell
 
         def _bal(msg: str) -> bool:
             m = (msg or "").lower()
@@ -822,40 +967,53 @@ class Executor:
             last_attempt = attempt
             sliced = False
             for sz in size_ladder:
+                if sz >= failed_sz:
+                    continue
+                sz_use = _sell_amount_size(attempt, sz, cap)
+                if sz_use <= 0 or sz_use >= failed_sz:
+                    continue
+                last_sz = sz_use
                 try:
-                    args = OrderArgs(token_id=token, price=attempt, size=sz, side=side, builder_code="")
+                    args = OrderArgs(token_id=token, price=attempt, size=sz_use, side=side, builder_code="")
                 except TypeError:
-                    args = OrderArgs(token_id=token, price=attempt, size=sz, side=side)
+                    args = OrderArgs(token_id=token, price=attempt, size=sz_use, side=side)
                 _attach_builder_code(args)
                 try:
                     signed = _place_limit(client, args, tick_s, neg, sdk=sdk)
                 except Exception as exc:
-                    log.warning("SELL %s @ %s sz=%s: %s", (order.get("question") or "")[:40], attempt, sz, exc)
+                    log.warning("SELL %s @ %s sz=%s: %s", (order.get("question") or "")[:40], attempt, sz_use, exc)
                     last_signed = {"error": str(exc)}
                     if _bal(str(exc)):
                         sliced = True
-                        log.warning("SELL slice — ikke nok balance, prøver mindre sz")
+                        failed_sz = sz_use
+                        parsed = _parse_clob_token_balance(str(exc))
+                        if parsed is not None:
+                            cap = min(cap, sell_shares_cap(sz_use, parsed))
+                        log.warning("SELL slice — ikke nok balance, neste < %.4f", failed_sz)
                         continue
                     break
-                log.info("LIVE SELL try @ %s sz=%s %s", attempt, sz, signed)
+                log.info("LIVE SELL try @ %s sz=%s %s", attempt, sz_use, signed)
                 filled, data = _order_filled(signed)
                 last_signed = signed
                 err = str((data or {}).get("error") or (data or {}).get("errorMsg") or "")
                 if err and _bal(err):
                     sliced = True
+                    failed_sz = sz_use
+                    parsed = _parse_clob_token_balance(err)
+                    if parsed is not None:
+                        cap = min(cap, sell_shares_cap(sz_use, parsed))
                     log.warning("SELL slice — CLOB balance %s", err[:160])
                     continue
                 if not filled:
                     break
-                size = sz
-                order = {**order, "shares": sz}
+                order = {**order, "shares": sz_use}
                 attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
                 self.store.add_fill(
                     condition_id=order.get("condition_id"),
                     side=attr["side"] or f"SELL_{order.get('side')}",
                     price=attempt,
-                    size=size,
-                    cost=round(attempt * size, 4),
+                    size=sz_use,
+                    cost=round(attempt * sz_use, 4),
                     dry_run=False,
                     raw={
                         "order": data or str(signed),
@@ -886,18 +1044,24 @@ class Executor:
                     self.store.close_position(order["condition_id"], order.get("side"))
                 return {"status": "live_sell", "response": data or signed, "ticket": payload}
             if sliced:
-                log.info("SELL stop after slice — ikke retry dust @ %s", last_attempt)
-                return {
-                    "status": "resting_sell",
-                    "response": data or last_signed,
-                    "ticket": payload,
-                    "attempt_px": last_attempt,
-                    "best_bid": book_bid,
-                }
+                # Try remaining strictly-smaller sizes at this price already happened.
+                # Next price only if a smaller size is still above dust.
+                continue
+        leftover = min(cap, last_sz if last_sz > 0 else shares_sell)
+        if sell_is_dust(leftover, live, deposited) or dust_kind:
+            log.info("SELL dust_close after unmatched leftover=%.4f bid=%.3f", leftover, live)
+            return {
+                "status": "dust_close",
+                "response": data or last_signed,
+                "ticket": payload,
+                "attempt_px": last_attempt,
+                "best_bid": book_bid,
+                "shares": leftover,
+                "notional": round(leftover * live, 6),
+            }
         log.info("Salg umatchet etter FAK-retry — ingen fill")
-        st = "unmatched_dust" if dust else "resting_sell"
         return {
-            "status": st,
+            "status": "resting_sell",
             "response": data or last_signed,
             "ticket": payload,
             "attempt_px": last_attempt,
