@@ -326,21 +326,27 @@ class Arb:
         """Named Kalshi pair. Buy when Kalshi ≥ PM + 5c. Not locked arb."""
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
+        open_pos = self.store.positions("open")
         held_side = {
             str(p.get("condition_id")): str(p.get("side") or "YES").upper()
-            for p in self.store.positions("open")
+            for p in open_pos
         }
+        open_qs = [str(p.get("question") or "") for p in open_pos]
         for m in markets:
             cid = m.get("condition_id")
             ks = m.get("kalshi") or {}
             ticker = str(ks.get("ticker") or "").strip()
             if not cid or not ticker:
                 continue
-            from agent.kalshi import pair_ok
+            from agent.kalshi import fed_seat_taken, pair_ok
 
+            q = str(m.get("question") or "")
             pm = float(m.get("yes_mid") or m.get("mid") or ks.get("pm_yes") or 0)
             k_yes = float(ks.get("yes") or 0)
-            if not pair_ok(str(m.get("question") or ""), ticker, str(ks.get("title") or ""), k_yes, pm)[0]:
+            if not pair_ok(q, ticker, str(ks.get("title") or ""), k_yes, pm)[0]:
+                continue
+            fed_why = fed_seat_taken(open_qs, q)
+            if fed_why:
                 continue
             if self._skip_sports(m, sports_n, sports_halt, out):
                 continue
@@ -394,6 +400,7 @@ class Arb:
                 )
             )
             open_ids.add(cid)
+            open_qs.append(q)
             if len(out) >= 3:
                 break
         return out

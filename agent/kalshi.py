@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -566,6 +567,45 @@ def _pm_fed_meeting(pm_q: str) -> set[str]:
     return out
 
 
+def _pm_side(q: str) -> str | None:
+    """Dem↔D, GOP↔R, trump-out↔OUT, hike↔H25, hold↔H0, cut↔C25."""
+    t = (q or "").lower()
+    if any(x in t for x in ("trump out", "out as president", "leaves office", "removed as president")):
+        return "OUT"
+    if re.search(r"\b(democrat|democrats|democratic|dems)\b", t):
+        return "D"
+    if re.search(r"\b(republican|republicans|gop)\b", t):
+        return "R"
+    want = _fed_want(q)
+    return want
+
+
+def _ticker_side(ticker: str, title: str = "") -> str | None:
+    tick = (ticker or "").upper()
+    suf = _fed_suffix(tick)
+    if suf:
+        return suf
+    m = re.search(r"-(D|R)(?:\b|$|-)", tick)
+    if m:
+        return m.group(1)
+    blob = f"{ticker} {title}".lower()
+    if re.search(r"\b(democrat|democratic)\b", blob):
+        return "D"
+    if re.search(r"\b(republican|gop)\b", blob):
+        return "R"
+    return None
+
+
+def _pm_years(pm_q: str) -> set[int]:
+    """20xx in the title, else current year if a month/day deadline is present (Sep 30 → 2026)."""
+    ys = _years(pm_q)
+    if ys:
+        return ys
+    if _md(pm_q) or _months(pm_q):
+        ys.add(datetime.now(timezone.utc).year)
+    return ys
+
+
 def pair_ok(
     pm_q: str,
     ticker: str,
@@ -573,7 +613,7 @@ def pair_ok(
     k_yes: float | None = None,
     pm_yes: float | None = None,
 ) -> tuple[bool, str]:
-    """Hard gate. Family + calendar + strike/outcome + live mids."""
+    """Hard gate. Family + calendar + SAME OUTCOME + strike + live mids."""
     tick = str(ticker or "").strip()
     if not tick:
         return False, "ingen ticker"
@@ -583,6 +623,21 @@ def pair_ok(
         return False, f"ulik familie {pf or '—'} vs {tf or '—'} ({tick})"
     if pf != tf:
         return False, f"familie {pf} ≠ {tf} ({tick})"
+    ps, ts = _pm_side(pm_q), _ticker_side(tick, k_title)
+    if ps and ts and ps != ts:
+        log.info("motpart, ikke par %s vs %s (%s)", ps, ts, tick)
+        return False, "motpart, ikke par"
+    qy = _pm_years(pm_q)
+    ty = _years(tick) | _years(k_title)
+    if qy and ty and not (qy & ty):
+        return False, f"ulikt år {sorted(qy)} ≠ {sorted(ty)}"
+    if pm_yes is not None:
+        try:
+            py_pin = float(pm_yes)
+        except (TypeError, ValueError):
+            py_pin = None
+        if py_pin is not None and (py_pin >= 0.95 or py_pin <= 0.05):
+            return False, "pm pin ikke kalshi-buy"
     blob_k = f"{tick} {k_title}"
     if pf == "fed":
         want = _fed_want(pm_q)
@@ -595,11 +650,8 @@ def pair_ok(
         tick_meet = _meeting_codes(tick)
         if pm_meet and tick_meet and not (pm_meet & tick_meet):
             return False, f"ulik møte {'/'.join(sorted(pm_meet))} ≠ {'/'.join(sorted(tick_meet))}"
-    if pf == "us_election":
-        qy = _years(pm_q)
-        ty = _years(tick) | _years(k_title)
-        if qy and ty and not (qy & ty):
-            return False, f"ulikt år {sorted(qy)} ≠ {sorted(ty)}"
+        if pm_meet and not tick_meet:
+            return False, f"ulik møte {'/'.join(sorted(pm_meet))} ≠ —"
     if pf in {"btc", "eth"}:
         q_strike = _strikes(pm_q)
         k_strike = _strikes(blob_k)
@@ -610,13 +662,6 @@ def pair_ok(
         qmd, kmd = _md(pm_q), _md(blob_k)
         if qmd and kmd and not (qmd & kmd):
             return False, "ulik session-dato"
-        if pm_yes is not None:
-            try:
-                py = float(pm_yes)
-            except (TypeError, ValueError):
-                py = None
-            if py is not None and (py >= 0.95 or py <= 0.05):
-                return False, "pm pin ikke kalshi-buy"
     if pf in {"hormuz", "tweets", "fdv"}:
         qd, kd = _dates(pm_q), _dates(blob_k)
         qmd, kmd = _md(pm_q), _md(blob_k)
@@ -630,13 +675,10 @@ def pair_ok(
             py = float(pm_yes)
         except (TypeError, ValueError):
             return False, "ugyldig mid"
-        if pf in {"btc", "eth"} and (py >= 0.95 or py <= 0.05):
+        if py >= 0.95 or py <= 0.05:
             return False, "pm pin ikke kalshi-buy"
-        pinned = (ky <= 0.01 or ky >= 0.99) and (py <= 0.01 or py >= 0.99)
-        if not pinned and not (0.01 < ky < 0.99 and 0.01 < py < 0.99):
+        if not (0.01 < ky < 0.99 and 0.01 < py < 0.99):
             return False, f"mid utenfor (0.01,0.99) k={ky:.3f} pm={py:.3f}"
-        if pinned and pf in {"btc", "eth"}:
-            return False, "pm pin ikke kalshi-buy"
     return True, ""
 
 
@@ -677,7 +719,42 @@ CALENDAR_PAIR_FIXTURES: tuple[tuple[str, str, str, float, float], ...] = (
         0.01,
         1.00,
     ),
+    (
+        "Bitcoin above $76000 on Sep 9",
+        "KXBTC-26SEP0909-T76000",
+        "Bitcoin above 76000 on Sep 9",
+        0.01,
+        1.00,
+    ),
+    (
+        "Democratic Party control the House after the 2026 Midterms",
+        "CONTROLH-2026-R",
+        "Republicans control House",
+        0.15,
+        0.88,
+    ),
+    (
+        "Trump out as President by September 30",
+        "KXPRESPARTY-2032-R",
+        "Republican presidential party 2032",
+        0.40,
+        0.42,
+    ),
 )
+
+
+def fed_seat_taken(open_questions: list[str], new_q: str) -> str | None:
+    """One Fed meeting at a time. hike-NO + hold-YES is overlap, not edge."""
+    if _pm_family(new_q) != "fed":
+        return None
+    meet = _pm_fed_meeting(new_q)
+    for q in open_questions:
+        if _pm_family(q) != "fed":
+            continue
+        pmeet = _pm_fed_meeting(q)
+        if not meet or not pmeet or (meet & pmeet):
+            return "fed møte allerede åpen"
+    return None
 
 
 def pair_ok_selfcheck() -> None:
@@ -700,6 +777,12 @@ def pair_ok_selfcheck() -> None:
     )
     if not legal_ok:
         raise RuntimeError(f"pair_ok selfcheck: legal Fed H25 rejected ({legal_why})")
+    hike = "Fed hike 25 bps after the September 2026 meeting"
+    hold = "Will the Fed hold after the September 2026 meeting?"
+    if not fed_seat_taken([hike], hold):
+        raise RuntimeError("pair_ok selfcheck: fed_seat_taken missed same meeting")
+    if fed_seat_taken([hike], "Bitcoin above $76000 on Sep 9"):
+        raise RuntimeError("pair_ok selfcheck: fed_seat_taken blocked non-fed")
     if bad:
         raise RuntimeError("pair_ok selfcheck FAILED, would attach: " + " | ".join(bad))
     n = len(ILLEGAL_PAIR_FIXTURES) + len(CALENDAR_PAIR_FIXTURES)

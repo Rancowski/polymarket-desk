@@ -22,7 +22,7 @@ from agent.risk import (
     sizing_base,
 )
 from agent.scanner import Scout
-from agent.kalshi import extract_tickers, keep_fed_h25, pair_ok
+from agent.kalshi import _pm_family, extract_tickers, keep_fed_h25, pair_ok
 from agent.store import Store
 
 log = logging.getLogger("desk")
@@ -320,7 +320,11 @@ class Desk:
                     return False, "ingen ticker"
                 if keep_fed_h25(q, t):
                     return True, ""
-                return pair_ok(q, t, title, ky, py)
+                # Pin is a buy gate, not a flatten reason (Fed 26SEP stays).
+                ok, why = pair_ok(q, t, title, ky, None)
+                if not ok and why == "pm pin ikke kalshi-buy":
+                    return True, ""
+                return ok, why
 
             live_tick = str(live.get("ticker") or "").strip()
             if live_tick:
@@ -756,6 +760,56 @@ class Desk:
                 if status in {"live_sell", "paper_sell"}:
                     action = "sold"
                     sold += 1
+                elif status == "no_bid":
+                    mkt = by_id.get(cid or "") or {}
+                    state = resolved_state(pos, pbook, mkt)
+                    redeemable = bool(
+                        pos.get("redeemable")
+                        or mkt.get("redeemable")
+                        or mkt.get("closed")
+                        or mkt.get("resolved")
+                        or pos.get("closed")
+                    )
+                    fam = _pm_family(str(pos.get("question") or ""))
+                    if state == "loser":
+                        self.store.close_position(str(cid or ""), side)
+                        try:
+                            self.store.clear_dust(str(cid or ""), str(side or "YES"))
+                        except Exception:
+                            pass
+                        action = "closed"
+                        sold += 1
+                        reason = f"closed ingen live bud — loser · {reason}"
+                    elif state == "winner" or redeemable or mark >= 0.99:
+                        cid_s = str(cid or "")
+                        if self._redeem_cooldown(cid_s):
+                            action = "redeem_err"
+                            reason = "redeem_err cooldown 30m"
+                        else:
+                            try:
+                                result_r = self.exec.redeem(pos)
+                                st = str(result_r.get("status") or "")
+                                if st in {"redeem_ok", "paper_redeem"}:
+                                    action = "redeem_ok"
+                                    sold += 1
+                                    reason = f"{st} ingen live bud · {reason}"
+                                    self.store.set_meta(f"redeem_err:{cid_s}", "")
+                                else:
+                                    action = "redeem_err"
+                                    reason = f"redeem_err {st} · {reason}"
+                                    self.store.set_meta(f"redeem_err:{cid_s}", f"{time.time():.0f}")
+                            except Exception as exc:
+                                action = "redeem_err"
+                                reason = f"redeem_err {exc}"[:220]
+                                self.store.set_meta(f"redeem_err:{cid_s}", f"{time.time():.0f}")
+                    elif fam == "fed":
+                        action = "hold"
+                        reason = f"ingen live bud — Fed, ikke dust · {reason}"
+                    else:
+                        self.store.close_dust(str(cid or ""), str(side or "YES"))
+                        action = "closed_dust"
+                        sold += 1
+                        reason = f"closed_dust ingen live bud · {reason}"
                 elif mark < 0.90 and (
                     status == "unmatched_dust"
                     or (

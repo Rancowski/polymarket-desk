@@ -621,6 +621,14 @@ class Risk:
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
         if same_cid:
             return None, "aldri average down"
+        from agent.kalshi import fed_seat_taken
+
+        fed_why = fed_seat_taken(
+            [str(p.get("question") or "") for p in open_pos],
+            str(market.get("question") or ""),
+        )
+        if fed_why:
+            return None, fed_why
         if len(open_pos) >= settings.max_open_positions:
             return None, "max 10 åpne (kun hedge/påfyll)"
         sports_pos = [p for p in open_pos if is_sports(p)]
@@ -797,10 +805,16 @@ class Risk:
                 best_bid=book_bid,
             ), "ok"
         if force_reason:
-            if peak >= 0.98:
+            if peak >= 0.98 and book_bid >= 0.02:
+                if book_bid >= 0.98:
+                    return self._exit_ticket(
+                        pos, book, shares, book_bid, force_reason, kind="stop", best_bid=book_bid
+                    ), "ok"
                 return None, f"hold peak {peak:.3f} — ikke trim-dump ({force_reason})"
             if book_bid < 0.02:
-                return None, f"hold trim — ingen live bud ({force_reason})"
+                return self._exit_ticket(
+                    pos, book, shares, 0.0, force_reason, kind="ghost", best_bid=book_bid
+                ), "ok"
             return self._exit_ticket(
                 pos, book, shares, book_bid, force_reason, kind="stop", best_bid=book_bid
             ), "ok"
@@ -934,24 +948,15 @@ class Risk:
     ) -> dict:
         live = float(best_bid or 0)
         px = float(price or 0)
-        if kind != "dust" and kind != "resolved_loser" and live >= 0.10:
-            tick = 0.01
-            px = math.floor(live / tick + 1e-12) * tick
-            px = round(min(0.99, px), 2)
-        elif kind == "dust" or px < 0.10:
-            tick = 0.001 if px < 0.10 or kind == "dust" else 0.01
-            if px < tick:
-                px = tick
-            else:
-                px = math.floor(px / tick + 1e-12) * tick
-            px = round(max(tick, min(0.99, px)), 4)
-        else:
-            tick = 0.01
-            src = live if live >= 0.02 else px
+        tick = 0.01
+        src = live if live >= 0.02 else (px if px >= 0.02 else 0.0)
+        if src >= tick:
             px = math.floor(src / tick + 1e-12) * tick
             px = round(max(tick, min(0.99, px)), 2)
+        else:
+            px = tick
         low = str(reason or "").lower()
-        if kind == "dust":
+        if kind == "dust" or kind == "ghost":
             src_name = "flatten"
         elif kind == "tp" and "trail" in low:
             src_name = "exit_trail"

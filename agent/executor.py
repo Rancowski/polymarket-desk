@@ -773,7 +773,13 @@ class Executor:
             except Exception:
                 side = "SELL"
         tick_s, neg = _clob_meta(token)
-        tick_f = float(tick_s)
+        tick_f = float(tick_s) if tick_s else 0.01
+        # Never FAK on 0.001. Snap to the market tick, at least 0.01.
+        if tick_f <= 0.001 + 1e-12 or tick_f < 0.01:
+            tick_f = 0.01
+            tick_s = "0.01"
+        else:
+            tick_s = _tick_literal(tick_f)
         dust = bool(order.get("dust") or order.get("kind") == "dust")
         book_bid = float(order.get("best_bid") or 0)
         mark = float(order.get("mark") or 0)
@@ -782,73 +788,67 @@ class Executor:
         if str(order.get("kind") or "") == "resolved_loser":
             raise RuntimeError("resolved loser — close locally")
         live = book_bid if book_bid > 0 else 0.0
+        if live < 0.02:
+            return {
+                "status": "no_bid",
+                "response": {"error": "ingen live bud"},
+                "ticket": payload,
+                "attempt_px": None,
+                "best_bid": live,
+            }
         attempts: list[float] = []
-        if dust or live < 0.10:
-            if live < 0.02 and not dust:
-                return {
-                    "status": "resting_sell",
-                    "response": {"error": "ingen live bud"},
-                    "ticket": payload,
-                    "attempt_px": None,
-                    "best_bid": live,
-                }
-            if tick_f > 0.001:
-                tick_s, tick_f = "0.001", 0.001
-            src = live if live > 0 else min(0.01, price)
-            first = _floor_tick(src, tick_f) if src >= tick_f else tick_f
-            attempts.append(first)
-        else:
-            # Stop/trail: FAK at live bid, then bid−1 tick. Never 0.001 / 0.01.
-            tick_f = tick_f if 0 < tick_f <= 0.10 else 0.01
-            tick_s = _tick_literal(tick_f)
-            for drop in (0, 1):
-                attempt = _floor_tick(live - drop * tick_f, tick_f)
-                if attempt < 0.10:
-                    continue
-                if attempt not in attempts:
-                    attempts.append(attempt)
-            if not attempts and live >= 0.10:
-                attempts.append(_floor_tick(live, tick_f if tick_f >= 0.01 else 0.01))
+        for drop in (0, 1):
+            attempt = _floor_tick(live - drop * tick_f, tick_f)
+            if attempt < 0.01:
+                continue
+            if attempt not in attempts:
+                attempts.append(attempt)
+        if not attempts:
+            attempts.append(_floor_tick(live, 0.01))
         last_signed: Any = None
         data: dict = {}
         last_attempt = attempts[0] if attempts else price
+        size_ladder = [size]
+        if size > 5:
+            size_ladder.append(max(5.0, round(size * 0.5, 2)))
+        if size > 15:
+            size_ladder.append(max(5.0, round(size * 0.25, 2)))
+
+        def _bal(msg: str) -> bool:
+            m = (msg or "").lower()
+            return "not enough" in m or "insufficient" in m or "balance" in m
+
         for attempt in attempts:
             last_attempt = attempt
-            try:
-                args = OrderArgs(token_id=token, price=attempt, size=size, side=side, builder_code="")
-            except TypeError:
-                args = OrderArgs(token_id=token, price=attempt, size=size, side=side)
-            _attach_builder_code(args)
-            try:
-                signed = _place_limit(client, args, tick_s, neg, sdk=sdk)
-            except Exception as exc:
-                msg = str(exc).lower()
-                log.warning("SELL %s @ %s: %s", (order.get("question") or "")[:40], attempt, exc)
-                last_signed = {"error": str(exc)}
-                if "not enough" in msg or "insufficient" in msg or "balance" in msg:
-                    log.warning("SELL skip — ikke nok balance, ingen dust-retry")
-                    return {
-                        "status": "resting_sell",
-                        "response": {"error": str(exc)},
-                        "ticket": payload,
-                        "attempt_px": attempt,
-                        "best_bid": book_bid,
-                    }
-                continue
-            log.info("LIVE SELL try @ %s %s", attempt, signed)
-            filled, data = _order_filled(signed)
-            last_signed = signed
-            err = str((data or {}).get("error") or (data or {}).get("errorMsg") or "")
-            if err and ("not enough" in err.lower() or "insufficient" in err.lower() or "balance" in err.lower()):
-                log.warning("SELL skip — CLOB balance %s", err[:160])
-                return {
-                    "status": "resting_sell",
-                    "response": data or signed,
-                    "ticket": payload,
-                    "attempt_px": attempt,
-                    "best_bid": book_bid,
-                }
-            if filled:
+            sliced = False
+            for sz in size_ladder:
+                try:
+                    args = OrderArgs(token_id=token, price=attempt, size=sz, side=side, builder_code="")
+                except TypeError:
+                    args = OrderArgs(token_id=token, price=attempt, size=sz, side=side)
+                _attach_builder_code(args)
+                try:
+                    signed = _place_limit(client, args, tick_s, neg, sdk=sdk)
+                except Exception as exc:
+                    log.warning("SELL %s @ %s sz=%s: %s", (order.get("question") or "")[:40], attempt, sz, exc)
+                    last_signed = {"error": str(exc)}
+                    if _bal(str(exc)):
+                        sliced = True
+                        log.warning("SELL slice — ikke nok balance, prøver mindre sz")
+                        continue
+                    break
+                log.info("LIVE SELL try @ %s sz=%s %s", attempt, sz, signed)
+                filled, data = _order_filled(signed)
+                last_signed = signed
+                err = str((data or {}).get("error") or (data or {}).get("errorMsg") or "")
+                if err and _bal(err):
+                    sliced = True
+                    log.warning("SELL slice — CLOB balance %s", err[:160])
+                    continue
+                if not filled:
+                    break
+                size = sz
+                order = {**order, "shares": sz}
                 attr = _fill_attr(order, {"cycle_id": order.get("cycle_id") or self.store.get_meta("cycle_id") or None})
                 self.store.add_fill(
                     condition_id=order.get("condition_id"),
@@ -885,6 +885,15 @@ class Executor:
                 else:
                     self.store.close_position(order["condition_id"], order.get("side"))
                 return {"status": "live_sell", "response": data or signed, "ticket": payload}
+            if sliced:
+                log.info("SELL stop after slice — ikke retry dust @ %s", last_attempt)
+                return {
+                    "status": "resting_sell",
+                    "response": data or last_signed,
+                    "ticket": payload,
+                    "attempt_px": last_attempt,
+                    "best_bid": book_bid,
+                }
         log.info("Salg umatchet etter FAK-retry — ingen fill")
         st = "unmatched_dust" if dust else "resting_sell"
         return {
