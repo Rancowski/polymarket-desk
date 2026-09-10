@@ -16,6 +16,10 @@ from agent.risk import (
     MAX_SPORTS,
     Risk,
     dust_cutoff,
+    is_fdv_pin,
+    is_in_play_tape,
+    is_map_bo,
+    is_match_market,
     is_sports,
     resolved_state,
     same_player_conflicts,
@@ -77,44 +81,27 @@ def _hours(m: dict) -> float | None:
 
 
 def _grok_drop_reason(m: dict) -> str | None:
-    """Why this name is not in the Grok-15. None = eligible."""
+    """Why this name is not in the Grok-15. None = eligible.
+
+    cs_live = sports in-play tape (map/BO/handicap or hours < 6). Not 'vs' and not <48h.
+    short_horizon = hours_left < 6 or 5/15-min crypto. 8–48h is NEAR, not short.
+    mid_extreme for the batch = mid < 0.12 or mid > 0.88.
+    """
     if m.get("_open_only"):
         return "short_horizon"
     q = (m.get("question") or "").lower()
-    blob = f"{q} {m.get('event_key') or ''} {m.get('category') or ''}".lower()
     if any(p in q for p in SKIP_QUESTION_PATTERNS):
         return "short_horizon"
     try:
         mid = float(m.get("yes_mid") or m.get("mid") or 0)
     except (TypeError, ValueError):
         mid = 0.0
-    if mid <= 0.15 or mid >= 0.85:
+    if mid <= 0 or mid < 0.12 or mid > 0.88:
         return "mid_extreme"
     h = _hours(m)
     if h is not None and h < 6:
         return "short_horizon"
-    if (" vs " in f" {q} " or "-vs-" in q) and h is not None and h < 48:
-        return "cs_live"
-    esport = any(x in blob for x in _ESPORT_TITLE)
-    tourney = any(x in q for x in _TOURNEY_WIN)
-    if esport and not (tourney and h is not None and h > 7 * 24):
-        return "cs_live"
-    if any(x in blob for x in _LIVE_TAPE):
-        return "cs_live"
-    win_on = re.search(r"win on (\d{4}-\d{2}-\d{2})", q)
-    if win_on:
-        try:
-            day = datetime.strptime(win_on.group(1), "%Y-%m-%d").date()
-            today = datetime.now(timezone.utc).date()
-            if day <= today + timedelta(days=1):
-                return "cs_live"
-        except ValueError:
-            pass
-    if "fdv" in q or "one day after launch" in q or "1 day after launch" in q:
-        return "short_horizon"
-    tennis_tour = any(x in blob for x in ("atp", "wta", "challenger"))
-    match_line = " vs " in f" {q} " or "win on" in q or "match winner" in q
-    if tennis_tour and match_line:
+    if is_in_play_tape(m) or is_map_bo(m):
         return "cs_live"
     return None
 
@@ -134,6 +121,62 @@ def _grok_prefer(m: dict) -> bool:
     if cat in {"geopolitics", "politics"} and h is not None and h > 7 * 24:
         return True
     return False
+
+
+def _vol24(m: dict) -> float:
+    try:
+        return float(m.get("volume_24h") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _mid_band(m: dict, lo: float = 0.18, hi: float = 0.82) -> bool:
+    try:
+        mid = float(m.get("yes_mid") or m.get("mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    return lo <= mid <= hi
+
+
+def _grok_bucket(m: dict) -> str | None:
+    """A = 8–48h named non-map, B = 48h–7d, C = preferred >7d. None = do not pad."""
+    if is_fdv_pin(m) or is_map_bo(m) or is_in_play_tape(m):
+        return None
+    if not _mid_band(m):
+        return None
+    h = _hours(m)
+    if h is not None and 8 <= h <= 48 and _vol24(m) > 0:
+        return "A"
+    if h is not None and 48 < h <= 7 * 24:
+        return "B"
+    if (h is None or h > 7 * 24) and _grok_prefer(m):
+        return "C"
+    return None
+
+
+def _build_grok_batch(eligible: list) -> tuple[list, dict[str, int]]:
+    """Fill GROK_BATCH_N from A then B then C. Do not pad with maps/FDV/mid leftovers."""
+    buckets: dict[str, list] = {"A": [], "B": [], "C": []}
+    for m in eligible:
+        b = _grok_bucket(m)
+        if b:
+            buckets[b].append(m)
+    for key in buckets:
+        buckets[key].sort(key=lambda row: -_vol24(row))
+    batch: list = []
+    seen: set[str] = set()
+    counts = {"A": 0, "B": 0, "C": 0}
+    for key in ("A", "B", "C"):
+        for m in buckets[key]:
+            cid = str(m.get("condition_id") or "")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            batch.append(m)
+            counts[key] += 1
+            if len(batch) >= GROK_BATCH_N:
+                return batch, counts
+    return batch, counts
 
 
 class Desk:
@@ -1095,31 +1138,18 @@ class Desk:
                     logged_drop += 1
                 continue
             eligible.append(m)
-        eligible.sort(
-            key=lambda m: (
-                0 if _grok_prefer(m) else 1,
-                -float(m.get("volume_24h") or m.get("liquidity") or 0),
-            )
-        )
         prepaid = self.store.xai_prepaid_usd()
         spent = self.store.api_spend(hours=None)
         remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
-        seen: set[str] = set()
-        batch: list = []
-
-        def _take(m: dict) -> None:
-            cid = m.get("condition_id")
-            if not cid or cid in seen:
-                return
-            seen.add(cid)
-            batch.append(m)
-
-        if remaining >= 0.15:
-            for m in eligible:
-                _take(m)
-                if len(batch) >= GROK_BATCH_N:
-                    break
-        batch = batch[:GROK_BATCH_N]
+        batch, bucket_n = _build_grok_batch(eligible) if remaining >= 0.15 else ([], {"A": 0, "B": 0, "C": 0})
+        log.info(
+            "Grok-batch %s navn A=%s B=%s C=%s (eligible=%s)",
+            len(batch),
+            bucket_n.get("A", 0),
+            bucket_n.get("B", 0),
+            bucket_n.get("C", 0),
+            len(eligible),
+        )
         if not batch:
             log.info("Ingen markeder passerte filter")
             self._finish_cycle(
@@ -1142,6 +1172,7 @@ class Desk:
             return {"ok": True, "scanned": 0}
 
         for m in batch:
+            m["_grok_bucket"] = _grok_bucket(m) or ""
             try:
                 mid = float(m.get("yes_mid") or m.get("mid") or 0)
                 if m.get("yes_token"):

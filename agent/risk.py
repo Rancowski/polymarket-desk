@@ -203,6 +203,56 @@ def is_match_market(row: dict) -> bool:
     return " vs " in b or " versus " in b or "-vs-" in b
 
 
+_MAP_BO = (
+    "map 1", "map 2", "map 3", "map 4", "map 5", "map 6", "map 7",
+    "1st map", "2nd map", "3rd map",
+    "bo1", "bo2", "bo3", "bo5", "bo7", "best of",
+    "handicap", "over/under", "o/u",
+    "live score", "in play", "in-play", "current score",
+)
+
+
+def is_fdv_pin(row: dict) -> bool:
+    q = str(row.get("question") or "").lower()
+    return "fdv" in q or "one day after launch" in q or "1 day after launch" in q or "fully diluted" in q
+
+
+def is_map_bo(row: dict) -> bool:
+    """Map/BO/handicap tape. Sports only — 'best of' on awards is not tape."""
+    if not is_sports(row):
+        return False
+    b = f" {_blob(row)} "
+    if any(x in b for x in _MAP_BO):
+        return True
+    if re.search(r"\bspread\b", b):
+        return True
+    if re.search(r" [+-]\d+\.5\b", b):
+        return True
+    return False
+
+
+def is_in_play_tape(row: dict) -> bool:
+    """cs_live only: sports AND (map/BO/handicap OR tape words OR hours_left < 6)."""
+    if not is_sports(row):
+        return False
+    if is_map_bo(row):
+        return True
+    h = hours_to_end(row)
+    if h is not None and h < 6:
+        return True
+    return False
+
+
+def near_named_window(row: dict) -> bool:
+    """8–48h named non-map, not in-play tape, not FDV."""
+    if is_in_play_tape(row) or is_map_bo(row) or is_fdv_pin(row):
+        return False
+    h = hours_to_end(row)
+    if h is None or h < 8 or h > 48:
+        return False
+    return True
+
+
 def _name_tokens(row: dict) -> set[str]:
     toks = re.findall(r"[a-z]{4,}", _blob(row))
     return {t for t in toks if t not in _NAME_DROP and t not in {h.replace(" ", "") for h in TOURNEY_HINTS}}
@@ -277,15 +327,15 @@ PRIMARY_HINTS = (
     "trump",
 )
 SPORTS_PX = (0.22, 0.82)
-DEPLOYED_MAX = 0.75
+DEPLOYED_MAX = 0.85
 EQUITY_SPORTS_HALT = 0.70
 MAX_SPORTS = 4
 HARD_NAME_PCT = 0.18
 EVENT_COST_PCT = 0.25
 CASH_SPORTS_MIN = 0.15
-SPORTS_PCT = (0.06, 0.08)
-CORE_PCT = (0.10, 0.14)
-HALF_CORE_PCT = (0.05, 0.07)
+SPORTS_PCT = (0.08, 0.12)  # scheduled match-winner 8–48h
+CORE_PCT = (0.12, 0.18)
+HALF_CORE_PCT = (0.08, 0.12)  # medium on >7d names only
 MIN_NOTIONAL_PCT = 0.05
 DEPTH_USE_PCT = 0.50
 CASH_USE_PCT = 0.90
@@ -571,6 +621,8 @@ class Risk:
             return None, "syntetisk bok"
         if spread > settings.max_spread:
             return None, f"spread {spread:.3f} > max"
+        if is_in_play_tape(market) or is_map_bo(market):
+            return None, "cs_live"
 
         yes_edge = p_yes - mid
         no_edge = (1.0 - p_yes) - (1.0 - mid)
@@ -597,13 +649,16 @@ class Risk:
                 spread = float(nb["spread"])
 
         fee_frac = expected_taker_fee_frac(cost, market["category"])
-        extra = 0.015 if is_sports(market) else 0.0
+        extra = 0.015 if is_in_play_tape(market) else 0.0
         edge_gross = p_hat - cost
         edge_net = edge_gross - fee_frac - settings.model_haircut - extra
         need = settings.min_net_edge if min_edge is None else min_edge
-        if is_sports(market):
+        near_win = near_named_window(market)
+        if near_win:
+            need = max(0.015, float(need) - 0.02)
+        elif is_map_bo(market):
             need = max(need, 0.022)
-        if not clean_kalshi:
+        if not clean_kalshi and not near_win:
             yask = float(book.get("best_ask") or cost)
             nb = market.get("no_book") or {}
             nask = float(nb.get("best_ask") or 0)
@@ -615,7 +670,9 @@ class Risk:
             return None, f"edge_net {edge_net:.3f} < {need}"
         sports = is_sports(market) or is_tournament(market)
         open_pos = self.store.positions("open")
-        if sports and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
+        if sports and not near_win and (cost <= SPORTS_PX[0] or cost >= SPORTS_PX[1]):
+            return None, "sports ekstrem-pris"
+        if sports and near_win and (cost < 0.18 or cost > 0.82):
             return None, "sports ekstrem-pris"
         event = market.get("event_key") or market["condition_id"]
         same_cid = [p for p in open_pos if p.get("condition_id") == cid]
@@ -649,10 +706,17 @@ class Risk:
         size_base = sizing_base(deposited, equity)
         longshot = cost <= 0.28
         cheap_sports = (sports or is_tournament(market)) and cost < 0.40
-        live_sport = sports and is_match_market(market)
-        if live_sport and conf == "medium":
-            return None, "cs_live"
-        if sports or longshot or cheap_sports:
+        sched_match = (
+            near_win
+            and is_sports(market)
+            and is_match_market(market)
+            and not is_map_bo(market)
+        )
+        if sched_match:
+            _floor_pct, cap_pct = SPORTS_PCT
+        elif near_win:
+            _floor_pct, cap_pct = CORE_PCT
+        elif sports or ((longshot or cheap_sports) and sports):
             _floor_pct, cap_pct = SPORTS_PCT
         elif conf == "medium":
             _floor_pct, cap_pct = HALF_CORE_PCT

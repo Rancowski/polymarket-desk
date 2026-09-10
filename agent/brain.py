@@ -11,31 +11,38 @@ from agent.config import settings
 
 log = logging.getLogger("brain")
 
-SYSTEM = """Du er sannsynlighetsanalytiker for binære Polymarket-markeder.
-Du får KUN gratis tape: Polymarket-bok (mid, spread, dybde, volum, last trade,
-YES+NO-sum, søsken, tid til resolusjon, 1d-historikk) og ev. CoinGecko-spot.
-Kalshi er et annet venues pris på SAMME kontrakt. Gap ≥ 4 ¢: trekk p_yes hardt MOT Kalshi.
-Ingen web. Ingen X. Ingen live-søk.
+SYSTEM = """You are picking trades on binary Polymarket markets, not writing a caution memo.
+You only get free tape: Polymarket book (mid, spread, depth, volume, last trade,
+YES+NO sum, siblings, time to resolution, 1d history) and optional CoinGecko spot.
+Kalshi is another venue on the SAME contract. Gap ≥ 4¢: pull p_yes hard toward Kalshi.
+No web. No X. No live search.
 
-Jakte edge i:
-- Kalshi vs Polymarket (samme hendelse, ulik pris)
-- Søskenmarkeder som ikke summerer til ~1
-- Resolusjonstekst vs mid
-- Crypto vs CoinGecko-spot
-Ikke kall live sport/esport «avgjort» bare fordi mid flyttet. skip=true hvis kampen
-ser ferdig ut (mid > 0.90 eller < 0.10 uten Kalshi-støtte).
-Ikke finn på nyheter. Mangler info: hold deg nær mid.
+For each name: YES or NO or SKIP.
+SKIP only if you have no read or the market is noise.
+confidence=low = you truly do not know. It is not the default.
+confidence=medium = a real directional view with some uncertainty — this MUST be allowed to trade.
+confidence=high = clean read.
+Prefer the 8–48h names in the batch when two views are similar.
+Return at least one non-SKIP when the batch contains ≥3 names in mid 0.22–0.78
+with hours_left 8–48h, unless every one is in-play tape.
 
-confidence=high kun ved Kalshi-gap, komplementbrudd eller klar mikrostruktur.
-skip=true hvis uleselig eller allerede avgjort.
-Aldri 0 eller 1. p i [0.02, 0.98].
-Svar KUN gyldig JSON-array.
+Hunt edge in:
+- Kalshi vs Polymarket (same event, different price)
+- Sibling markets that do not sum to ~1
+- Resolution text vs mid
+- Crypto vs CoinGecko spot
+Do not call live sport/esport "resolved" just because mid moved. skip=true only if the
+match looks finished (mid > 0.90 or < 0.10 without Kalshi support).
+Do not invent news. If you lack info, stay near mid with confidence=medium, not low.
+
+Never 0 or 1. p in [0.02, 0.98].
+Reply with ONLY a valid JSON array.
 
 {
   "condition_id": "...",
   "p_yes": 0.0-1.0,
   "confidence": "low"|"medium"|"high",
-  "thesis": "en setning",
+  "thesis": "one sentence",
   "skip": false,
   "skip_reason": ""
 }
@@ -112,10 +119,23 @@ class Brain:
                     "spot": m.get("spot") or {},
                     "kalshi": m.get("kalshi") or {},
                     "open_position": bool(m.get("_open_only")),
+                    "bucket": m.get("_grok_bucket") or "",
                 }
             )
+        n_near = 0
+        for m in markets:
+            try:
+                h = float(m.get("hours_left")) if m.get("hours_left") not in (None, "") else None
+                mid = float(m.get("yes_mid") or m.get("mid") or 0)
+            except (TypeError, ValueError):
+                h, mid = None, 0.0
+            if h is not None and 8 <= h <= 48 and 0.22 <= mid <= 0.78:
+                n_near += 1
         user = (
-            "Estimer P(YES) fra Polymarket-feltene. Marker intern edge i thesis.\n"
+            "Pick trades from these Polymarket fields. Mark the edge in thesis.\n"
+            f"Names in 8–48h with mid 0.22–0.78: {n_near}. "
+            "If that count is ≥3, return at least one non-SKIP with confidence medium or high "
+            "unless every one is in-play tape. confidence=low is not the default.\n"
             + json.dumps(payload_markets, ensure_ascii=False)
         )
         models = [settings.grok_model, "grok-4.5", "grok-4"]
@@ -215,10 +235,17 @@ class Brain:
             except (TypeError, ValueError):
                 continue
             p = min(0.98, max(0.02, p))
+            raw_conf = row.get("confidence")
+            if raw_conf is None or str(raw_conf).strip() == "":
+                conf = "medium"
+            else:
+                conf = str(raw_conf).strip().lower()
+            if conf not in {"low", "medium", "high"}:
+                conf = "medium"
             out[cid] = {
                 "p_yes": p,
-                "confidence": str(row.get("confidence") or "medium").lower(),
                 "thesis": str(row.get("thesis") or ""),
+                "confidence": conf,
                 "skip": bool(row.get("skip")),
                 "skip_reason": str(row.get("skip_reason") or ""),
             }
