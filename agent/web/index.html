@@ -154,6 +154,7 @@
       let cls = "b-ukjent";
       if (s === "grok") cls = "b-grok";
       else if (s === "kalshi") cls = "b-kalshi";
+      else if (s === "stats") cls = "b-kalshi";
       else if (s === "complement") cls = "b-complement";
       else if (s === "tape") cls = "b-tape";
       else if (s === "redeem") cls = "b-redeem";
@@ -277,7 +278,8 @@
     function cycleLine(s) {
       const c = s.last_cycle;
       if (!c) return "Venter på første syklus.";
-      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · kalshi ${c.kalshi || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0} · neste ${countdown(s)}`;
+      const src = c.by_source || {};
+      return `skannet ${c.scanned || 0} · grok ${c.grok || c.estimated || 0} · A ${c.bucket_A_count || 0} · stats ${src.stats || c.stats || 0} · kalshi ${src.kalshi || 0} · complement ${src.complement || c.complement || 0} · grok-fill ${src.grok || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0} · neste ${countdown(s)}`;
     }
     function rejects(s) {
       const el = $("rejects");
@@ -313,7 +315,7 @@
         ).join("");
       }
       const src = a.by_source || {};
-      const names = ["grok", "kalshi", "complement", "exits"];
+      const names = ["stats", "kalshi", "grok", "complement", "exits"];
       const srcEl = $("attrSrc");
       if (srcEl) {
         srcEl.innerHTML = names.map((k) => {
@@ -345,7 +347,7 @@
           ["10 seter", "Maks 10 åpne. Ved 10: kun exits og hedge (YES+NO samme marked). Samme kamp/event_key maks 25 % av innskutt samlet. Inntil 85 % av innskutt i markedet."],
           ["Størrelse", "Alt i prosent av innskutt (ellers egenkapital). Gulv 5 %. Planlagt kampvinner 8–48t 8–12 %. Kjerne 12–18 %. Medium >7d 8–12 %. Hard tak 18 % ett navn. Maks 50 % av ask-dybde og 90 % av kontant. Tynn bok hoppes. Aldri average down. Aldri stub under 5 %."],
           ["Sports-exits", "Kun live bud. Stopp: bud ≤ avg×0,85 eller bud ≤ 0,03. Ta: +18 % vs avg, deretter trail 8 % under HWM (0,72 → selg ≤ 0,662). FAK på bud, retry −1/−2 tick. Umachet to ganger → reject+bid. Død bok mark ≤ 0,01 eller verdi < 0,1 % av innskutt → closed_dust (ikke Fed)."],
-          ["Kjerne-exits", "Stopp −18 % vs avg. Ta bud ≥ 0,92 eller +22 % vs avg. Rent Kalshi-par og Kalshi ≤ PM − 7 ¢ vs kost → selg nå (Grok overstyrer ikke). FAK på live bud + 2 retry."],
+          ["Kjerne-exits", "Stopp −18 % vs avg. Ta bud ≥ 0,92 eller +22 % vs avg. Rent Kalshi-par og Kalshi ≤ PM − 7 ¢ vs kost → selg nå. Grok p_hat under kost selger ikke (grok-exit-blocked). FAK på live bud, tick ≥ 0,01."],
           ["Kalshi", "Egen spor. Fed H25/H26/H0 pluss høy-volum politikk og navngitte crypto-nivå (ikke 5-min). Samme dato + samme utfall matcher. Ingen par = vekt 0, blokkerer ikke kjøp. Logg ticker og begge mids, gap mot åpen side."],
           ["Sikring", "Ingen daglig handelsstopp. Ingen 85 %-halt. Ingen sports-kjøpsstopp. HALT-fil stopper alt. Exits og redeem kjører hver syklus før Grok."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");

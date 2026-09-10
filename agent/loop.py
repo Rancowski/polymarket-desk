@@ -130,7 +130,7 @@ def _vol24(m: dict) -> float:
         return 0.0
 
 
-def _mid_band(m: dict, lo: float = 0.18, hi: float = 0.82) -> bool:
+def _mid_band(m: dict, lo: float = 0.25, hi: float = 0.85) -> bool:
     try:
         mid = float(m.get("yes_mid") or m.get("mid") or 0)
     except (TypeError, ValueError):
@@ -139,23 +139,37 @@ def _mid_band(m: dict, lo: float = 0.18, hi: float = 0.82) -> bool:
 
 
 def _grok_bucket(m: dict) -> str | None:
-    """A = 8–48h named non-map, B = 48h–7d, C = preferred >7d. None = do not pad."""
+    """A = 8–48h named non-map (incl. 0.58–0.85 favorites), B = 48h–7d, C = preferred >7d."""
     if is_fdv_pin(m) or is_map_bo(m) or is_in_play_tape(m):
         return None
-    if not _mid_band(m):
-        return None
     h = _hours(m)
-    if h is not None and 8 <= h <= 48 and _vol24(m) > 0:
+    if h is not None and 8 <= h <= 48 and _vol24(m) > 0 and _mid_band(m, 0.25, 0.85):
         return "A"
-    if h is not None and 48 < h <= 7 * 24:
+    if h is not None and 48 < h <= 7 * 24 and _mid_band(m, 0.25, 0.82):
         return "B"
-    if (h is None or h > 7 * 24) and _grok_prefer(m):
+    if (h is None or h > 7 * 24) and _grok_prefer(m) and _mid_band(m, 0.25, 0.82):
         return "C"
     return None
 
 
+def _is_tennis_row(m: dict) -> bool:
+    blob = f"{m.get('question') or ''} {m.get('event_key') or ''} {m.get('category') or ''}".lower()
+    return any(x in blob for x in ("challenger", "exhibition", "tennis", " atp", "atp ", "wta"))
+
+
+def _is_tourney_longshot(m: dict) -> bool:
+    blob = f"{m.get('question') or ''} {m.get('event_key') or ''}".lower()
+    try:
+        mid = float(m.get("yes_mid") or m.get("mid") or 0)
+    except (TypeError, ValueError):
+        mid = 0.0
+    if mid >= 0.40:
+        return False
+    return any(x in blob for x in ("win the", "to win", "winner of", "lift the", "champion"))
+
+
 def _build_grok_batch(eligible: list) -> tuple[list, dict[str, int]]:
-    """Fill GROK_BATCH_N from A then B then C. Do not pad with maps/FDV/mid leftovers."""
+    """Fill GROK_BATCH_N from A then B then C. Cap tennis/challenger and tournament longshots at 2."""
     buckets: dict[str, list] = {"A": [], "B": [], "C": []}
     for m in eligible:
         b = _grok_bucket(m)
@@ -166,11 +180,21 @@ def _build_grok_batch(eligible: list) -> tuple[list, dict[str, int]]:
     batch: list = []
     seen: set[str] = set()
     counts = {"A": 0, "B": 0, "C": 0}
+    tennis_n = 0
+    open_n = 0
     for key in ("A", "B", "C"):
         for m in buckets[key]:
             cid = str(m.get("condition_id") or "")
             if not cid or cid in seen:
                 continue
+            if _is_tennis_row(m):
+                if tennis_n >= 2:
+                    continue
+                tennis_n += 1
+            if _is_tourney_longshot(m):
+                if open_n >= 2:
+                    continue
+                open_n += 1
             seen.add(cid)
             batch.append(m)
             counts[key] += 1
@@ -1053,6 +1077,7 @@ class Desk:
         kalshi_n = len(kalshi_log)
         arb_tickets = self.arb.scan(markets, bankroll, equity=equity)
         arb_n = 0
+        src_fill = {"stats": 0, "kalshi": 0, "complement": 0, "grok": 0}
         failed_events: set[str] = set()
         pending_hedge = None
         for ticket in arb_tickets:
@@ -1075,6 +1100,9 @@ class Desk:
                 if result.get("status") in {"live", "paper"}:
                     bankroll = max(0.0, bankroll - ticket.size_usd)
                     self._bought += 1
+                    src = str(ticket.source or "")
+                    if src in src_fill:
+                        src_fill[src] += 1
                 if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
                     pending_hedge = ticket if pending_hedge is None else None
                 else:
@@ -1142,14 +1170,22 @@ class Desk:
         spent = self.store.api_spend(hours=None)
         remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
         batch, bucket_n = _build_grok_batch(eligible) if remaining >= 0.15 else ([], {"A": 0, "B": 0, "C": 0})
+        a_n = int(bucket_n.get("A", 0) or 0)
         log.info(
             "Grok-batch %s navn A=%s B=%s C=%s (eligible=%s)",
             len(batch),
-            bucket_n.get("A", 0),
+            a_n,
             bucket_n.get("B", 0),
             bucket_n.get("C", 0),
             len(eligible),
         )
+        try:
+            prev_a = int(float(self.store.get_meta("bucket_A_count", "0") or 0))
+        except (TypeError, ValueError):
+            prev_a = 0
+        if a_n == 0 and prev_a == 0 and self._cycle_i > 1:
+            log.warning("Grok-batch A=0 two cycles — 8–48h 0.58–0.85 favorites still dropped")
+        self.store.set_meta("bucket_A_count", str(a_n))
         if not batch:
             log.info("Ingen markeder passerte filter")
             self._finish_cycle(
@@ -1165,6 +1201,10 @@ class Desk:
                 arb=arb_n,
                 kalshi=kalshi_n,
                 kalshi_log=kalshi_log,
+                stats=src_fill.get("stats", 0),
+                complement=src_fill.get("complement", 0),
+                by_source=src_fill,
+                bucket_A_count=a_n,
                 bankroll=bankroll,
                 equity=equity,
                 xai_usd=0.0,
@@ -1259,6 +1299,10 @@ class Desk:
                 xai_usd=round(xai_cycle, 4),
                 bankroll=bankroll,
                 equity=equity,
+                stats=src_fill.get("stats", 0),
+                complement=src_fill.get("complement", 0),
+                by_source=src_fill,
+                bucket_A_count=a_n,
                 reason=str(exc),
             )
             return {"ok": False, "reason": str(exc), **self.last_cycle}
@@ -1278,15 +1322,43 @@ class Desk:
             if m.get("_open_only"):
                 continue
             est = estimates.get(m["condition_id"])
+            try:
+                mid_log = float(m.get("yes_mid") or m.get("mid") or 0.5)
+            except (TypeError, ValueError):
+                mid_log = 0.5
             if not est:
-                why_est = str(getattr(self.brain, "last_skip", "") or "parse")
+                est = {
+                    "p_yes": mid_log,
+                    "confidence": "low",
+                    "skip": True,
+                    "skip_reason": "no read",
+                    "thesis": "",
+                }
+            if est.get("skip") or str(est.get("skip_reason") or "").lower() in {"no read", "no_read"}:
+                if est.get("p_yes") in (None, ""):
+                    est = {**est, "p_yes": mid_log}
                 self.store.log_decision(
                     condition_id=m["condition_id"],
                     question=m["question"],
+                    mid=mid_log,
+                    p_hat=est.get("p_yes"),
                     action="skip",
-                    reason=f"ingen estimat ({why_est})",
+                    reason="grok-skip (no read) — andre spor kjører",
+                    payload=est,
                 )
+                continue
+            if str(est.get("confidence") or "").lower() == "low":
                 rejected += 1
+                self._bump_reject("confidence=low")
+                self.store.log_decision(
+                    condition_id=m["condition_id"],
+                    question=m["question"],
+                    mid=mid_log,
+                    p_hat=est.get("p_yes"),
+                    action="reject",
+                    reason="confidence=low",
+                    payload=est,
+                )
                 continue
             try:
                 book = m.get("book") or self.scout.book(
@@ -1334,6 +1406,7 @@ class Desk:
                     equity = bankroll + locked + ticket.size_usd
                     locked += ticket.size_usd
                     self._bought += 1
+                    src_fill["grok"] += 1
             except Exception as exc:
                 log.exception("Ordre feilet")
                 self.last_error = str(exc)
@@ -1348,11 +1421,19 @@ class Desk:
             bankroll, equity, _ = self._refresh_portfolio()
         except Exception:
             pass
-        log.info("Syklus ferdig. Grok-tickets: %s arb: %s kalshi: %s exits: %s", accepted, arb_n, kalshi_n, exits)
+        log.info(
+            "Syklus ferdig. stats=%s kalshi=%s grok=%s complement=%s kjøpt=%s A=%s",
+            src_fill.get("stats", 0),
+            src_fill.get("kalshi", 0),
+            src_fill.get("grok", 0),
+            src_fill.get("complement", 0),
+            self._bought,
+            a_n,
+        )
         self._finish_cycle(
             scanned=len(markets),
             estimated=len(estimates),
-            grok=len(estimates),
+            grok=len(batch),
             accepted=accepted,
             arb=arb_n,
             kalshi=kalshi_n,
@@ -1365,6 +1446,10 @@ class Desk:
             xai_usd=round(xai_cycle, 4),
             bankroll=bankroll,
             equity=equity,
+            stats=src_fill.get("stats", 0),
+            complement=src_fill.get("complement", 0),
+            by_source=src_fill,
+            bucket_A_count=a_n,
         )
         return {"ok": True, **self.last_cycle}
 

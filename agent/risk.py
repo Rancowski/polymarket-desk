@@ -994,10 +994,9 @@ class Risk:
                 p_hat = p_yes if side == "YES" else 1.0 - p_yes
                 faded_to_mid = abs(p_hat - mid) < 0.02 and abs(mid - avg) < 0.03
                 if p_hat + 0.05 <= avg and not faded_to_mid:
-                    return self._exit_ticket(
-                        pos, book, shares, live, f"p_hat {p_hat:.2f} ≥5c under kost {avg:.2f}",
-                        kind="stop", best_bid=live,
-                    ), "ok"
+                    qn = str(pos.get("question") or "")[:60]
+                    log.info("grok-exit-blocked %s p_hat=%.2f avg=%.2f", qn, p_hat, avg)
+                    return None, f"grok-exit-blocked p_hat {p_hat:.2f} vs kost {avg:.2f}"
         return None, f"hold bid {live:.3f} pnl {pnl_pct:.1%}"
 
     def _exit_ticket(

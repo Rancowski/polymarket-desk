@@ -18,13 +18,16 @@ Kalshi is another venue on the SAME contract. Gap ≥ 4¢: pull p_yes hard towar
 No web. No X. No live search.
 
 For each name: YES or NO or SKIP.
-SKIP only if you have no read or the market is noise.
+SKIP only if you have no read or the market is noise (Tulln Challenger, exhibition, random tweet buckets).
+SKIP is not a veto of other desk tracks — it only means you have no Grok ticket.
 confidence=low = you truly do not know. It is not the default.
 confidence=medium = a real directional view with some uncertainty — this MUST be allowed to trade.
 confidence=high = clean read.
 Prefer the 8–48h names in the batch when two views are similar.
 Return at least one non-SKIP when the batch contains ≥3 names in mid 0.22–0.78
 with hours_left 8–48h, unless every one is in-play tape.
+Public names MUST return a numeric p_yes and confidence medium|high|low — never "no read":
+Fed/FOMC, US House/Senate/President, named BTC/ETH daily close with more than 6h left.
 
 Hunt edge in:
 - Kalshi vs Polymarket (same event, different price)
@@ -59,6 +62,22 @@ def _extract_json(text: str) -> Any:
     if start >= 0 and end > start:
         return json.loads(text[start : end + 1])
     return json.loads(text)
+
+
+def _is_public_name(m: dict) -> bool:
+    t = f"{m.get('question') or ''} {m.get('event_key') or ''}".lower()
+    if any(x in t for x in ("fed", "fomc", "federal reserve")):
+        return True
+    if "brazil" not in t and re.search(r"\b(house|senate|president|presidential)\b", t):
+        return True
+    try:
+        h = float(m.get("hours_left")) if m.get("hours_left") not in (None, "") else None
+    except (TypeError, ValueError):
+        h = None
+    crypto = "bitcoin" in t or re.search(r"\bbtc\b", t) or "ethereum" in t or re.search(r"\beth\b", t)
+    if crypto and (h is None or h > 6):
+        return True
+    return False
 
 
 def _response_text(data: dict) -> str:
@@ -230,11 +249,18 @@ class Brain:
                 cid = by_q.get(q) or (list(known.keys())[i] if i < len(known) else "")
             if not cid:
                 continue
+            mkt = known.get(cid) or {}
+            try:
+                mid = float(mkt.get("yes_mid") or mkt.get("mid") or 0.5)
+            except (TypeError, ValueError):
+                mid = 0.5
+            has_p = True
             try:
                 p = float(row.get("p_yes"))
             except (TypeError, ValueError):
-                continue
-            p = min(0.98, max(0.02, p))
+                p = mid
+                has_p = False
+            p = min(0.98, max(0.02, p if 0 < p < 1 else mid))
             raw_conf = row.get("confidence")
             if raw_conf is None or str(raw_conf).strip() == "":
                 conf = "medium"
@@ -242,12 +268,23 @@ class Brain:
                 conf = str(raw_conf).strip().lower()
             if conf not in {"low", "medium", "high"}:
                 conf = "medium"
+            skip = bool(row.get("skip"))
+            skip_reason = str(row.get("skip_reason") or "")
+            if not has_p:
+                skip = True
+                skip_reason = skip_reason or "no read"
+            public = _is_public_name(mkt)
+            if public and (skip or not has_p):
+                skip = False
+                skip_reason = ""
+                if not has_p:
+                    p = mid
             out[cid] = {
                 "p_yes": p,
                 "thesis": str(row.get("thesis") or ""),
                 "confidence": conf,
-                "skip": bool(row.get("skip")),
-                "skip_reason": str(row.get("skip_reason") or ""),
+                "skip": skip,
+                "skip_reason": skip_reason,
             }
         log.info("Brain: estimat for %s/%s markeder (ingen live-søk)", len(out), len(markets))
         return out

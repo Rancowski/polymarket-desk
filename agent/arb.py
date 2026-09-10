@@ -5,14 +5,18 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from agent.config import settings
+from agent.config import SKIP_QUESTION_PATTERNS, settings
 from agent.risk import (
     CORE_PCT,
     DEPLOYED_MAX,
+    EVENT_COST_PCT,
     HARD_NAME_PCT,
     MAX_SPORTS,
     SPORTS_PCT,
     Ticket,
+    hours_to_end,
+    is_in_play_tape,
+    is_map_bo,
     is_near_resolution,
     is_sports,
     parse_end,
@@ -160,7 +164,15 @@ class Arb:
             tickets.extend(self._locked(markets, bankroll, open_ids | taken, sports_n, sports_halt))
             taken = {t.condition_id for t in tickets}
             tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken, sports_n, sports_halt))
-        log.info("Arb: %s ben (complement/låst/kalshi-bekreftelse)", len(tickets))
+            taken = {t.condition_id for t in tickets}
+            tickets.extend(self._favorites(markets, bankroll, open_ids | taken, sports_n, sports_halt))
+        log.info(
+            "Arb: %s ben (complement=%s kalshi=%s stats=%s)",
+            len(tickets),
+            sum(1 for t in tickets if t.source == "complement"),
+            sum(1 for t in tickets if t.source == "kalshi"),
+            sum(1 for t in tickets if t.source == "stats"),
+        )
         return tickets
 
     def _skip_sports(
@@ -402,5 +414,109 @@ class Arb:
             open_ids.add(cid)
             open_qs.append(q)
             if len(out) >= 3:
+                break
+        return out
+
+    def _favorites(
+        self,
+        markets: list[dict],
+        bankroll: float,
+        open_ids: set[str],
+        sports_n: int = 0,
+        sports_halt: bool = False,
+    ) -> list[Ticket]:
+        """8–48h liquid favorite. source=stats. Grok cannot block."""
+        out: list[Ticket] = []
+        size_base = self._size_base(bankroll)
+        open_pos = list(self.store.positions("open"))
+        open_qs = [str(p.get("question") or "") for p in open_pos]
+        event_cost: dict[str, float] = {}
+        for p in open_pos:
+            ek = str(p.get("event_key") or p.get("condition_id") or "")
+            event_cost[ek] = event_cost.get(ek, 0.0) + float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+        for m in markets:
+            cid = m.get("condition_id")
+            if not cid or cid in open_ids:
+                continue
+            q = str(m.get("question") or "").lower()
+            if any(p in q for p in SKIP_QUESTION_PATTERNS):
+                continue
+            if is_in_play_tape(m) or is_map_bo(m):
+                continue
+            h = hours_to_end(m)
+            if h is None or h < 8 or h > 48:
+                continue
+            try:
+                yes_mid = float(m.get("yes_mid") or m.get("mid") or 0)
+            except (TypeError, ValueError):
+                yes_mid = 0.0
+            if yes_mid >= 0.58:
+                side, traded = "YES", yes_mid
+            else:
+                side, traded = "NO", (1.0 - yes_mid if 0 < yes_mid < 1 else 0.0)
+            if traded < 0.58 or traded > 0.82:
+                continue
+            try:
+                vol = float(m.get("volume_24h") or 0)
+            except (TypeError, ValueError):
+                vol = 0.0
+            if vol <= 0:
+                continue
+            if self._skip_sports(m, sports_n, sports_halt, out):
+                continue
+            from agent.kalshi import fed_seat_taken
+
+            fed_why = fed_seat_taken(open_qs, str(m.get("question") or ""))
+            if fed_why:
+                continue
+            book = self._book(m, "yes" if side == "YES" else "no")
+            if not book or book.get("synthetic"):
+                continue
+            spread = float(book.get("spread") or 0)
+            if spread > settings.max_spread:
+                continue
+            cost = float(book.get("best_ask") or 0)
+            if cost < 0.58 or cost > 0.82:
+                continue
+            token = m.get("yes_token") if side == "YES" else m.get("no_token")
+            if not token:
+                continue
+            event = str(m.get("event_key") or cid)
+            room_evt = max(0.0, EVENT_COST_PCT * size_base - event_cost.get(event, 0.0))
+            pct = SPORTS_PCT[1] if is_sports(m) else CORE_PCT[1]
+            ask_sz = float(book.get("ask_size") or 0)
+            open_cost = sum(float(p["shares"]) * float(p["avg_cost"]) for p in self.store.positions("open"))
+            powder = max(0.0, DEPLOYED_MAX * size_base - open_cost)
+            usd, shares, why = size_ticket(
+                target_pct=pct,
+                size_base=size_base,
+                cost=cost,
+                ask_size=ask_sz,
+                cash=bankroll,
+                name_room=min(HARD_NAME_PCT * size_base, room_evt),
+                deployed_room=powder,
+            )
+            if why:
+                log.info("stats skip %s %s", (m.get("question") or "")[:48], why)
+                continue
+            thesis = f"favorite_near {side} mid={traded:.2f} {h:.0f}h"
+            out.append(
+                _ticket(
+                    m,
+                    side,
+                    token,
+                    book,
+                    cost,
+                    shares,
+                    thesis,
+                    source="stats",
+                    source_detail=thesis,
+                    pm_mid=yes_mid,
+                )
+            )
+            open_ids.add(cid)
+            open_qs.append(str(m.get("question") or ""))
+            event_cost[event] = event_cost.get(event, 0.0) + usd
+            if len(out) >= 4:
                 break
         return out
