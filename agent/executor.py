@@ -14,6 +14,16 @@ from agent.store import Store, kalshi_fields_ok, normalize_side, normalize_sourc
 
 log = logging.getLogger("exec")
 
+_DATA_API = "https://data-api.polymarket.com"
+_DATA_UA = {"User-Agent": "polymarket-desk/1.0"}
+# pUSD (Available to trade). data-api /value is positions MTM only.
+_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+_POLYGON_RPCS = (
+    "https://polygon-bor.publicnode.com",
+    "https://polygon-rpc.com",
+    "https://1rpc.io/matic",
+)
+
 
 def _num(value: Any) -> float | None:
     if value is None or value is False or value == "":
@@ -343,9 +353,9 @@ def _order_filled(signed: Any) -> tuple[bool, dict]:
 def _infer_category(p: dict) -> str:
     row = {
         "question": p.get("title") or p.get("question") or "",
-        "event_key": p.get("eventSlug") or p.get("event_key") or "",
+        "event_key": p.get("eventSlug") or p.get("event_slug") or p.get("event_key") or "",
         "category": p.get("category") or "",
-        "eventSlug": p.get("eventSlug") or "",
+        "eventSlug": p.get("eventSlug") or p.get("event_slug") or "",
         "slug": p.get("slug") or "",
     }
     if is_sports(row):
@@ -361,6 +371,8 @@ def _side_and_label(p: dict) -> tuple[str, str, str]:
     outcome = str(p.get("outcome") or "").strip()
     title = str(p.get("title") or "")
     idx = p.get("outcomeIndex")
+    if idx is None:
+        idx = p.get("outcome_index")
     ou = outcome.upper()
     if ou in {"YES", "Y", "1"}:
         return "YES", title[:160], "YES"
@@ -399,6 +411,7 @@ class Executor:
         self.store = store
         self._client = None
         self._sdk = "v1"
+        self._pm_snap: tuple[float, dict] | None = None
 
     def _attach_creds(self, client: Any, v2: bool) -> None:
         if settings.poly_api_key and settings.poly_api_secret:
@@ -487,40 +500,178 @@ class Executor:
         raise RuntimeError("Kunne ikke lage CLOB-klient")
 
     def bankroll(self) -> float:
-        if settings.dry_run or not settings.private_key:
-            return settings.paper_bankroll_usd
-        parsed = 0.0
-        try:
-            client = self._live_client()
-            if hasattr(client, "get_balance_allowance"):
-                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        """Available-to-trade from the data-api user snapshot. Never last_cash / deposited-cost."""
+        snap = self.fetch_pm_snapshot()
+        av = snap.get("available")
+        if av is not None:
+            return float(av)
+        return 0.0
 
-                try:
-                    params = BalanceAllowanceParams(
-                        asset_type=AssetType.COLLATERAL,
-                        signature_type=settings.signature_type,
-                    )
-                except TypeError:
-                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                bal = client.get_balance_allowance(params)
-                log.info("Balanse raw=%s", bal)
-                parsed = _parse_balance(bal)
-        except Exception as exc:
-            log.warning("Live balanse feilet: %s", exc)
-        if parsed > 0:
-            log.info("Live bankroll=%.2f pUSD", parsed)
-            return parsed
-        snap = self.store.float_meta("last_cash")
-        if snap is not None and snap > 0:
-            log.warning("CLOB sa 0 pUSD — bruker siste snapshot cash=%.2f", snap)
-            return snap
-        log.warning(
-            "CLOB sa 0 pUSD (du har sannsynligvis feil POLYMARKET_FUNDER — "
-            "bruk innskuddsadressen under Cash/Deposit, ikke Profile «API use only»). "
-            "Bruker PAPER_BANKROLL_USD=%.2f",
-            settings.paper_bankroll_usd,
+    def _data_api_json(self, path: str, params: dict, timeout: float = 12) -> Any:
+        r = requests.get(
+            f"{_DATA_API}{path}",
+            headers=_DATA_UA,
+            params=params,
+            timeout=timeout,
         )
-        return settings.paper_bankroll_usd if settings.dry_run else 0.0
+        if not r.ok:
+            return None
+        return r.json()
+
+    def _extract_usd(self, data: Any) -> float | None:
+        if data is None:
+            return None
+        if isinstance(data, list):
+            if not data:
+                return None
+            return self._extract_usd(data[0])
+        if not isinstance(data, dict):
+            try:
+                return float(data)
+            except (TypeError, ValueError):
+                return None
+        inner = data.get("data")
+        if isinstance(inner, (dict, list)) and "value" not in data:
+            got = self._extract_usd(inner)
+            if got is not None:
+                return got
+        for key in ("value", "portfolio", "portfolio_value", "available", "cash", "balance"):
+            raw = data.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _data_api_value(self, funder: str, *, v2: bool) -> float | None:
+        path = "/v2/value" if v2 else "/value"
+        try:
+            data = self._data_api_json(path, {"user": funder}, timeout=8)
+        except Exception as exc:
+            log.warning("data-api %s: %s", path, exc)
+            return None
+        return self._extract_usd(data)
+
+    def _funder_available_usdc(self, funder: str) -> float | None:
+        """pUSD of the data-api user = Available to trade. Never CLOB last_cash."""
+        addr = str(funder or "").strip().lower().removeprefix("0x")
+        if len(addr) != 40:
+            return None
+        data = "0x70a08231" + addr.rjust(64, "0")
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{"to": _PUSD, "data": data}, "latest"],
+        }
+        for rpc in _POLYGON_RPCS:
+            try:
+                r = requests.post(rpc, json=payload, headers=_DATA_UA, timeout=8)
+                if not r.ok:
+                    continue
+                result = (r.json() or {}).get("result")
+                if not result or result in {"0x", "0x0"}:
+                    return 0.0
+                usd = int(result, 16) / 1e6
+                log.info("available pUSD=%.4f funder=%s", usd, funder[:12])
+                return usd
+            except Exception as exc:
+                log.warning("pUSD rpc %s: %s", rpc, exc)
+        return None
+
+    def _norm_position(self, p: dict) -> dict | None:
+        try:
+            size = float(p.get("size") or p.get("shares") or p.get("current_size") or 0)
+        except (TypeError, ValueError):
+            return None
+        if size <= 0:
+            return None
+        cid = str(p.get("conditionId") or p.get("condition_id") or "").strip()
+        if not cid:
+            return None
+        status = str(p.get("status") or "").upper()
+        if status in {"CLOSED", "REDEEMABLE_LOST"}:
+            return None
+        side, label, outcome = _side_and_label(p)
+        try:
+            avg = float(p.get("avgPrice") or p.get("avg_price") or 0)
+            cur = float(
+                p.get("curPrice")
+                or p.get("currPrice")
+                or p.get("current_price")
+                or 0
+            )
+        except (TypeError, ValueError):
+            return None
+        if cur <= 0.01:
+            return None
+        api_val = p.get("currentValue")
+        if api_val in (None, ""):
+            api_val = p.get("current_value")
+        try:
+            mtm = float(api_val) if api_val not in (None, "") else (size * cur if cur else 0)
+        except (TypeError, ValueError):
+            mtm = size * cur if cur else 0
+        return {
+            "condition_id": cid,
+            "question": label,
+            "outcome": outcome,
+            "category": _infer_category(p),
+            "event_key": str(p.get("eventSlug") or p.get("event_slug") or p.get("conditionId") or cid),
+            "side": side,
+            "token_id": str(p.get("asset") or p.get("token_id") or p.get("assetId") or p.get("asset_id") or ""),
+            "shares": size,
+            "avg_cost": avg,
+            "cur_price": cur,
+            "current_value": mtm if mtm else None,
+            "redeemable": bool(p.get("redeemable")),
+            "neg_risk": bool(p.get("negativeRisk") or p.get("negative_risk") or p.get("negRisk") or p.get("neg_risk")),
+            "closed": bool(p.get("closed") or p.get("resolved")),
+            "status": "open",
+        }
+
+    def fetch_pm_snapshot(self, *, force: bool = False) -> dict:
+        """data-api positions + MTM; available = pUSD of that user. Never CLOB cache."""
+        now = time.time()
+        if not force and self._pm_snap and now - self._pm_snap[0] < 8:
+            return self._pm_snap[1]
+        out: dict[str, Any] = {
+            "available": None,
+            "portfolio": None,
+            "mtm": None,
+            "positions": None,
+            "source": "",
+        }
+        funder = (settings.funder or "").strip()
+        if not funder:
+            self._pm_snap = (now, out)
+            return out
+        pos = self.fetch_live_positions()
+        out["positions"] = pos
+        mtm_sum = 0.0
+        if pos:
+            mtm_sum = sum(float(p.get("current_value") or 0) for p in pos)
+        v2 = self._data_api_value(funder, v2=True)
+        v1 = self._data_api_value(funder, v2=False)
+        if v2 is not None:
+            mtm = float(v2)
+        elif v1 is not None:
+            mtm = float(v1)
+        else:
+            mtm = mtm_sum
+        out["mtm"] = mtm
+        available = self._funder_available_usdc(funder)
+        out["available"] = available
+        if available is not None:
+            out["portfolio"] = float(available) + float(mtm or 0)
+            out["source"] = "pUSD+data-api"
+        else:
+            out["portfolio"] = float(mtm or 0)
+            out["source"] = "data-api mtm"
+        self._pm_snap = (now, out)
+        return out
 
     def cancel_open(self) -> int:
         """Fjern hvilende GTC som aldri fyltes (forrige «live» uten fill)."""
@@ -557,80 +708,78 @@ class Executor:
         return n
 
     def fetch_live_positions(self) -> list[dict] | None:
-        """Sannhet fra Polymarket. None = henting feilet, ikke tøm lokalt."""
+        """data-api seats: size>0 and mid>0.01. None = fetch failed, keep local."""
         funder = (settings.funder or "").strip()
         if not funder:
             return None
-        headers = {"User-Agent": "polymarket-desk/1.0"}
-        urls = [
-            f"https://data-api.polymarket.com/positions?user={funder}&sizeThreshold=0.01",
-            f"https://gamma-api.polymarket.com/positions?user={funder}",
-        ]
-        for url in urls:
-            try:
-                r = requests.get(url, headers=headers, timeout=12)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                rows = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
-                out = []
+        out: list[dict] = []
+        cursor = None
+        got = False
+        try:
+            for _ in range(20):
+                params: dict[str, Any] = {
+                    "user": funder,
+                    "limit": 100,
+                    "filter_type": "TOKENS",
+                    "filter_amount": 0,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                data = self._data_api_json("/v2/positions", params, timeout=12)
+                if data is None:
+                    break
+                got = True
+                rows = data.get("data") if isinstance(data, dict) else data
+                if not isinstance(rows, list):
+                    rows = []
                 for p in rows:
-                    size = float(p.get("size") or p.get("shares") or 0)
-                    if size < 0.01:
+                    if not isinstance(p, dict):
                         continue
-                    cid = str(p.get("conditionId") or p.get("condition_id") or "").strip()
-                    if not cid:
-                        continue
-                    side, label, outcome = _side_and_label(p)
-                    avg = float(p.get("avgPrice") or p.get("avg_price") or 0)
-                    cur = float(p.get("curPrice") or p.get("currPrice") or 0)
-                    api_val = p.get("currentValue")
-                    mtm = float(api_val) if api_val not in (None, "") else (size * cur if cur else 0)
-                    out.append(
-                        {
-                            "condition_id": cid,
-                            "question": label,
-                            "outcome": outcome,
-                            "category": _infer_category(p),
-                            "event_key": str(p.get("eventSlug") or p.get("conditionId") or cid),
-                            "side": side,
-                            "token_id": str(p.get("asset") or p.get("token_id") or ""),
-                            "shares": size,
-                            "avg_cost": avg,
-                            "cur_price": cur if cur else None,
-                            "current_value": mtm if mtm else None,
-                            "redeemable": bool(p.get("redeemable")),
-                            "neg_risk": bool(p.get("negativeRisk") or p.get("negRisk") or p.get("neg_risk")),
-                            "closed": bool(p.get("closed") or p.get("resolved")),
-                            "status": "open",
-                        }
-                    )
-                log.info("Live posisjoner fra API: %s", len(out))
-                return out
-            except Exception as exc:
-                log.warning("positions %s: %s", url.split("/")[2], exc)
+                    row = self._norm_position(p)
+                    if row:
+                        out.append(row)
+                pag = data.get("pagination") if isinstance(data, dict) else {}
+                nxt = (pag or {}).get("next_cursor")
+                if (pag or {}).get("has_more") and nxt:
+                    cursor = nxt
+                    continue
+                break
+        except Exception as exc:
+            log.warning("data-api v2 positions: %s", exc)
+            got = False
+        if got:
+            log.info("Live posisjoner fra data-api v2: %s", len(out))
+            return out
+        try:
+            data = self._data_api_json(
+                "/positions",
+                {"user": funder, "sizeThreshold": 0},
+                timeout=12,
+            )
+            if data is None:
+                return None
+            rows = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
+            out = []
+            for p in rows:
+                if not isinstance(p, dict):
+                    continue
+                row = self._norm_position(p)
+                if row:
+                    out.append(row)
+            log.info("Live posisjoner fra data-api v1: %s", len(out))
+            return out
+        except Exception as exc:
+            log.warning("data-api v1 positions: %s", exc)
         return None
 
     def fetch_position_value(self) -> float | None:
         funder = (settings.funder or "").strip()
         if not funder:
             return None
-        try:
-            r = requests.get(
-                f"https://data-api.polymarket.com/value?user={funder}",
-                headers={"User-Agent": "polymarket-desk/1.0"},
-                timeout=8,
-            )
-            if not r.ok:
-                return None
-            data = r.json()
-            if isinstance(data, list) and data:
-                return float(data[0].get("value") or 0)
-            if isinstance(data, dict) and "value" in data:
-                return float(data.get("value") or 0)
-        except Exception as exc:
-            log.warning("portfolio value: %s", exc)
-        return None
+        v2 = self._data_api_value(funder, v2=True)
+        if v2 is not None:
+            return v2
+        return self._data_api_value(funder, v2=False)
 
     def submit(self, ticket: Ticket) -> dict:
         src = str(getattr(ticket, "source", "") or "")
@@ -898,6 +1047,7 @@ class Executor:
             }
 
         def _record_paper() -> dict:
+            # Paper fill is log-only. Do not bump cash — chain did not pay.
             log.info(
                 "PAPER SELL %s %s @ %s size=%s (%s)",
                 order.get("side"),
@@ -1305,6 +1455,7 @@ class Executor:
         return resp, txh
 
     def _record_redeem(self, pos: dict, txh: str, neg: bool, paper: bool) -> None:
+        # Paper redeem must not increase cash as if the chain paid.
         cid = str(pos.get("condition_id") or "")
         shares = float(pos.get("shares") or 0)
         try:

@@ -191,29 +191,32 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
 
 def _state() -> dict[str, Any]:
     desk = _desk
-    mark = desk.store.latest_mark() if desk else None
     open_pos = desk.store.positions("open") if desk else []
-    snap_cash = desk.store.float_meta("last_cash") if desk else None
-    if mark:
-        raw_cash = float(mark["bankroll"])
-    elif snap_cash is not None:
-        raw_cash = snap_cash
-    else:
-        raw_cash = settings.paper_bankroll_usd if settings.dry_run else 0.0
+    desk_cash = desk.store.float_meta("desk_cash") if desk else None
+    if desk_cash is None and desk:
+        desk_cash = desk.store.float_meta("last_cash")
+    desk_equity = desk.store.float_meta("desk_equity") if desk else None
+    if desk_equity is None and desk:
+        desk_equity = desk.store.float_meta("last_equity")
+    raw_cash = float(desk_cash or 0)
+    raw_equity = float(desk_equity if desk_equity is not None else raw_cash)
     halt = settings.halt_file.exists()
     st: dict[str, Any] = {}
     bankroll = raw_cash
-    equity = raw_cash
+    equity = raw_equity
     if desk:
         try:
-            st = desk.store.portfolio_stats(raw_cash, raw_cash, open_pos)
+            st = desk.store.portfolio_stats(raw_equity, raw_cash, open_pos)
             bankroll = float(st.get("cash") if st.get("cash") is not None else raw_cash)
-            equity = float(st.get("equity") if st.get("equity") is not None else bankroll)
+            equity = float(st.get("equity") if st.get("equity") is not None else raw_equity)
             deposited = float(st.get("deposited") or 0)
             if deposited >= 1:
                 st["total"] = round(equity - deposited, 2)
                 st["total_pct"] = round(st["total"] / deposited, 4)
                 st["after_xai"] = round(st["total"] - float(st.get("xai_total") or 0), 2)
+            st["pm_portfolio"] = desk.store.float_meta("pm_portfolio")
+            st["pm_available"] = desk.store.float_meta("pm_available")
+            st["gap"] = desk.store.float_meta("pm_gap")
         except Exception as exc:
             log.exception("portfolio_stats: %s", exc)
     spent = float((st or {}).get("xai_total") or 0)

@@ -265,16 +265,41 @@ class Desk:
         threading.Thread(target=_run, daemon=True, name="desk-once").start()
         return True
 
+    def _pm_qa_fields(self) -> dict[str, float | None]:
+        def _f(key: str) -> float | None:
+            val = self.store.float_meta(key)
+            return None if val is None else round(val, 2)
+
+        return {
+            "pm_portfolio": _f("pm_portfolio"),
+            "pm_available": _f("pm_available"),
+            "desk_equity": _f("desk_equity"),
+            "desk_cash": _f("desk_cash"),
+            "gap": _f("pm_gap"),
+        }
+
     def qa_report(self) -> str:
         from agent.arb import STATS_ENABLED
 
         sha = _git_sha()
-        seats = len(self.store.positions("open"))
+        seats_raw = self.store.get_meta("pm_open", "")
+        try:
+            seats = int(seats_raw)
+        except (TypeError, ValueError):
+            seats = len(self.store.positions("open"))
         grouped = self.store.grouped_rejects(20)
         freeze_ts = self.store.get_meta("freeze_ts", "")
         leaks = self.store.leak_fills_since(("grok", "stats"), freeze_ts)
+        qa = self._pm_qa_fields()
+        gap = qa.get("gap")
+        fail = gap is not None and abs(float(gap)) > 1.00
         lines = [
             f"QA freeze sha={sha} DRY_RUN={settings.dry_run} stats_enabled={STATS_ENABLED} seats={seats}",
+            (
+                f"pm_portfolio={qa['pm_portfolio']} pm_available={qa['pm_available']} "
+                f"desk_equity={qa['desk_equity']} desk_cash={qa['desk_cash']} gap={qa['gap']}"
+                + (" FAIL" if fail else "")
+            ),
             "rejects: " + (", ".join(f"{n}× {r}" for r, n in grouped) if grouped else "none"),
             f"leaks grok/stats fills since freeze: {len(leaks)}" + (" LEAK" if leaks else ""),
         ]
@@ -315,70 +340,58 @@ class Desk:
             self.exec.cancel_open()
         except Exception as exc:
             log.warning("cancel_open: %s", exc)
+        snap: dict = {}
         try:
-            live_pos = self.exec.fetch_live_positions()
-            if live_pos is not None:
-                self.store.sync_open_positions(live_pos)
+            snap = self.exec.fetch_pm_snapshot(force=True)
         except Exception as exc:
-            log.warning("sync posisjoner: %s", exc)
-        bankroll = self.exec.bankroll()
-        open_pos = self.store.positions("open")
-        for p in open_pos:
-            token = str(p.get("token_id") or "")
-            if not token:
-                continue
+            log.warning("pm snapshot: %s", exc)
+            snap = {}
+        live_pos = snap.get("positions")
+        if live_pos is not None:
             try:
-                book = self.scout.book(token)
-            except Exception:
-                continue
-            if not book or book.get("synthetic"):
-                continue
-            mid = float(book.get("mid") or book.get("best_bid") or 0)
-            if not (0 < mid < 0.99):
-                continue
-            p["cur_price"] = mid
-            p["current_value"] = float(p.get("shares") or 0) * mid
-            try:
-                self.store.upsert_position(**p)
-            except Exception:
-                pass
-        open_pos = self.store.positions("open")
-        api_mtm = None
-        try:
-            api_mtm = self.exec.fetch_position_value()
-        except Exception:
-            api_mtm = None
-        live_flags: dict = {}
-        try:
-            raw_live = self.exec.fetch_live_positions()
-            if raw_live:
-                live_flags = {
-                    (str(r.get("condition_id")), str(r.get("side") or "YES").upper()): r
-                    for r in raw_live
-                }
-        except Exception:
-            live_flags = {}
-        for p in open_pos:
-            fl = live_flags.get((str(p.get("condition_id")), str(p.get("side") or "YES").upper())) or {}
-            for k in ("redeemable", "neg_risk", "closed"):
-                if fl.get(k) is not None:
-                    p[k] = fl.get(k)
-        cash, equity, open_cost, open_mtm = self.store.split_cash_equity(bankroll, open_pos)
-        if api_mtm is not None and api_mtm > 0 and abs(api_mtm - open_cost) > 0.05:
-            open_mtm = api_mtm
+                self.store.sync_open_positions(live_pos)
+            except Exception as exc:
+                log.warning("sync posisjoner: %s", exc)
+        open_pos = live_pos if live_pos is not None else self.store.positions("open")
+        available = snap.get("available")
+        cash, equity, open_cost, open_mtm = self.store.split_cash_equity(
+            float(available or 0), open_pos
+        )
+        api_mtm = snap.get("mtm")
+        if api_mtm is not None:
+            open_mtm = float(api_mtm)
             equity = cash + open_mtm
-        bankroll = cash
-        self.store.mark_equity(bankroll, equity)
-        self.store.save_snapshot(bankroll, equity, open_mtm)
+        pm_available = cash
+        pm_portfolio = snap.get("portfolio")
+        if pm_portfolio is None:
+            pm_portfolio = equity
+        pm_portfolio = float(pm_portfolio)
+        gap = equity - pm_portfolio
+        self.store.mark_equity(cash, equity)
+        self.store.save_snapshot(cash, equity, open_mtm)
+        self.store.set_meta("pm_portfolio", f"{pm_portfolio:.4f}")
+        self.store.set_meta("pm_available", f"{pm_available:.4f}")
+        self.store.set_meta("desk_equity", f"{equity:.4f}")
+        self.store.set_meta("desk_cash", f"{cash:.4f}")
+        self.store.set_meta("pm_gap", f"{gap:.4f}")
+        self.store.set_meta("pm_open", str(len(open_pos)))
         log.info(
-            "Portfolio cash=%.2f mtm=%.2f cost=%.2f equity=%.2f open=%s",
-            bankroll,
+            "pm_portfolio=%.2f pm_available=%.2f desk_equity=%.2f desk_cash=%.2f gap=%.2f mtm=%.2f cost=%.2f open=%s",
+            pm_portfolio,
+            pm_available,
+            equity,
+            cash,
+            gap,
             open_mtm,
             open_cost,
-            equity,
             len(open_pos),
         )
-        return bankroll, equity, open_pos
+        if abs(gap) > 1.00:
+            log.error(
+                "FAIL abs(desk_equity - pm_portfolio)=%.2f > 1.00",
+                abs(gap),
+            )
+        return cash, equity, open_pos
 
     def _upnl(self, p: dict) -> float:
         cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
@@ -616,6 +629,7 @@ class Desk:
         base.update(kwargs)
         if "sold" not in kwargs:
             base["sold"] = sold
+        base.update(self._pm_qa_fields())
         base["qa"] = self.qa_report()
         try:
             self.store.log_decision(

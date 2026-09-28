@@ -474,6 +474,8 @@ class Store:
         self.set_meta("last_cash", f"{cash:.4f}")
         self.set_meta("last_equity", f"{equity:.4f}")
         self.set_meta("last_mtm", f"{mtm:.4f}")
+        self.set_meta("desk_cash", f"{cash:.4f}")
+        self.set_meta("desk_equity", f"{equity:.4f}")
 
     def log_decision(self, **row: Any) -> None:
         payload = row.pop("payload", {})
@@ -831,6 +833,8 @@ class Store:
             self.conn.commit()
 
     def deposited_usd(self, equity_fallback: float) -> float:
+        """User-editable start equity. Never auto-fill from cash/equity."""
+        _ = equity_fallback
         raw = self.get_meta("deposited_usd", "")
         try:
             val = float(raw)
@@ -838,11 +842,7 @@ class Store:
                 return val
         except (TypeError, ValueError):
             pass
-        first = self.first_sane_equity(equity_fallback)
-        if first >= 20 and equity_fallback >= 20:
-            self.set_meta("deposited_usd", f"{first:.2f}")
-            return first
-        return first if first >= 1 else 0.0
+        return 0.0
 
     def first_sane_equity(self, fallback: float) -> float:
         with self._lock:
@@ -957,7 +957,7 @@ class Store:
         return sum(1 for row in rows if self._raw_is_matched(row["raw"]))
 
     def sync_open_positions(self, live: list[dict]) -> None:
-        """Erstatt lokale open med det Polymarket faktisk viser."""
+        """Replace local open with data-api seats. Drop ghosts not on the list."""
         cleaned = []
         for r in live:
             cid = str(r.get("condition_id") or "").strip()
@@ -976,36 +976,6 @@ class Store:
                     )
             self.conn.commit()
         for r in cleaned:
-            cid = str(r.get("condition_id") or "")
-            side = str(r.get("side") or "YES")
-            if self.is_dust(cid, side) or self.dust_close_fresh(cid, side):
-                try:
-                    cur = float(r.get("cur_price") or 0)
-                except (TypeError, ValueError):
-                    cur = 0.0
-                try:
-                    mtm = float(r.get("current_value") or 0)
-                except (TypeError, ValueError):
-                    mtm = 0.0
-                shares = float(r.get("shares") or 0)
-                if mtm <= 0 and shares and cur:
-                    mtm = shares * cur
-                try:
-                    dep = float(self.get_meta("deposited_usd") or 0)
-                except (TypeError, ValueError):
-                    dep = 0.0
-                dust_cut = 0.001 * dep if dep > 0 else 0.0
-                keep_dust = (
-                    shares < 1.0
-                    or mtm < 1.0
-                    or (dust_cut > 0 and mtm < dust_cut)
-                    or cur <= 0.01
-                    or self.dust_close_fresh(cid, side)
-                )
-                if keep_dust:
-                    continue
-                self.clear_dust(cid, side)
-                self.set_meta(f"dust_close:{cid}", "")
             self.upsert_position(**r)
 
     def first_mark(self) -> dict | None:
@@ -1020,35 +990,27 @@ class Store:
         return float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
 
     def position_mtm(self, p: dict) -> float:
-        """Live value = shares * mid. Never fall back to cost (that double-counts vs available cash)."""
+        """Live value = data-api mark. Include winners at 1.0. Never fall back to cost."""
         shares = float(p.get("shares") or 0)
-        cost = self.position_cost(p)
-        cur = p.get("cur_price")
-        try:
-            if cur not in (None, "") and 0 < float(cur) < 0.99:
-                return shares * float(cur)
-        except (TypeError, ValueError):
-            pass
         cv = p.get("current_value")
         try:
-            if cv not in (None, "") and abs(float(cv) - cost) > 0.05:
+            if cv not in (None, "") and float(cv) > 0:
                 return float(cv)
+        except (TypeError, ValueError):
+            pass
+        cur = p.get("cur_price")
+        try:
+            if cur not in (None, "") and float(cur) > 0.01:
+                return shares * float(cur)
         except (TypeError, ValueError):
             pass
         return 0.0
 
-    def split_cash_equity(self, clob_cash: float, open_pos: list[dict]) -> tuple[float, float, float, float]:
-        deposited = 0.0
-        try:
-            deposited = float(self.get_meta("deposited_usd") or 0)
-        except (TypeError, ValueError):
-            deposited = 0.0
+    def split_cash_equity(self, available: float, open_pos: list[dict]) -> tuple[float, float, float, float]:
+        """cash = available to trade. equity = cash + MTM. Never deposited − cost."""
         open_cost = sum(self.position_cost(p) for p in open_pos)
         open_mtm = sum(self.position_mtm(p) for p in open_pos)
-        if deposited >= 1 and open_cost > 1 and abs(float(clob_cash) - deposited) < 3:
-            cash = max(0.0, deposited - open_cost)
-        else:
-            cash = max(0.0, float(clob_cash or 0))
+        cash = max(0.0, float(available or 0))
         equity = cash + open_mtm
         return cash, equity, open_cost, open_mtm
 

@@ -230,6 +230,10 @@
         ["PnL vs innskutt", `${signed(pnl)} (${pctn(st.total_pct || 0)})`, tone(pnl)],
         ["xAI igjen", s.xai_remaining == null ? "fyll inn" : usd(s.xai_remaining), s.xai_remaining != null && s.xai_remaining < 5 ? "loss" : ""],
       ];
+      const gap = st.gap;
+      if (gap != null && Number.isFinite(Number(gap))) {
+        cards.push(["PM gap", usd(gap), Math.abs(Number(gap)) > 1 ? "loss" : ""]);
+      }
       $("stats").innerHTML = cards.map(([l, v, c]) =>
         `<div class="stat"><span>${l}</span><strong class="${c}">${v}</strong></div>`
       ).join("");
@@ -281,7 +285,10 @@
       const c = s.last_cycle;
       if (!c) return "Venter på første syklus.";
       const src = c.by_source || {};
-      return `skannet ${c.scanned || 0} · C ${c.n_complement || src.complement || 0} · K ${c.n_kalshi_clean || src.kalshi || 0} · E ${c.n_partition || src.partition || 0} · M ${c.maker || src.maker || 0} · spr ${c.n_blocked_spread || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0} · neste ${countdown(s)}`;
+      const pm = (c.pm_portfolio != null)
+        ? ` · pm_portfolio ${usd(c.pm_portfolio)} pm_available ${usd(c.pm_available)} desk_equity ${usd(c.desk_equity)} desk_cash ${usd(c.desk_cash)} gap ${c.gap != null ? usd(c.gap) : "—"}`
+        : "";
+      return `skannet ${c.scanned || 0} · C ${c.n_complement || src.complement || 0} · K ${c.n_kalshi_clean || src.kalshi || 0} · E ${c.n_partition || src.partition || 0} · M ${c.maker || src.maker || 0} · spr ${c.n_blocked_spread || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0}${pm} · neste ${countdown(s)}`;
     }
     function rejects(s) {
       const el = $("rejects");
