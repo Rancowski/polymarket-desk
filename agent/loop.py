@@ -327,10 +327,6 @@ class Desk:
         return text
 
     def cycle(self) -> dict:
-        block = live_forbidden()
-        if block:
-            log.error("%s", block)
-            return {"ok": False, "reason": block}
         if not self.cycle_lock.acquire(blocking=False):
             return {"ok": False, "reason": "syklus kjører allerede"}
         self.busy = True
@@ -1106,10 +1102,9 @@ class Desk:
             )
 
     def _cycle(self) -> dict:
-        block = live_forbidden()
-        if block:
-            log.error("%s", block)
-            return self._finish_cycle(halted=True, reason=block)
+        locked = live_forbidden()
+        if locked:
+            log.error("live locked")
         halt = self.risk.halted()
         self.last_error = None
         self._cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1125,17 +1120,20 @@ class Desk:
         except Exception as exc:
             log.warning("Kalshi fetch: %s", exc)
         by_open = self._market_stubs(open_pos)
-        redeems, redeem_log = self._run_redeems(open_pos, by_open)
-        if redeems:
-            try:
-                bankroll, equity, open_pos = self._refresh_portfolio()
-                by_open = self._market_stubs(open_pos)
-            except Exception as exc:
-                log.warning("post-redeem sync: %s", exc)
-                open_pos = self.store.positions("open")
+        redeems, redeem_log = 0, []
+        if settings.dry_run and not locked:
+            redeems, redeem_log = self._run_redeems(open_pos, by_open)
+            if redeems:
+                try:
+                    bankroll, equity, open_pos = self._refresh_portfolio()
+                    by_open = self._market_stubs(open_pos)
+                except Exception as exc:
+                    log.warning("post-redeem sync: %s", exc)
+                    open_pos = self.store.positions("open")
         n_redeem_ok = sum(1 for r in redeem_log if r.get("action") == "redeem_ok")
-        if halt:
-            log.warning("Stoppet: %s", halt)
+        if halt or locked:
+            reason = locked or halt
+            log.warning("Stoppet: %s", reason)
             self._finish_cycle(
                 halted=True,
                 scanned=0,
@@ -1150,11 +1148,11 @@ class Desk:
                 sold=0,
                 redeem_ok=n_redeem_ok,
                 exit_log=redeem_log,
-                reason=halt,
+                reason=reason,
                 bankroll=bankroll,
                 equity=equity,
             )
-            return {"ok": True, "halted": True}
+            return {"ok": True, "halted": True, "reason": reason}
 
         self._cycle_i += 1
         run_grok = True
@@ -1352,10 +1350,8 @@ class Desk:
         return {"ok": True, **self.last_cycle}
 
     def run_forever(self) -> None:
-        block = live_forbidden()
-        if block:
-            log.error("%s", block)
-            raise SystemExit(2)
+        if live_forbidden():
+            log.error("live locked")
         log.info("Desk kjører. DRY_RUN=%s interval=%ss", settings.dry_run, settings.loop_seconds)
         while True:
             try:

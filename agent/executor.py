@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 
-from agent.config import settings
+from agent.config import live_forbidden, settings
 from agent.risk import Ticket, is_sports
 from agent.store import Store, kalshi_fields_ok, normalize_side, normalize_source
 
@@ -440,6 +440,9 @@ class Executor:
             log.info("API-creds derivert")
 
     def _live_client(self):
+        if live_forbidden():
+            log.error("live locked")
+            raise RuntimeError("live locked")
         if self._client is not None:
             return self._client
         if not settings.private_key:
@@ -675,6 +678,9 @@ class Executor:
 
     def cancel_open(self) -> int:
         """Fjern hvilende GTC som aldri fyltes (forrige «live» uten fill)."""
+        if live_forbidden():
+            log.error("live locked")
+            return 0
         if settings.dry_run or not settings.private_key:
             return 0
         n = 0
@@ -782,6 +788,12 @@ class Executor:
         return self._data_api_value(funder, v2=False)
 
     def submit(self, ticket: Ticket) -> dict:
+        if live_forbidden():
+            log.error("live locked")
+            return {"status": "blocked", "reason": "live locked"}
+        if settings.halt_file.exists():
+            log.info("HALT: skip buy %s", (ticket.question or "")[:60])
+            return {"status": "blocked", "reason": "HALT"}
         src = str(getattr(ticket, "source", "") or "")
         if src not in {"complement", "kalshi", "partition", "maker"}:
             log.error("freeze: blocked buy source=%s %s", src, (ticket.question or "")[:60])
@@ -999,6 +1011,12 @@ class Executor:
         return None
 
     def sell(self, order: dict) -> dict:
+        if live_forbidden():
+            log.error("live locked")
+            return {"status": "blocked", "reason": "live locked"}
+        if settings.halt_file.exists() and not settings.dry_run:
+            log.info("HALT: skip live sell")
+            return {"status": "blocked", "reason": "HALT"}
         payload = {**order}
         token = str(order.get("token_id") or "").strip()
         booked = float(order.get("shares") or 0)
@@ -1513,6 +1531,18 @@ class Executor:
             unique.append(pos)
         if not unique:
             return out
+        if live_forbidden():
+            log.error("live locked")
+            return {
+                str(p.get("condition_id")): {"status": "blocked", "reason": "live locked"}
+                for p in unique
+            }
+        if settings.halt_file.exists() and not settings.dry_run:
+            log.info("HALT: skip live redeem")
+            return {
+                str(p.get("condition_id")): {"status": "blocked", "reason": "HALT"}
+                for p in unique
+            }
         if settings.dry_run:
             for pos in unique:
                 cid = str(pos.get("condition_id"))

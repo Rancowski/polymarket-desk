@@ -211,8 +211,8 @@
       return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
     }
     function pills(s) {
-      const on = !s.halted;
-      const mode = s.dry_run ? "Paper" : "Live";
+      const on = !s.halted && !s.live_locked;
+      const mode = s.live_locked ? "Live locked" : (s.dry_run ? "Paper" : "Live");
       const rel = (s.version && s.version.release) || "";
       $("pills").innerHTML =
         `<span class="pill ${on ? "on" : "off"}"><span class="dot"></span>${on ? mode : "Stoppet"}</span>` +
@@ -357,7 +357,7 @@
           ["Maker", "Kun når du blir betalt for å vente: spread ≥0,06, mid 0,25–0,75, ≤72t, ikke in-play. GTC 6–8 % på budet, ikke kryss. Maks 2. Avbryt neste syklus om umatchet. Ikke FAK."],
           ["Exits", "Hvis A/B/E-kanten er borte: stopp bud ≤ avg×0,90. Ta bud ≥ avg×1,12 eller ≥0,90, deretter trail 6 % HWM. Kant borte og −8¢ vs avg → flatten FAK. Kalshi ≥6¢ mot åpen side → flatten. Dust < $1 eller <0,1 % innskutt. Salg gulves til on-chain, aldri ceil til 5. Grok p_hat selger aldri."],
           ["Kalshi", "Bare samme utfall og dato. |gap|≥6¢. Grok kan ikke blokke. Ingen par = vekt 0."],
-          ["Sikring", "HALT-fil stopper alt. In-play map/BO og 5/15-min crypto hoppes. spread >0,04 på et ben du ville løfte → skip det benet."],
+          ["Sikring", "HALT hopper nye kjøp og live-salg; dashboard :8788 kjører. Paper-redeem når DRY_RUN=true. DRY_RUN=false → live locked, CLOB stengt, HTTP oppe."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;
       }

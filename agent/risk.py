@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from agent.config import FEE_RATE, settings
+from agent.config import FEE_RATE, live_forbidden, settings
 from agent.store import Store
 
 log = logging.getLogger("risk")
@@ -600,8 +600,11 @@ class Risk:
         return None
 
     def buys_blocked(self, equity: float, deposited: float) -> str | None:
-        """HALT-fil only. No daily freeze, no 85% desk stop."""
+        """HALT or live locked. No daily freeze, no 85% desk stop."""
         _ = (equity, deposited)
+        locked = live_forbidden()
+        if locked:
+            return locked
         return self.halted()
 
     def sports_blocked(self, equity: float, deposited: float, cash: float | None = None) -> str | None:

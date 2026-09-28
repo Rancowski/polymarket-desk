@@ -124,9 +124,9 @@ def env_dry_run_false() -> bool:
 
 
 def live_forbidden() -> str | None:
-    """Refuse the loop when DRY_RUN is false. Never flip DRY_RUN."""
+    """True when live CLOB is locked. Never flip DRY_RUN. Never sys.exit."""
     if env_dry_run_false() or not settings.dry_run:
-        return "HARD STOP: DRY_RUN is false — refuse to start. Do not flip DRY_RUN."
+        return "live locked"
     return None
 
 

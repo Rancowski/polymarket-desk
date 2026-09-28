@@ -25,9 +25,8 @@ def main() -> None:
     p.add_argument("cmd", nargs="?", default="run", choices=["run", "once", "status"])
     args = p.parse_args()
     block = live_forbidden()
-    if args.cmd in {"run", "once"} and block:
-        print(block, file=sys.stderr)
-        raise SystemExit(2)
+    if block:
+        logging.getLogger("desk").error("%s", block)
     desk = Desk()
     if args.cmd == "status":
         pos = desk.store.positions("open")

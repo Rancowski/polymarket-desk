@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-from agent.config import settings
+from agent.config import live_forbidden, settings
 from agent.kalshi import pair_ok
 from agent.version import release as git_release
 
@@ -252,8 +252,9 @@ def _state() -> dict[str, Any]:
     return {
         "dry_run": settings.dry_run,
         "halted": halt,
+        "live_locked": bool(live_forbidden()),
         "busy": bool(desk and desk.busy),
-        "running": bool(desk) and not halt,
+        "running": bool(desk),
         "bankroll": bankroll,
         "equity": equity,
         "open": len(open_pos),
@@ -384,9 +385,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/once":
             if _desk is None:
                 self._json(500, {"ok": False, "reason": "desk ikke klar"})
-                return
-            if settings.halt_file.exists():
-                self._json(400, {"ok": False, "reason": "Agenten er stoppet. Trykk Slå på først."})
                 return
             if not _desk.begin_cycle_async():
                 self._json(409, {"ok": False, "reason": "En syklus kjører allerede — vent til den er ferdig."})
