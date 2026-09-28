@@ -192,7 +192,10 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
                 "kalshi_gap": gap_yes,
                 "kalshi_pm_yes": pm_yes if pm_yes else None,
                 "live_thesis": live_thesis,
-                "entry_source": p.get("entry_source"),
+                "entry_source": (
+                    (_desk.store.opening_source(str(cid or ""), p.get("side")) if _desk else None)
+                    or None
+                ),
                 "entry_detail": p.get("entry_detail"),
             }
         )
@@ -507,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"ok": False, "reason": "innskutt må være ≥ 1"})
                     return
                 _desk.store.set_meta("deposited_usd", f"{val:.2f}")
+                if not _desk.store.get_meta("deposited_ts", ""):
+                    _desk.store.set_meta("deposited_ts", datetime.now(timezone.utc).isoformat())
                 eq = _desk.store.float_meta("desk_equity") or 0.0
                 _desk.store.note_period_anchors(eq)
             if "xai_prepaid_usd" in payload:

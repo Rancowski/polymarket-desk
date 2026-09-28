@@ -907,6 +907,7 @@ class Desk:
                 log_rows.append(_row("hold", why))
                 continue
             if str(ticket_ex.get("kind") or "") == "resolved_loser":
+                self.store.record_resolution(pos, source="resolve", proceeds=0.0)
                 self.store.close_position(str(cid or ""), side)
                 try:
                     self.store.clear_dust(str(cid or ""), str(side or "YES"))
@@ -978,6 +979,7 @@ class Desk:
                     )
                     fam = _pm_family(str(pos.get("question") or ""))
                     if state == "loser":
+                        self.store.record_resolution(pos, source="resolve", proceeds=0.0)
                         self.store.close_position(str(cid or ""), side)
                         try:
                             self.store.clear_dust(str(cid or ""), str(side or "YES"))

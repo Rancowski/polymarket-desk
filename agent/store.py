@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -9,6 +10,22 @@ from pathlib import Path
 from typing import Any
 
 from agent.config import settings
+
+log = logging.getLogger("store")
+
+BUY_SOURCES = frozenset(
+    {"grok", "kalshi", "complement", "partition", "maker", "stats", "tape"}
+)
+
+
+def _real_buy_source(src: Any, detail: Any = None) -> str | None:
+    """Opening-fill source. Partition only if the fill itself was a partition ticket."""
+    got = normalize_source(src)
+    if got not in BUY_SOURCES:
+        return None
+    if got == "partition" and not str(detail or "").lower().startswith("partition "):
+        return None
+    return got
 
 
 VALID_SOURCES = frozenset(
@@ -25,6 +42,7 @@ VALID_SOURCES = frozenset(
         "exit_trail",
         "exit_kalshi",
         "redeem",
+        "resolve",
         "flatten",
     }
 )
@@ -39,8 +57,11 @@ _SIDE_MAP = {
     "SELL_YES": "SELL_YES",
     "SELL_NO": "SELL_NO",
     "REDEEM": "REDEEM",
-    "REDEEM_YES": "REDEEM",
-    "REDEEM_NO": "REDEEM",
+    "REDEEM_YES": "REDEEM_YES",
+    "REDEEM_NO": "REDEEM_NO",
+    "RESOLVE": "RESOLVE",
+    "RESOLVE_YES": "RESOLVE_YES",
+    "RESOLVE_NO": "RESOLVE_NO",
 }
 
 
@@ -128,8 +149,10 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
                     explicit = None
     if explicit:
         return explicit, thesis or None
-    if su == "REDEEM" or data.get("redeem"):
+    if su.startswith("REDEEM") or data.get("redeem"):
         return "redeem", thesis or "redeem_ok"
+    if su.startswith("RESOLVE") or data.get("resolve"):
+        return "resolve", thesis or "resolved"
     sell = su.startswith("SELL")
     if sell:
         if "kalshi" in low:
@@ -147,8 +170,6 @@ def infer_fill_source(side: Any, raw: Any) -> tuple[str | None, str | None]:
         return "complement", thesis or None
     if "favorite_near" in low or low.startswith("stats "):
         return "stats", thesis or None
-    if "sum_ask_lt_1" in low or "sum_bid_gt_1" in low or low.startswith("partition "):
-        return "partition", thesis or None
     if low.startswith("maker "):
         return "maker", thesis or None
     if "låst utfall" in low:
@@ -182,6 +203,7 @@ class Store:
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init()
+        self.backfill_resolved_closes()
 
     def _init(self) -> None:
         with self._lock:
@@ -381,10 +403,14 @@ class Store:
                 su = normalize_side(row["side"])
                 if not su.startswith("BUY_"):
                     continue
+                src = _real_buy_source(row["source"], row["source_detail"])
+                if not src:
+                    continue
                 yn = su[4:] or "YES"
                 key = (str(row["condition_id"] or ""), yn)
                 if key[0] and key not in first:
-                    first[key] = (str(row["source"]), row["source_detail"])
+                    first[key] = (src, row["source_detail"])
+            self.conn.execute("UPDATE positions SET entry_source=''")
             for (cid, side), (src, detail) in first.items():
                 self.conn.execute(
                     """
@@ -421,7 +447,7 @@ class Store:
         empty = {"", "0", "0.0", "none", "null"}
         if merged.get("closed_dust"):
             return False
-        if merged.get("redeem"):
+        if merged.get("redeem") or merged.get("resolve"):
             return True
         if status in {"live", "open", "resting", "unmatched", "cancelled", "canceled"} and taking.lower() in empty and making.lower() in empty:
             return False
@@ -431,7 +457,7 @@ class Store:
                     return True
             except (TypeError, ValueError):
                 pass
-            if merged.get("redeem"):
+            if merged.get("redeem") or merged.get("resolve"):
                 return True
             return False
         try:
@@ -545,6 +571,148 @@ class Store:
         with self._lock:
             cur = self.conn.execute("SELECT * FROM positions WHERE status=?", (status,))
             return [dict(r) for r in cur.fetchall()]
+
+    def opening_source(self, condition_id: str, side: str | None = None) -> str | None:
+        """Source of the first BUY fill. Never invent partition."""
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if not cid:
+            return None
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side, source, source_detail FROM fills WHERE condition_id=? ORDER BY id ASC",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if not su.startswith("BUY_"):
+                continue
+            if (su[4:] or "YES") != yn:
+                continue
+            src = _real_buy_source(row["source"], row["source_detail"])
+            if src:
+                return src
+        return None
+
+    def has_close_fill(self, condition_id: str, side: str | None = None) -> bool:
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if not cid:
+            return False
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side, raw, dry_run FROM fills WHERE condition_id=?",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su in {f"RESOLVE_{yn}", "RESOLVE", f"REDEEM_{yn}", "REDEEM"}:
+                return True
+            if su == f"SELL_{yn}" or (su == "SELL" and yn == "YES"):
+                if int(row["dry_run"] or 0) == 0 and self._raw_is_matched(row["raw"]):
+                    return True
+        return False
+
+    def _leg_has_live_buy(self, condition_id: str, side: str | None) -> bool:
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side, dry_run FROM fills WHERE condition_id=?",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su.startswith("BUY_") and (su[4:] or "YES") == yn and int(row["dry_run"] or 0) == 0:
+                return True
+        return False
+
+    def record_resolution(self, pos: dict, *, source: str, proceeds: float) -> bool:
+        """One close fill for a vanished or worthless seat. proceeds=0 if worthless."""
+        cid = str(pos.get("condition_id") or "").strip()
+        yn = str(pos.get("side") or "YES").upper()
+        if yn not in {"YES", "NO"}:
+            yn = "YES"
+        if not cid or self.has_close_fill(cid, yn):
+            return False
+        try:
+            shares = float(pos.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            avg = float(pos.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            avg = 0.0
+        if shares <= 0 and avg <= 0:
+            return False
+        proceeds_f = max(0.0, float(proceeds or 0))
+        px = (proceeds_f / shares) if shares > 0 else 0.0
+        src = "redeem" if source == "redeem" else "resolve"
+        side = f"REDEEM_{yn}" if src == "redeem" else f"RESOLVE_{yn}"
+        paper = not self._leg_has_live_buy(cid, yn)
+        self.add_fill(
+            condition_id=cid,
+            side=side,
+            price=round(px, 4),
+            size=shares,
+            cost=round(proceeds_f, 4),
+            dry_run=paper,
+            question=pos.get("question"),
+            token_id=pos.get("token_id"),
+            source=src,
+            source_detail="worthless" if proceeds_f <= 0 else src,
+            cycle_id=self.get_meta("cycle_id") or None,
+            raw={
+                src: True,
+                "status": "matched",
+                "takingAmount": str(proceeds_f),
+                "question": pos.get("question"),
+                "source": src,
+            },
+        )
+        log.info(
+            "%s fill %s %s shares=%.4f proceeds=%.2f cost=%.2f",
+            src,
+            yn,
+            str(pos.get("question") or "")[:60],
+            shares,
+            proceeds_f,
+            shares * avg,
+        )
+        return True
+
+    def backfill_resolved_closes(self) -> int:
+        """Import vanished losers still sitting as closed/closed_dust without a close fill."""
+        if self.get_meta("resolve_backfill_v1", ""):
+            return 0
+        n = 0
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT * FROM positions WHERE status IN ('closed', 'closed_dust')"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        for row in rows:
+            if self.record_resolution(row, source="resolve", proceeds=0.0):
+                n += 1
+        self.set_meta("resolve_backfill_v1", utc_now())
+        if n:
+            log.info("backfill resolved closes: %s", n)
+        return n
+
+    def deposited_since(self) -> datetime | None:
+        raw = self.get_meta("deposited_ts", "")
+        if not raw:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
+        except ValueError:
+            return None
 
     def close_position(self, condition_id: str, side: str | None = None) -> None:
         with self._lock:
@@ -957,24 +1125,32 @@ class Store:
         return sum(1 for row in rows if self._raw_is_matched(row["raw"]))
 
     def sync_open_positions(self, live: list[dict]) -> None:
-        """Replace local open with data-api seats. Drop ghosts not on the list."""
+        """Replace local open with data-api seats. Resolve vanished / mid≤0.02."""
         cleaned = []
+        dead: list[dict] = []
         for r in live:
             cid = str(r.get("condition_id") or "").strip()
             if not cid:
                 continue
+            try:
+                mid = float(r.get("cur_price") or 0)
+            except (TypeError, ValueError):
+                mid = 0.0
+            redeemable = bool(r.get("redeemable") or r.get("closed"))
+            if redeemable and mid <= 0.02:
+                dead.append(r)
+                continue
             cleaned.append(r)
         live_keys = {(str(r.get("condition_id")), str(r.get("side") or "YES").upper()) for r in cleaned}
-        with self._lock:
-            cur = self.conn.execute("SELECT condition_id, side FROM positions WHERE status='open'")
-            for row in cur.fetchall():
-                key = (str(row["condition_id"]), str(row["side"] or "YES").upper())
-                if key not in live_keys:
-                    self.conn.execute(
-                        "UPDATE positions SET status='closed', shares=0, last_ts=? WHERE condition_id=? AND side=?",
-                        (utc_now(), row["condition_id"], row["side"]),
-                    )
-            self.conn.commit()
+        local_open = self.positions("open")
+        for row in local_open:
+            key = (str(row.get("condition_id")), str(row.get("side") or "YES").upper())
+            if key not in live_keys:
+                self.record_resolution(row, source="resolve", proceeds=0.0)
+                self.close_position(str(row.get("condition_id") or ""), row.get("side"))
+        for r in dead:
+            self.record_resolution(r, source="redeem", proceeds=0.0)
+            self.close_position(str(r.get("condition_id") or ""), r.get("side"))
         for r in cleaned:
             self.upsert_position(**r)
 
@@ -1270,8 +1446,10 @@ class Store:
 
         def _leg(side: Any) -> tuple[str, str]:
             s = normalize_side(side)
-            if s == "REDEEM":
-                return "redeem", "YES"
+            if s.startswith("REDEEM"):
+                return "redeem", (s[7:] or "YES")
+            if s.startswith("RESOLVE"):
+                return "redeem", (s[8:] or "YES")
             if s.startswith("SELL_"):
                 return "sell", s[5:] or "YES"
             if s.startswith("BUY_"):
@@ -1280,7 +1458,7 @@ class Store:
 
         def _src_bucket(src: Any) -> str | None:
             s = str(src or "").lower()
-            if s in {"grok", "kalshi", "complement"}:
+            if s in {"grok", "kalshi", "complement", "partition", "maker"}:
                 return s
             if s in {"exit_stop", "exit_take", "exit_trail", "exit_kalshi", "flatten"}:
                 return "exits"
@@ -1317,8 +1495,9 @@ class Store:
             if direction == "buy":
                 g["buy_cost"] += cost
                 g["buy_n"] += 1
-                if not g["entry_source"] and _src_bucket(src) in {"grok", "kalshi", "complement"}:
-                    g["entry_source"] = src
+                real = _real_buy_source(src, f.get("source_detail"))
+                if not g["entry_source"] and real:
+                    g["entry_source"] = real
             elif direction == "redeem":
                 g["sell_proceeds"] += cost
                 g["sell_n"] += 1
@@ -1331,6 +1510,7 @@ class Store:
         open_keys = {
             (str(p.get("condition_id")), str(p.get("side") or "YES").upper()) for p in open_pos
         }
+        since = self.deposited_since()
         closed: list[dict] = []
         for key, g in groups.items():
             if key in open_keys:
@@ -1341,6 +1521,10 @@ class Store:
             hold_h = None
             if g["first_ts"] and g["last_ts"]:
                 hold_h = (g["last_ts"] - g["first_ts"]).total_seconds() / 3600.0
+            if since is not None:
+                mark_ts = g["last_ts"] or g["first_ts"]
+                if mark_ts is None or mark_ts < since:
+                    continue
             closed.append(
                 {
                     "realized": realized,
@@ -1362,8 +1546,8 @@ class Store:
                 ]
             n = len(rows)
             pnl = sum(float(r["realized"]) for r in rows)
-            wins = [r for r in rows if r["realized"] > 0.004]
-            losses = [r for r in rows if r["realized"] < -0.004]
+            wins = [r for r in rows if r["realized"] > 0]
+            losses = [r for r in rows if r["realized"] < 0]
             holds = [r["hold_h"] for r in rows if r["hold_h"] is not None]
             return {
                 "n": n,
@@ -1382,7 +1566,7 @@ class Store:
         d7 = _window(24 * 7)
         by_source = {
             k: {"n": 0, "bought": 0.0, "realized": 0.0}
-            for k in ("grok", "kalshi", "complement", "exits")
+            for k in ("grok", "kalshi", "complement", "partition", "maker", "exits")
         }
         for f in fills:
             direction, _yn = _leg(f.get("side"))
@@ -1401,7 +1585,7 @@ class Store:
                 by_source["exits"]["bought"] += cost
         for r in closed:
             b = _src_bucket(r.get("entry_source"))
-            if b in {"grok", "kalshi", "complement"}:
+            if b in {"grok", "kalshi", "complement", "partition", "maker"}:
                 by_source[b]["realized"] += r["realized"]
             if r.get("via_sell"):
                 by_source["exits"]["realized"] += r["realized"]
