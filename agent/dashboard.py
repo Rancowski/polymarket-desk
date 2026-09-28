@@ -124,7 +124,17 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
             kalshi_by[str(cid)] = row
     out = []
     for p in open_pos:
-        cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
+        try:
+            shares = float(p.get("shares") or 0)
+            mid = float(p.get("cur_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares <= 0 or mid <= 0.01:
+            continue
+        try:
+            cost = shares * float(p.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
         cv = p.get("current_value")
         try:
             mtm = float(cv) if cv not in (None, "") else None
@@ -191,7 +201,8 @@ def _positions_payload(open_pos: list, last_cycle: dict | None) -> list[dict]:
 
 def _state() -> dict[str, Any]:
     desk = _desk
-    open_pos = desk.store.positions("open") if desk else []
+    raw_open = desk.store.positions("open") if desk else []
+    open_pos = desk.store.shown_seats(raw_open) if desk else []
     desk_cash = desk.store.float_meta("desk_cash") if desk else None
     if desk_cash is None and desk:
         desk_cash = desk.store.float_meta("last_cash")
@@ -207,8 +218,10 @@ def _state() -> dict[str, Any]:
     if desk:
         try:
             st = desk.store.portfolio_stats(raw_equity, raw_cash, open_pos)
-            bankroll = float(st.get("cash") if st.get("cash") is not None else raw_cash)
-            equity = float(st.get("equity") if st.get("equity") is not None else raw_equity)
+            bankroll = raw_cash
+            equity = raw_equity
+            st["cash"] = round(raw_cash, 2)
+            st["equity"] = round(raw_equity, 2)
             deposited = float(st.get("deposited") or 0)
             if deposited >= 1:
                 st["total"] = round(equity - deposited, 2)
@@ -217,6 +230,9 @@ def _state() -> dict[str, Any]:
             st["pm_portfolio"] = desk.store.float_meta("pm_portfolio")
             st["pm_available"] = desk.store.float_meta("pm_available")
             st["gap"] = desk.store.float_meta("pm_gap")
+            st["i_markedet"] = round(desk.store.markedet_sum(open_pos), 2)
+            st["daily_pnl"] = desk.store.float_meta("daily_pnl")
+            st["dd_from_peak"] = desk.store.float_meta("dd_from_peak")
         except Exception as exc:
             log.exception("portfolio_stats: %s", exc)
     spent = float((st or {}).get("xai_total") or 0)
@@ -491,6 +507,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"ok": False, "reason": "innskutt må være ≥ 1"})
                     return
                 _desk.store.set_meta("deposited_usd", f"{val:.2f}")
+                eq = _desk.store.float_meta("desk_equity") or 0.0
+                _desk.store.note_period_anchors(eq)
             if "xai_prepaid_usd" in payload:
                 val = float(payload["xai_prepaid_usd"])
                 if val < 0:

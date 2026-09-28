@@ -272,10 +272,10 @@ class Desk:
 
         return {
             "pm_portfolio": _f("pm_portfolio"),
-            "pm_available": _f("pm_available"),
             "desk_equity": _f("desk_equity"),
-            "desk_cash": _f("desk_cash"),
             "gap": _f("pm_gap"),
+            "daily_pnl": _f("daily_pnl"),
+            "dd_from_peak": _f("dd_from_peak"),
         }
 
     def qa_report(self) -> str:
@@ -286,23 +286,38 @@ class Desk:
         try:
             seats = int(seats_raw)
         except (TypeError, ValueError):
-            seats = len(self.store.positions("open"))
+            seats = len(self.store.shown_seats(self.store.positions("open")))
         grouped = self.store.grouped_rejects(20)
         freeze_ts = self.store.get_meta("freeze_ts", "")
         leaks = self.store.leak_fills_since(("grok", "stats"), freeze_ts)
         qa = self._pm_qa_fields()
         gap = qa.get("gap")
-        fail = gap is not None and abs(float(gap)) > 1.00
+        i_markedet = self.store.float_meta("i_markedet")
+        card_sum = self.store.markedet_sum(self.store.positions("open"))
+        if i_markedet is None:
+            i_markedet = card_sum
+        fail_eq = gap is not None and abs(float(gap)) > 1.00
+        fail_mkt = abs(float(i_markedet) - float(card_sum)) > 0.50
+        fail = fail_eq or fail_mkt
         lines = [
             f"QA freeze sha={sha} DRY_RUN={settings.dry_run} stats_enabled={STATS_ENABLED} seats={seats}",
             (
-                f"pm_portfolio={qa['pm_portfolio']} pm_available={qa['pm_available']} "
-                f"desk_equity={qa['desk_equity']} desk_cash={qa['desk_cash']} gap={qa['gap']}"
+                f"pm_portfolio={qa['pm_portfolio']} desk_equity={qa['desk_equity']} "
+                f"gap={qa['gap']} daily_pnl={qa['daily_pnl']} dd_from_peak={qa['dd_from_peak']}"
                 + (" FAIL" if fail else "")
             ),
             "rejects: " + (", ".join(f"{n}× {r}" for r, n in grouped) if grouped else "none"),
             f"leaks grok/stats fills since freeze: {len(leaks)}" + (" LEAK" if leaks else ""),
         ]
+        if fail_eq:
+            log.error("FAIL abs(desk_equity - pm_portfolio)=%.2f > 1.00", abs(float(gap or 0)))
+        if fail_mkt:
+            log.error(
+                "FAIL abs(i_markedet - sum cards)=%.2f > 0.50 i_markedet=%.2f cards=%.2f",
+                abs(float(i_markedet) - float(card_sum)),
+                float(i_markedet),
+                float(card_sum),
+            )
         for row in leaks[:8]:
             lines.append(
                 f"  LEAK {row.get('source')} {(row.get('question') or '')[:56]} ts={row.get('ts')}"
@@ -367,6 +382,9 @@ class Desk:
             pm_portfolio = equity
         pm_portfolio = float(pm_portfolio)
         gap = equity - pm_portfolio
+        shown = self.store.shown_seats(open_pos)
+        i_markedet = self.store.markedet_sum(shown)
+        anchors = self.store.note_period_anchors(equity)
         self.store.mark_equity(cash, equity)
         self.store.save_snapshot(cash, equity, open_mtm)
         self.store.set_meta("pm_portfolio", f"{pm_portfolio:.4f}")
@@ -374,24 +392,32 @@ class Desk:
         self.store.set_meta("desk_equity", f"{equity:.4f}")
         self.store.set_meta("desk_cash", f"{cash:.4f}")
         self.store.set_meta("pm_gap", f"{gap:.4f}")
-        self.store.set_meta("pm_open", str(len(open_pos)))
+        self.store.set_meta("i_markedet", f"{i_markedet:.4f}")
+        self.store.set_meta("pm_open", str(len(shown)))
+        daily = float(anchors.get("daily_pnl") or 0)
+        dd = float(anchors.get("dd_from_peak") or 0)
         log.info(
-            "pm_portfolio=%.2f pm_available=%.2f desk_equity=%.2f desk_cash=%.2f gap=%.2f mtm=%.2f cost=%.2f open=%s",
+            "pm_portfolio=%.2f desk_equity=%.2f gap=%.2f daily_pnl=%.2f dd_from_peak=%.2f i_markedet=%.2f cash=%.2f open=%s",
             pm_portfolio,
-            pm_available,
             equity,
-            cash,
             gap,
-            open_mtm,
-            open_cost,
-            len(open_pos),
+            daily,
+            dd,
+            i_markedet,
+            cash,
+            len(shown),
         )
         if abs(gap) > 1.00:
             log.error(
                 "FAIL abs(desk_equity - pm_portfolio)=%.2f > 1.00",
                 abs(gap),
             )
-        return cash, equity, open_pos
+        if abs(i_markedet - self.store.markedet_sum(shown)) > 0.50:
+            log.error(
+                "FAIL abs(i_markedet - sum cards)=%.2f > 0.50",
+                abs(i_markedet - self.store.markedet_sum(shown)),
+            )
+        return cash, equity, shown
 
     def _upnl(self, p: dict) -> float:
         cost = float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)

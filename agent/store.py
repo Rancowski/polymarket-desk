@@ -989,6 +989,121 @@ class Store:
     def position_cost(self, p: dict) -> float:
         return float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
 
+    def shown_seats(self, open_pos: list[dict]) -> list[dict]:
+        """Seats shown in Posisjoner: size>0 and mid>0.01."""
+        out: list[dict] = []
+        for p in open_pos or []:
+            try:
+                shares = float(p.get("shares") or 0)
+            except (TypeError, ValueError):
+                continue
+            if shares <= 0:
+                continue
+            try:
+                mid = float(p.get("cur_price") or 0)
+            except (TypeError, ValueError):
+                mid = 0.0
+            if mid <= 0.01:
+                continue
+            out.append(p)
+        return out
+
+    def markedet_sum(self, open_pos: list[dict]) -> float:
+        return sum(self.position_mtm(p) for p in self.shown_seats(open_pos))
+
+    def note_period_anchors(self, equity: float) -> dict:
+        """Persist UTC-midnight equity, 7d trail, and peak. Call before save_snapshot."""
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        eq = float(equity or 0)
+        stored_day = self.get_meta("day_anchor_date", "")
+        if stored_day != today:
+            if not stored_day:
+                anchor = eq
+            else:
+                prev = self.float_meta("last_equity")
+                anchor = float(prev) if prev is not None else eq
+            self.set_meta("day_anchor_date", today)
+            self.set_meta("day_anchor_equity", f"{anchor:.4f}")
+        deposited = self.deposited_usd(0.0)
+        dep_ref = self.get_meta("deposited_usd", "")
+        if self.get_meta("peak_deposited_ref", "") != dep_ref:
+            peak = max(deposited if deposited >= 1 else 0.0, eq)
+            self.set_meta("peak_deposited_ref", dep_ref)
+        else:
+            saved = self.float_meta("peak_equity") or 0.0
+            peak = max(deposited if deposited >= 1 else 0.0, saved, eq)
+        self.set_meta("peak_equity", f"{peak:.4f}")
+        self._append_eq_trail(now.timestamp(), eq)
+        day_anchor = self.float_meta("day_anchor_equity")
+        if day_anchor is None:
+            day_anchor = eq
+        daily = eq - float(day_anchor)
+        week_base = self.equity_hours_ago(7 * 24)
+        week = (eq - week_base) if week_base is not None else 0.0
+        dd = eq - float(peak or 0)
+        self.set_meta("daily_pnl", f"{daily:.4f}")
+        self.set_meta("week_pnl", f"{week:.4f}")
+        self.set_meta("dd_from_peak", f"{dd:.4f}")
+        return {
+            "daily_pnl": daily,
+            "week_pnl": week,
+            "dd_from_peak": dd,
+            "peak": float(peak or 0),
+            "day_anchor": float(day_anchor),
+            "week_base": week_base,
+        }
+
+    def _append_eq_trail(self, ts: float, equity: float) -> None:
+        try:
+            trail = json.loads(self.get_meta("eq_trail", "[]") or "[]")
+        except json.JSONDecodeError:
+            trail = []
+        if not isinstance(trail, list):
+            trail = []
+        point = {"t": float(ts), "e": round(float(equity), 4)}
+        if trail:
+            try:
+                last_t = float(trail[-1].get("t") or 0)
+            except (TypeError, ValueError, AttributeError):
+                last_t = 0.0
+            if ts - last_t < 3600:
+                trail[-1] = point
+            else:
+                trail.append(point)
+        else:
+            trail.append(point)
+        cutoff = ts - 8 * 24 * 3600
+        cleaned = []
+        for p in trail:
+            if not isinstance(p, dict):
+                continue
+            try:
+                if float(p.get("t") or 0) >= cutoff:
+                    cleaned.append({"t": float(p["t"]), "e": float(p["e"])})
+            except (TypeError, ValueError, KeyError):
+                continue
+        self.set_meta("eq_trail", json.dumps(cleaned))
+
+    def equity_hours_ago(self, hours: float) -> float | None:
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        try:
+            trail = json.loads(self.get_meta("eq_trail", "[]") or "[]")
+        except json.JSONDecodeError:
+            trail = []
+        chosen = None
+        for p in trail:
+            if not isinstance(p, dict):
+                continue
+            try:
+                t = float(p.get("t") or 0)
+                e = float(p.get("e"))
+            except (TypeError, ValueError):
+                continue
+            if t <= cutoff:
+                chosen = e
+        return chosen
+
     def position_mtm(self, p: dict) -> float:
         """Live value = data-api mark. Include winners at 1.0. Never fall back to cost."""
         shares = float(p.get("shares") or 0)
@@ -1015,84 +1130,49 @@ class Store:
         return cash, equity, open_cost, open_mtm
 
     def portfolio_stats(self, equity: float, bankroll: float, open_pos: list[dict]) -> dict:
-        hist = self.equity_history(400)
         start = self.deposited_usd(0.0)
-        cash, equity, open_cost, open_mtm = self.split_cash_equity(bankroll, open_pos)
-        bankroll = cash
+        shown = self.shown_seats(open_pos)
+        open_cost = sum(self.position_cost(p) for p in shown)
+        i_markedet = sum(self.position_mtm(p) for p in shown)
+        cash = max(0.0, float(bankroll or 0))
+        equity = float(equity or 0)
         if start < 1:
             start = 0.0
         total = equity - start if start >= 1 else 0.0
         total_pct = (total / start) if start >= 1 else 0.0
-        now = datetime.now(timezone.utc)
-
-        def _sane(eq: float) -> bool:
-            if eq < 1:
-                return False
-            # Ghost spike: cash+cost (~239) while deposited is 221.
-            if start >= 1 and abs(eq - start) / start > 0.08:
-                return False
-            if open_cost > 1 and abs(eq - (bankroll + open_cost)) < 0.6:
-                return False
-            return True
-
-        def _at(hours: float) -> float:
-            cutoff = now.timestamp() - hours * 3600
-            chosen = start if start >= 1 else equity
-            for row in hist:
-                try:
-                    ts = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    eq = float(row["equity"])
-                    if not _sane(eq):
-                        continue
-                    if ts.timestamp() <= cutoff:
-                        chosen = eq
-                except ValueError:
-                    continue
-            return chosen
-
-        day_base = _at(24)
-        week_base = _at(24 * 7)
-        day = equity - day_base
-        week = equity - week_base
-        peak = start if start > 0 else equity
-        max_dd = 0.0
-        max_dd_usd = 0.0
-        prev = peak
-        for row in hist:
-            eq = float(row["equity"])
-            if not _sane(eq):
-                continue
-            if prev and abs(eq - prev) / max(prev, 1) > 0.12:
-                continue
-            peak = max(peak, eq)
-            dd_usd = eq - peak
-            if peak and dd_usd < max_dd_usd:
-                max_dd_usd = dd_usd
-                max_dd = dd_usd / peak
-            prev = eq
+        day_anchor = self.float_meta("day_anchor_equity")
+        daily = (equity - float(day_anchor)) if day_anchor is not None else 0.0
+        week_base = self.equity_hours_ago(7 * 24)
+        week = (equity - week_base) if week_base is not None else 0.0
+        saved_peak = self.float_meta("peak_equity") or 0.0
+        peak = max(start if start >= 1 else 0.0, saved_peak, equity)
+        dd_usd = equity - peak if peak else 0.0
+        max_dd_pct = (dd_usd / peak) if peak else 0.0
+        day_base = float(day_anchor) if day_anchor is not None else 0.0
         xai_total = self.api_spend(hours=None)
         return {
             "start_equity": round(start, 2) if start >= 1 else 0.0,
             "equity": round(equity, 2),
             "total": round(total, 2),
             "total_pct": round(total_pct, 4),
-            "day": round(day, 2),
-            "day_pct": round(day / day_base, 4) if day_base else 0.0,
+            "day": round(daily, 2),
+            "day_pct": round(daily / day_base, 4) if day_base else 0.0,
             "week": round(week, 2),
-            "week_pct": round(week / week_base, 4) if week_base else 0.0,
-            "max_dd_pct": round(max_dd, 4),
-            "max_dd_usd": round(max_dd_usd, 2),
+            "week_pct": round(week / float(week_base), 4) if week_base else 0.0,
+            "max_dd_pct": round(max_dd_pct, 4),
+            "max_dd_usd": round(dd_usd, 2),
             "trades": self.live_fill_count(),
             "open_cost": round(open_cost, 2),
-            "open_mtm": round(open_mtm, 2),
-            "cash": round(bankroll, 2),
+            "open_mtm": round(i_markedet, 2),
+            "i_markedet": round(i_markedet, 2),
+            "cash": round(cash, 2),
             "xai_total": round(xai_total, 4),
             "xai_day": round(self.api_spend(hours=24), 4),
             "xai_prepaid": round(self.xai_prepaid_usd(), 2),
             "deposited": round(start, 2) if start >= 1 else 0.0,
             "after_xai": round(total - xai_total, 2),
+            "daily_pnl": round(daily, 2),
+            "dd_from_peak": round(dd_usd, 2),
             "top_rejects": self.top_rejects(8),
         }
 

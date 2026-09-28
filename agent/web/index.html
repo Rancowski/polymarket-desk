@@ -239,7 +239,7 @@
       ).join("");
       const lastFill = (s.fills || []).find((f) => !f.dry_run);
       const strip = [
-        ["I markedet", `${s.open || 0} · ${usd(st.open_cost || 0)}`, ""],
+        ["I markedet", `${s.open || 0} · ${usd(st.i_markedet != null ? st.i_markedet : st.open_mtm || 0)}`, ""],
         ["Siste fill", lastFill ? `${lastFill.side} ${usd(lastFill.cost)}` : "ingen", ""],
         ["I dag", `${signed(st.day || 0)} (${pctn(st.day_pct || 0)})`, tone(st.day || 0)],
         ["7 dager", `${signed(st.week || 0)} (${pctn(st.week_pct || 0)})`, tone(st.week || 0)],
@@ -285,8 +285,8 @@
       const c = s.last_cycle;
       if (!c) return "Venter på første syklus.";
       const src = c.by_source || {};
-      const pm = (c.pm_portfolio != null)
-        ? ` · pm_portfolio ${usd(c.pm_portfolio)} pm_available ${usd(c.pm_available)} desk_equity ${usd(c.desk_equity)} desk_cash ${usd(c.desk_cash)} gap ${c.gap != null ? usd(c.gap) : "—"}`
+      const pm = (c.pm_portfolio != null || c.desk_equity != null)
+        ? ` · pm_portfolio ${c.pm_portfolio != null ? usd(c.pm_portfolio) : "—"} desk_equity ${c.desk_equity != null ? usd(c.desk_equity) : "—"} gap ${c.gap != null ? usd(c.gap) : "—"} daily_pnl ${c.daily_pnl != null ? usd(c.daily_pnl) : "—"} dd_from_peak ${c.dd_from_peak != null ? usd(c.dd_from_peak) : "—"}`
         : "";
       return `skannet ${c.scanned || 0} · C ${c.n_complement || src.complement || 0} · K ${c.n_kalshi_clean || src.kalshi || 0} · E ${c.n_partition || src.partition || 0} · M ${c.maker || src.maker || 0} · spr ${c.n_blocked_spread || 0} · solgt ${c.sold != null ? c.sold : (c.exits || 0)} · kjøpt ${c.bought || 0} · redeem_ok ${c.redeem_ok || 0}${pm} · neste ${countdown(s)}`;
     }
