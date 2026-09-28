@@ -740,6 +740,13 @@ CALENDAR_PAIR_FIXTURES: tuple[tuple[str, str, str, float, float], ...] = (
         0.40,
         0.42,
     ),
+    (
+        "Will Hormuz traffic stay normal through December 31 2026",
+        "KXHORMUZNORM-26MAR17",
+        "Hormuz traffic March 17",
+        0.45,
+        0.47,
+    ),
 )
 
 

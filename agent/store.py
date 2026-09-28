@@ -707,6 +707,42 @@ class Store:
             row = cur.fetchone()
         return dict(row) if row else None
 
+    def grouped_rejects(self, limit: int = 20) -> list[tuple[str, int]]:
+        """Last N reject/skip reasons, grouped by reason text."""
+        rows = self.recent_decisions(120)
+        picked: list[str] = []
+        for r in rows:
+            if str(r.get("action") or "") not in {"reject", "skip"}:
+                continue
+            picked.append(str(r.get("reason") or "—")[:90])
+            if len(picked) >= limit:
+                break
+        counts: dict[str, int] = {}
+        for reason in picked:
+            counts[reason] = counts.get(reason, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def leak_fills_since(self, sources: tuple[str, ...], since_ts: str) -> list[dict]:
+        """Fills tagged grok/stats after freeze_ts. Empty since_ts = all such fills."""
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT ts, question, side, source, source_detail, cost, dry_run
+                FROM fills WHERE source IN ({})
+                ORDER BY id DESC LIMIT 50
+                """.format(",".join("?" * len(sources))),
+                tuple(sources),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        if not since_ts:
+            return rows
+        out = []
+        for r in rows:
+            ts = str(r.get("ts") or "")
+            if ts >= since_ts:
+                out.append(r)
+        return out
+
     def recent_decisions(self, limit: int = 80) -> list[dict]:
         with self._lock:
             cur = self.conn.execute(

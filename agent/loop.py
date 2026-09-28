@@ -10,7 +10,7 @@ from typing import Any
 
 from agent.arb import Arb
 from agent.brain import Brain
-from agent.config import SKIP_QUESTION_PATTERNS, settings
+from agent.config import SKIP_QUESTION_PATTERNS, live_forbidden, settings
 from agent.executor import Executor
 from agent.risk import (
     MAX_SPORTS,
@@ -30,6 +30,24 @@ from agent.kalshi import _pm_family, extract_tickers, keep_fed_h25, pair_ok
 from agent.store import Store
 
 log = logging.getLogger("desk")
+
+
+def _git_sha() -> str:
+    try:
+        import subprocess
+
+        from agent.config import ROOT
+
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(ROOT),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return (out or "").strip() or "?"
+    except Exception:
+        return "?"
+
 GROK_BATCH_N = 15
 _KX_TICKER_RE = re.compile(
     r"\b(?:KX[A-Z0-9-]{4,}|CONTROLH-[A-Z0-9-]+|PRES-[A-Z0-9-]+|KXSENATE[A-Z0-9-]*)\b",
@@ -224,6 +242,9 @@ class Desk:
         from agent.kalshi import pair_ok_selfcheck
 
         pair_ok_selfcheck()
+        if not self.store.get_meta("freeze_ts"):
+            self.store.set_meta("freeze_ts", datetime.now(timezone.utc).isoformat())
+            self.store.set_meta("freeze_sha", _git_sha())
         threading.Thread(target=self._bootstrap_portfolio, daemon=True, name="desk-boot").start()
 
     def begin_cycle_async(self) -> bool:
@@ -244,7 +265,32 @@ class Desk:
         threading.Thread(target=_run, daemon=True, name="desk-once").start()
         return True
 
+    def qa_report(self) -> str:
+        from agent.arb import STATS_ENABLED
+
+        sha = _git_sha()
+        seats = len(self.store.positions("open"))
+        grouped = self.store.grouped_rejects(20)
+        freeze_ts = self.store.get_meta("freeze_ts", "")
+        leaks = self.store.leak_fills_since(("grok", "stats"), freeze_ts)
+        lines = [
+            f"QA freeze sha={sha} DRY_RUN={settings.dry_run} stats_enabled={STATS_ENABLED} seats={seats}",
+            "rejects: " + (", ".join(f"{n}× {r}" for r, n in grouped) if grouped else "none"),
+            f"leaks grok/stats fills since freeze: {len(leaks)}" + (" LEAK" if leaks else ""),
+        ]
+        for row in leaks[:8]:
+            lines.append(
+                f"  LEAK {row.get('source')} {(row.get('question') or '')[:56]} ts={row.get('ts')}"
+            )
+        text = "\n".join(lines)
+        log.info("%s", text.replace("\n", " | "))
+        return text
+
     def cycle(self) -> dict:
+        block = live_forbidden()
+        if block:
+            log.error("%s", block)
+            return {"ok": False, "reason": block}
         if not self.cycle_lock.acquire(blocking=False):
             return {"ok": False, "reason": "syklus kjører allerede"}
         self.busy = True
@@ -570,6 +616,15 @@ class Desk:
         base.update(kwargs)
         if "sold" not in kwargs:
             base["sold"] = sold
+        base["qa"] = self.qa_report()
+        try:
+            self.store.log_decision(
+                action="qa",
+                question="QA freeze",
+                reason=str(base.get("qa") or "")[:220],
+            )
+        except Exception:
+            pass
         self.last_cycle = base
         return base
 
@@ -1009,6 +1064,10 @@ class Desk:
             )
 
     def _cycle(self) -> dict:
+        block = live_forbidden()
+        if block:
+            log.error("%s", block)
+            return self._finish_cycle(halted=True, reason=block)
         halt = self.risk.halted()
         self.last_error = None
         self._cycle_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1251,6 +1310,10 @@ class Desk:
         return {"ok": True, **self.last_cycle}
 
     def run_forever(self) -> None:
+        block = live_forbidden()
+        if block:
+            log.error("%s", block)
+            raise SystemExit(2)
         log.info("Desk kjører. DRY_RUN=%s interval=%ss", settings.dry_run, settings.loop_seconds)
         while True:
             try:

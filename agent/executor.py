@@ -633,6 +633,18 @@ class Executor:
         return None
 
     def submit(self, ticket: Ticket) -> dict:
+        src = str(getattr(ticket, "source", "") or "")
+        if src not in {"complement", "kalshi", "partition", "maker"}:
+            log.error("freeze: blocked buy source=%s %s", src, (ticket.question or "")[:60])
+            return {
+                "status": "blocked",
+                "reason": f"freeze: source={src or '—'} not complement/kalshi/partition",
+                "ticket": {
+                    "condition_id": ticket.condition_id,
+                    "question": ticket.question,
+                    "source": src,
+                },
+            }
         payload = {
             "condition_id": ticket.condition_id,
             "question": ticket.question,

@@ -633,6 +633,8 @@ class Risk:
         min_edge: float | None = None,
         probe: bool = False,
     ) -> tuple[Ticket | None, str]:
+        _ = (market, book, estimate, bankroll, equity, min_edge, probe)
+        return None, "grok-log-only"
         deposited = self.store.deposited_usd(0.0)
         block = self.buys_blocked(equity, deposited)
         if block:

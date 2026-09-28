@@ -239,8 +239,9 @@ class Arb:
             taken = {t.condition_id for t in tickets}
             tickets.extend(self._partition(markets, bankroll, open_ids | taken, sports_n, sports_halt, open_pos))
             taken = {t.condition_id for t in tickets}
-            tickets.extend(self._favorites(markets, bankroll, open_ids | taken, sports_n, sports_halt))
-            taken = {t.condition_id for t in tickets}
+            if STATS_ENABLED:
+                tickets.extend(self._favorites(markets, bankroll, open_ids | taken, sports_n, sports_halt))
+                taken = {t.condition_id for t in tickets}
             tickets.extend(self._makers(markets, bankroll, open_ids | taken))
         self.n_complement = sum(1 for t in tickets if t.source == "complement")
         self.n_kalshi_clean = sum(1 for t in tickets if t.source == "kalshi")

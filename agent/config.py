@@ -105,6 +105,31 @@ FEE_RATE = {
     "other": 0.05,
 }
 
+def env_dry_run_false() -> bool:
+    """True if .env explicitly sets DRY_RUN to false. Does not write .env."""
+    path = ROOT / ".env"
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("DRY_RUN="):
+            continue
+        val = s.split("=", 1)[1].strip().strip('"').strip("'").lower()
+        return val in {"0", "false", "no", "off"}
+    return False
+
+
+def live_forbidden() -> str | None:
+    """Refuse the loop when DRY_RUN is false. Never flip DRY_RUN."""
+    if env_dry_run_false() or not settings.dry_run:
+        return "HARD STOP: DRY_RUN is false — refuse to start. Do not flip DRY_RUN."
+    return None
+
+
 SKIP_QUESTION_PATTERNS = (
     "up or down",
     "up/down",
