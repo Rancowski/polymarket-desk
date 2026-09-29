@@ -813,8 +813,14 @@ def _series_cooling(series: str) -> bool:
 
 
 def _mark_429(series: str) -> None:
-    _SERIES_BACKOFF[str(series)] = time.time() + _BACKOFF_SEC
-    log.warning("Kalshi 429 på %s — backoff 15 min, fortsetter katalogen", series)
+    until = datetime.now(timezone.utc).timestamp() + _BACKOFF_SEC
+    _SERIES_BACKOFF[str(series)] = until
+    until_iso = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
+    log.warning(
+        "Kalshi 429 series=%s until=%s — fortsetter katalogen",
+        series,
+        until_iso,
+    )
 
 
 def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[str], pages: int = 2) -> int:

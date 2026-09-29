@@ -412,6 +412,7 @@ class Executor:
         self._client = None
         self._sdk = "v1"
         self._pm_snap: tuple[float, dict] | None = None
+        self._last_ghosts: list[dict] = []
 
     def _attach_creds(self, client: Any, v2: bool) -> None:
         if settings.poly_api_key and settings.poly_api_secret:
@@ -725,12 +726,46 @@ class Executor:
             log.warning("cancel_open: %s", exc)
         return n
 
+    def _raw_size_mid(self, p: dict) -> tuple[float, float]:
+        try:
+            size = float(p.get("size") or p.get("shares") or p.get("current_size") or 0)
+        except (TypeError, ValueError):
+            size = 0.0
+        try:
+            mid = float(
+                p.get("curPrice")
+                or p.get("currPrice")
+                or p.get("current_price")
+                or p.get("cur_price")
+                or 0
+            )
+        except (TypeError, ValueError):
+            mid = 0.0
+        return size, mid
+
+    def _take_live_row(self, p: dict, out: list[dict], ghosts: list[dict]) -> None:
+        size, mid = self._raw_size_mid(p)
+        cid = str(p.get("conditionId") or p.get("condition_id") or "").strip() or "?"
+        if size <= 1e-6 or mid <= 0.01:
+            ghosts.append({"id": cid[:18], "size": size, "mid": mid})
+            return
+        row = self._norm_position(p)
+        if row:
+            out.append(row)
+
+    def _finish_live_pos(self, out: list[dict], ghosts: list[dict]) -> list[dict]:
+        seats = [r for r in out if is_open_seat(r)]
+        self._last_ghosts = ghosts
+        log.info("Live posisjoner: %s", len(seats))
+        return seats
+
     def fetch_live_positions(self) -> list[dict] | None:
         """data-api seats: size>0 and mid>0.01. None = fetch failed, keep local."""
         funder = (settings.funder or "").strip()
         if not funder:
             return None
         out: list[dict] = []
+        ghosts: list[dict] = []
         cursor = None
         got = False
         try:
@@ -753,9 +788,7 @@ class Executor:
                 for p in rows:
                     if not isinstance(p, dict):
                         continue
-                    row = self._norm_position(p)
-                    if row:
-                        out.append(row)
+                    self._take_live_row(p, out, ghosts)
                 pag = data.get("pagination") if isinstance(data, dict) else {}
                 nxt = (pag or {}).get("next_cursor")
                 if (pag or {}).get("has_more") and nxt:
@@ -766,9 +799,7 @@ class Executor:
             log.warning("data-api v2 positions: %s", exc)
             got = False
         if got:
-            out = [r for r in out if is_open_seat(r)]
-            log.info("Live posisjoner: %s", len(out))
-            return out
+            return self._finish_live_pos(out, ghosts)
         try:
             data = self._data_api_json(
                 "/positions",
@@ -779,15 +810,12 @@ class Executor:
                 return None
             rows = data if isinstance(data, list) else (data.get("positions") or data.get("data") or [])
             out = []
+            ghosts = []
             for p in rows:
                 if not isinstance(p, dict):
                     continue
-                row = self._norm_position(p)
-                if row:
-                    out.append(row)
-            out = [r for r in out if is_open_seat(r)]
-            log.info("Live posisjoner: %s", len(out))
-            return out
+                self._take_live_row(p, out, ghosts)
+            return self._finish_live_pos(out, ghosts)
         except Exception as exc:
             log.warning("data-api v1 positions: %s", exc)
         return None

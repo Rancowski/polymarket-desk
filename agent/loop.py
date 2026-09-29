@@ -298,6 +298,21 @@ class Desk:
             "rejects: " + (", ".join(f"{n}× {r}" for r, n in grouped) if grouped else "none"),
             f"leaks grok/stats fills since freeze: {len(leaks)}" + (" LEAK" if leaks else ""),
         ]
+        try:
+            attr = self.store.attribution_stats(
+                self.store.shown_seats(self.store.positions("open"))
+            )
+            r24 = attr.get("realized_24h")
+        except Exception:
+            r24 = None
+        n_now = self.store.n_resolves_stamped_now()
+        fail_24 = int(n_now or 0) != 0
+        lines.append(
+            f"realized_24t={r24} n_resolves_stamped_now={n_now}"
+            + (" FAIL" if fail_24 else "")
+        )
+        if fail_24:
+            log.error("FAIL n_resolves_stamped_now=%s (must be 0)", n_now)
         if fail_eq:
             log.error("FAIL abs(desk_equity - pm_portfolio)=%.2f > 1.00", abs(float(gap or 0)))
         if fail_mkt:
@@ -379,6 +394,18 @@ class Desk:
         self.store.set_meta("pm_gap", f"{gap:.4f}")
         self.store.set_meta("i_markedet", f"{i_markedet:.4f}")
         self.store.set_meta("pm_open", str(len(shown)))
+        live_n = len(live_pos) if live_pos is not None else None
+        if live_n is not None and live_n != len(shown):
+            ghosts = getattr(self.exec, "_last_ghosts", []) or []
+            bits = "; ".join(
+                f"{g.get('id')} size={g.get('size')} mid={g.get('mid')}" for g in ghosts[:20]
+            )
+            log.warning(
+                "Live posisjoner: %s header seats: %s dropped ghosts: %s",
+                live_n,
+                len(shown),
+                bits or "none",
+            )
         daily = float(anchors.get("daily_pnl") or 0)
         dd = float(anchors.get("dd_from_peak") or 0)
         log.info(
@@ -712,6 +739,24 @@ class Desk:
         for cid, rows in winners.items():
             if self.store.get_meta(f"redeem_ok:{cid}", ""):
                 self.store.close_position(cid)
+                if settings.dry_run:
+                    pos0 = rows[0]
+                    why = "paper_redeem already"
+                    if cid not in logged:
+                        self.store.log_decision(
+                            condition_id=cid,
+                            question=pos0.get("question"),
+                            side=pos0.get("side"),
+                            action="paper_redeem",
+                            reason=why,
+                        )
+                        logged.add(cid)
+                    log_rows.append(_row(pos0, "paper_redeem", why))
+                    log.info(
+                        "paper_redeem %s %s",
+                        (pos0.get("question") or "")[:50],
+                        why,
+                    )
                 continue
             if self._redeem_cooldown(cid):
                 why = "redeem_err cooldown 30m"
@@ -897,6 +942,7 @@ class Desk:
                     settings.dry_run
                     and str(side or "YES").upper() == "YES"
                     and "resolved — redeem" in str(why or "")
+                    and not self.store.get_meta(f"redeem_ok:{cid}", "")
                 ):
                     try:
                         result_r = self.exec.redeem(pos)

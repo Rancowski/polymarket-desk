@@ -701,6 +701,13 @@ class Store:
         side = f"REDEEM_{yn}" if src == "redeem" else f"RESOLVE_{yn}"
         paper = not self._leg_has_live_buy(cid, yn)
         closed_at = self._resolution_ts(pos)
+        if not closed_at:
+            log.warning(
+                "resolve fill skip now() stamp %s %s",
+                yn,
+                str(pos.get("question") or cid)[:60],
+            )
+            return False
         self.add_fill(
             condition_id=cid,
             side=side,
@@ -807,11 +814,11 @@ class Store:
             got = _parse_iso_ts(pos.get(key))
             if got:
                 return got
-        return utc_now()
+        return None
 
     def backfill_resolve_timestamps(self) -> int:
         """Rewrite imported RESOLVE_* fill ts to original closed_at / matching buy."""
-        if self.get_meta("resolve_ts_v1", ""):
+        if self.get_meta("resolve_ts_v2", ""):
             return 0
         n = 0
         with self._lock:
@@ -836,7 +843,7 @@ class Store:
             }
             ts = self._resolution_ts(pos)
             old = _parse_iso_ts(row.get("ts"))
-            if not ts or ts == old:
+            if not ts:
                 continue
             try:
                 ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -846,13 +853,48 @@ class Store:
                     continue
             except ValueError:
                 continue
+            if ts == old and _parse_iso_ts(data.get("closed_at")) == ts:
+                continue
+            data["closed_at"] = ts
             with self._lock:
-                self.conn.execute("UPDATE fills SET ts=? WHERE id=?", (ts, row["id"]))
+                self.conn.execute(
+                    "UPDATE fills SET ts=?, raw=? WHERE id=?",
+                    (ts, json.dumps(data, default=str), row["id"]),
+                )
                 self.conn.commit()
             n += 1
-        self.set_meta("resolve_ts_v1", utc_now())
+        self.set_meta("resolve_ts_v2", utc_now())
         if n:
             log.info("backfill resolve timestamps: %s", n)
+        return n
+
+    def n_resolves_stamped_now(self, window_s: float = 120.0) -> int:
+        """RESOLVE fills whose ts is wall-clock now — imported rows must be 0."""
+        now = datetime.now(timezone.utc)
+        n = 0
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT ts, raw FROM fills
+                WHERE side LIKE 'RESOLVE%' OR IFNULL(source,'')='resolve'
+                """
+            )
+            rows = list(cur.fetchall())
+        for row in rows:
+            data = _raw_dict(row["raw"])
+            ts = _parse_iso_ts(data.get("closed_at")) or _parse_iso_ts(row["ts"])
+            if not ts:
+                n += 1
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                n += 1
+                continue
+            if abs((now - dt).total_seconds()) <= window_s:
+                n += 1
         return n
 
     def deposited_since(self) -> datetime | None:
@@ -1623,6 +1665,11 @@ class Store:
                 },
             )
             ts = _parse_ts(f.get("ts"))
+            su = normalize_side(f.get("side"))
+            if su.startswith("RESOLVE") or str(f.get("source") or "").lower() == "resolve":
+                closed = _parse_ts(_raw_dict(f.get("raw")).get("closed_at"))
+                if closed:
+                    ts = closed
             if ts and (g["first_ts"] is None or ts < g["first_ts"]):
                 g["first_ts"] = ts
             if ts and (g["last_ts"] is None or ts > g["last_ts"]):
