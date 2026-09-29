@@ -912,6 +912,8 @@ class Risk:
                 if live < 0.98:
                     return None, "resolved — redeem"
             if live >= 0.98:
+                if settings.dry_run and side == "YES":
+                    return None, "resolved — redeem"
                 return self._exit_ticket(
                     pos, book, shares, live,
                     f"ta {live:.3f} ≥0.98",

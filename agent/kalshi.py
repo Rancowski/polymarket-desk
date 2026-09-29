@@ -249,6 +249,8 @@ SERIES = (
 _SERIES_CACHE: tuple[float, list[str]] = (0.0, [])
 _SERIES_META: list[dict] = []
 _FETCHED_N: dict[str, int] = {}
+_SERIES_BACKOFF: dict[str, float] = {}
+_BACKOFF_SEC = 15 * 60
 _TAPE_FREQ = ("fifteen_min", "five_min", "five min", "15m", "5m", "1-minute", "1 min")
 _TAPE_TICK = re.compile(r"(15M|5M|1H)$", re.I)
 
@@ -805,7 +807,19 @@ def keep_fed_h25(pm_q: str, ticker: str) -> bool:
     return ok
 
 
+def _series_cooling(series: str) -> bool:
+    until = _SERIES_BACKOFF.get(str(series), 0.0)
+    return time.time() < until
+
+
+def _mark_429(series: str) -> None:
+    _SERIES_BACKOFF[str(series)] = time.time() + _BACKOFF_SEC
+    log.warning("Kalshi 429 på %s — backoff 15 min, fortsetter katalogen", series)
+
+
 def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[str], pages: int = 2) -> int:
+    if _series_cooling(series):
+        return 0
     n = 0
     cursor = None
     try:
@@ -814,6 +828,9 @@ def _fetch_one_series(host: str, series: str, collected: list[dict], seen: set[s
             if cursor:
                 params["cursor"] = cursor
             r = requests.get(f"{host}/markets", params=params, timeout=12)
+            if r.status_code == 429:
+                _mark_429(series)
+                break
             if r.status_code >= 400:
                 break
             data = r.json() or {}
@@ -860,6 +877,9 @@ def expand_catalog(collected: list[dict], markets: list[dict], host: str | None 
             break
     added = 0
     for series in extra:
+        if _series_cooling(series):
+            log.info("Kalshi %s: backoff, hopper", series)
+            continue
         added += _fetch_one_series(host, series, collected, seen, pages=2)
         have.add(series)
     if extra:
@@ -877,6 +897,9 @@ def fetch_open(limit: int = 400) -> list[dict]:
         host_n = 0
         series_list = _discover_series(host)
         for series in series_list:
+            if _series_cooling(series):
+                log.info("Kalshi %s: backoff, hopper", series)
+                continue
             cursor = None
             series_n = 0
             try:
@@ -891,7 +914,7 @@ def fetch_open(limit: int = 400) -> list[dict]:
                         params["cursor"] = cursor
                     r = requests.get(f"{host}/markets", params=params, timeout=12)
                     if r.status_code == 429:
-                        log.warning("Kalshi 429 på %s — stopper serier", series)
+                        _mark_429(series)
                         break
                     if r.status_code >= 400:
                         break

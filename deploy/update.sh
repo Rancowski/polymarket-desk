@@ -88,6 +88,8 @@ try:
 except Exception as exc:
     print("commit sha:", exc)
 Path(root, "agent", "COMMIT").write_text(sha + "\n", encoding="utf-8")
+Path(root, "deploy").mkdir(parents=True, exist_ok=True)
+Path(root, "deploy", "VERSION").write_text(sha + "\n", encoding="utf-8")
 print("release", sha)
 PY
 if [ -x "$ROOT/.venv/bin/pip" ]; then

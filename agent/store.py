@@ -69,6 +69,52 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_ts(raw: Any) -> str | None:
+    """Normalize a timestamp to UTC isoformat. None if unusable."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            v = float(raw)
+            if v > 1e12:
+                v /= 1000.0
+            if v > 1e9:
+                return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            return None
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.isoformat()
+    except ValueError:
+        return None
+
+
+def is_open_seat(p: dict | None) -> bool:
+    """Shown seat: size>0 (not ≈0) and mid>0.01. Ghosts are not seats."""
+    if not p:
+        return False
+    try:
+        shares = float(p.get("shares") or p.get("size") or 0)
+    except (TypeError, ValueError):
+        return False
+    if shares <= 1e-6:
+        return False
+    try:
+        mid = float(
+            p.get("cur_price")
+            or p.get("curPrice")
+            or p.get("currPrice")
+            or p.get("current_price")
+            or 0
+        )
+    except (TypeError, ValueError):
+        mid = 0.0
+    return mid > 0.01
+
+
 def normalize_side(side: Any) -> str:
     s = str(side or "").upper().replace(" ", "_")
     return _SIDE_MAP.get(s, s)
@@ -204,6 +250,7 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self._init()
         self.backfill_resolved_closes()
+        self.backfill_resolve_timestamps()
 
     def _init(self) -> None:
         with self._lock:
@@ -653,6 +700,7 @@ class Store:
         src = "redeem" if source == "redeem" else "resolve"
         side = f"REDEEM_{yn}" if src == "redeem" else f"RESOLVE_{yn}"
         paper = not self._leg_has_live_buy(cid, yn)
+        closed_at = self._resolution_ts(pos)
         self.add_fill(
             condition_id=cid,
             side=side,
@@ -665,12 +713,14 @@ class Store:
             source=src,
             source_detail="worthless" if proceeds_f <= 0 else src,
             cycle_id=self.get_meta("cycle_id") or None,
+            ts=closed_at,
             raw={
                 src: True,
                 "status": "matched",
                 "takingAmount": str(proceeds_f),
                 "question": pos.get("question"),
                 "source": src,
+                "closed_at": closed_at,
             },
         )
         log.info(
@@ -700,6 +750,109 @@ class Store:
         self.set_meta("resolve_backfill_v1", utc_now())
         if n:
             log.info("backfill resolved closes: %s", n)
+        return n
+
+    def _first_buy_ts(self, condition_id: str, side: str | None) -> str | None:
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if yn.startswith("BUY_"):
+            yn = yn[4:]
+        if not cid:
+            return None
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT ts, side FROM fills WHERE condition_id=? ORDER BY id ASC",
+                (cid,),
+            )
+            rows = cur.fetchall()
+            pos = self.conn.execute(
+                "SELECT opened_ts, last_ts FROM positions WHERE condition_id=? AND UPPER(COALESCE(side,'YES'))=?",
+                (cid, yn),
+            ).fetchone()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su.startswith("BUY_") and (su[4:] or "YES") == yn:
+                got = _parse_iso_ts(row["ts"])
+                if got:
+                    return got
+        if pos:
+            for key in ("opened_ts", "last_ts"):
+                got = _parse_iso_ts(pos[key])
+                if got:
+                    return got
+        return None
+
+    def _resolution_ts(self, pos: dict) -> str:
+        """closed_at from data-api or matching buy. Never wall-clock now() when history exists."""
+        for key in (
+            "closed_at",
+            "closedTime",
+            "endDate",
+            "end_date",
+            "resolved_at",
+            "resolvedAt",
+        ):
+            got = _parse_iso_ts(pos.get(key))
+            if got:
+                return got
+        data = _raw_dict(pos.get("raw"))
+        for key in ("closed_at", "closedTime", "endDate", "end_date", "resolved_at"):
+            got = _parse_iso_ts(data.get(key))
+            if got:
+                return got
+        buy = self._first_buy_ts(str(pos.get("condition_id") or ""), pos.get("side"))
+        if buy:
+            return buy
+        for key in ("opened_ts", "last_ts"):
+            got = _parse_iso_ts(pos.get(key))
+            if got:
+                return got
+        return utc_now()
+
+    def backfill_resolve_timestamps(self) -> int:
+        """Rewrite imported RESOLVE_* fill ts to original closed_at / matching buy."""
+        if self.get_meta("resolve_ts_v1", ""):
+            return 0
+        n = 0
+        with self._lock:
+            cur = self.conn.execute(
+                """
+                SELECT id, condition_id, side, ts, raw, source
+                FROM fills
+                WHERE side LIKE 'RESOLVE%' OR IFNULL(source,'')='resolve'
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            data = _raw_dict(row.get("raw"))
+            su = normalize_side(row.get("side"))
+            yn = (su[8:] or "YES") if su.startswith("RESOLVE_") else "YES"
+            pos = {
+                "condition_id": row.get("condition_id"),
+                "side": yn,
+                "closed_at": data.get("closed_at"),
+                "raw": data,
+            }
+            ts = self._resolution_ts(pos)
+            old = _parse_iso_ts(row.get("ts"))
+            if not ts or ts == old:
+                continue
+            try:
+                ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts_dt.tzinfo is None:
+                    ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+                if abs((now - ts_dt).total_seconds()) < 120:
+                    continue
+            except ValueError:
+                continue
+            with self._lock:
+                self.conn.execute("UPDATE fills SET ts=? WHERE id=?", (ts, row["id"]))
+                self.conn.commit()
+            n += 1
+        self.set_meta("resolve_ts_v1", utc_now())
+        if n:
+            log.info("backfill resolve timestamps: %s", n)
         return n
 
     def deposited_since(self) -> datetime | None:
@@ -809,6 +962,7 @@ class Store:
         edge_net = row.get("edge_net") if "edge_net" in row else data.get("edge_net")
         gap_c = row.get("gap_c") if "gap_c" in row else data.get("gap_c")
         cycle_id = row.get("cycle_id") if row.get("cycle_id") is not None else data.get("cycle_id")
+        ts = _parse_iso_ts(row.get("ts")) or utc_now()
         with self._lock:
             self.conn.execute(
                 """
@@ -820,7 +974,7 @@ class Store:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    utc_now(),
+                    ts,
                     row.get("condition_id"),
                     question,
                     token_id,
@@ -1167,22 +1321,7 @@ class Store:
 
     def shown_seats(self, open_pos: list[dict]) -> list[dict]:
         """Seats shown in Posisjoner: size>0 and mid>0.01."""
-        out: list[dict] = []
-        for p in open_pos or []:
-            try:
-                shares = float(p.get("shares") or 0)
-            except (TypeError, ValueError):
-                continue
-            if shares <= 0:
-                continue
-            try:
-                mid = float(p.get("cur_price") or 0)
-            except (TypeError, ValueError):
-                mid = 0.0
-            if mid <= 0.01:
-                continue
-            out.append(p)
-        return out
+        return [p for p in (open_pos or []) if is_open_seat(p)]
 
     def markedet_sum(self, open_pos: list[dict]) -> float:
         return sum(self.position_mtm(p) for p in self.shown_seats(open_pos))
@@ -1425,11 +1564,12 @@ class Store:
 
     def attribution_stats(self, open_pos: list[dict] | None = None) -> dict:
         open_pos = open_pos if open_pos is not None else self.positions("open")
+        shown = self.shown_seats(open_pos)
         deposited = self.deposited_usd(0.0)
-        open_cost = sum(self.position_cost(p) for p in open_pos)
-        open_mtm = sum(self.position_mtm(p) for p in open_pos)
+        open_cost = sum(self.position_cost(p) for p in shown)
+        open_mtm = sum(self.position_mtm(p) for p in shown)
         unrealized = open_mtm - open_cost
-        seats = len(open_pos)
+        seats = len(shown)
         open_pct = (open_cost / deposited) if deposited >= 1 else 0.0
         fills = self._matched_fills()
         now = datetime.now(timezone.utc)

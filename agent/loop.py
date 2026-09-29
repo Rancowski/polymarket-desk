@@ -33,20 +33,9 @@ log = logging.getLogger("desk")
 
 
 def _git_sha() -> str:
-    try:
-        import subprocess
+    from agent.version import release
 
-        from agent.config import ROOT
-
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(ROOT),
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-        return (out or "").strip() or "?"
-    except Exception:
-        return "?"
+    return release()
 
 GROK_BATCH_N = 15
 _KX_TICKER_RE = re.compile(
@@ -708,6 +697,16 @@ class Desk:
                 continue
             if state == "winner":
                 winners.setdefault(cid, []).append(pos)
+                continue
+            if settings.dry_run and str(pos.get("side") or "YES").upper() == "YES":
+                live_bid = 0.0
+                if book and not book.get("synthetic"):
+                    try:
+                        live_bid = float(book.get("best_bid") or 0)
+                    except (TypeError, ValueError):
+                        live_bid = 0.0
+                if live_bid >= 0.98:
+                    winners.setdefault(cid, []).append(pos)
 
         ready: list[dict] = []
         for cid, rows in winners.items():
@@ -733,6 +732,7 @@ class Desk:
             nonlocal n
             status = str(result.get("status") or "redeem_ok")
             txh = str(result.get("tx") or "")
+            action = "paper_redeem" if status == "paper_redeem" else "redeem_ok"
             why = f"{status} tx={txh[:18] if txh else '—'}"
             self.store.set_meta(f"redeem_err:{cid}", "")
             if cid not in logged:
@@ -740,13 +740,13 @@ class Desk:
                     condition_id=cid,
                     question=rows[0].get("question"),
                     side=rows[0].get("side"),
-                    action="redeem_ok",
+                    action=action,
                     reason=why,
                 )
                 logged.add(cid)
-            log_rows.append(_row(rows[0], "redeem_ok", why))
+            log_rows.append(_row(rows[0], action, why))
             n += 1
-            log.info("redeem_ok %s %s", (rows[0].get("question") or "")[:50], why)
+            log.info("%s %s %s", action, (rows[0].get("question") or "")[:50], why)
 
         def _err(cid: str, rows: list, exc: Exception) -> None:
             why = f"redeem_err {exc}"[:220]
@@ -893,6 +893,28 @@ class Desk:
                 market=mkt,
             )
             if not ticket_ex:
+                if (
+                    settings.dry_run
+                    and str(side or "YES").upper() == "YES"
+                    and "resolved — redeem" in str(why or "")
+                ):
+                    try:
+                        result_r = self.exec.redeem(pos)
+                        st = str(result_r.get("status") or "")
+                        if st in {"redeem_ok", "paper_redeem"}:
+                            action = "paper_redeem" if st == "paper_redeem" else "redeem_ok"
+                            sold += 1
+                            self.store.log_decision(
+                                condition_id=cid,
+                                question=pos.get("question"),
+                                side=side,
+                                action=action,
+                                reason=why,
+                            )
+                            log_rows.append(_row(action, why))
+                            continue
+                    except Exception as exc:
+                        why = f"redeem_err {exc}"[:220]
                 self.store.log_decision(
                     condition_id=cid,
                     question=pos.get("question"),
@@ -994,7 +1016,7 @@ class Desk:
                                 result_r = self.exec.redeem(pos)
                                 st = str(result_r.get("status") or "")
                                 if st in {"redeem_ok", "paper_redeem"}:
-                                    action = "redeem_ok"
+                                    action = "paper_redeem" if st == "paper_redeem" else "redeem_ok"
                                     sold += 1
                                     reason = f"{st} ingen live bud · {reason}"
                                     self.store.set_meta(f"redeem_err:{cid_s}", "")
@@ -1130,7 +1152,9 @@ class Desk:
                 except Exception as exc:
                     log.warning("post-redeem sync: %s", exc)
                     open_pos = self.store.positions("open")
-        n_redeem_ok = sum(1 for r in redeem_log if r.get("action") == "redeem_ok")
+        n_redeem_ok = sum(
+            1 for r in redeem_log if r.get("action") in {"redeem_ok", "paper_redeem"}
+        )
         if halt or locked:
             reason = locked or halt
             log.warning("Stoppet: %s", reason)
@@ -1203,7 +1227,10 @@ class Desk:
         sold_n, exit_log = self._run_exits(open_pos, {}, by_id, equity=equity, extra_force=part_force)
         exit_log = redeem_log + exit_log
         exits = redeems + sold_n
-        open_pos = self.store.positions("open")
+        n_redeem_ok = sum(
+            1 for r in exit_log if r.get("action") in {"redeem_ok", "paper_redeem"}
+        )
+        open_pos = self.store.shown_seats(self.store.positions("open"))
         bankroll, equity, open_pos = bankroll, equity, open_pos
         arb_tickets = self.arb.scan(markets, bankroll, equity=equity)
         arb_n = 0

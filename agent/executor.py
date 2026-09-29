@@ -10,7 +10,7 @@ import requests
 
 from agent.config import live_forbidden, settings
 from agent.risk import Ticket, is_sports
-from agent.store import Store, kalshi_fields_ok, normalize_side, normalize_source
+from agent.store import Store, is_open_seat, kalshi_fields_ok, normalize_side, normalize_source
 
 log = logging.getLogger("exec")
 
@@ -589,7 +589,7 @@ class Executor:
             size = float(p.get("size") or p.get("shares") or p.get("current_size") or 0)
         except (TypeError, ValueError):
             return None
-        if size <= 0:
+        if size <= 1e-6:
             return None
         cid = str(p.get("conditionId") or p.get("condition_id") or "").strip()
         if not cid:
@@ -617,7 +617,15 @@ class Executor:
             mtm = float(api_val) if api_val not in (None, "") else (size * cur if cur else 0)
         except (TypeError, ValueError):
             mtm = size * cur if cur else 0
-        return {
+        closed_at = (
+            p.get("closedTime")
+            or p.get("closed_at")
+            or p.get("endDate")
+            or p.get("end_date")
+            or p.get("resolvedAt")
+            or p.get("resolved_at")
+        )
+        row = {
             "condition_id": cid,
             "question": label,
             "outcome": outcome,
@@ -632,8 +640,12 @@ class Executor:
             "redeemable": bool(p.get("redeemable")),
             "neg_risk": bool(p.get("negativeRisk") or p.get("negative_risk") or p.get("negRisk") or p.get("neg_risk")),
             "closed": bool(p.get("closed") or p.get("resolved")),
+            "closed_at": closed_at,
             "status": "open",
         }
+        if not is_open_seat(row):
+            return None
+        return row
 
     def fetch_pm_snapshot(self, *, force: bool = False) -> dict:
         """data-api positions + MTM; available = pUSD of that user. Never CLOB cache."""
@@ -754,7 +766,8 @@ class Executor:
             log.warning("data-api v2 positions: %s", exc)
             got = False
         if got:
-            log.info("Live posisjoner fra data-api v2: %s", len(out))
+            out = [r for r in out if is_open_seat(r)]
+            log.info("Live posisjoner: %s", len(out))
             return out
         try:
             data = self._data_api_json(
@@ -772,7 +785,8 @@ class Executor:
                 row = self._norm_position(p)
                 if row:
                     out.append(row)
-            log.info("Live posisjoner fra data-api v1: %s", len(out))
+            out = [r for r in out if is_open_seat(r)]
+            log.info("Live posisjoner: %s", len(out))
             return out
         except Exception as exc:
             log.warning("data-api v1 positions: %s", exc)

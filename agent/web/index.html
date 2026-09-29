@@ -315,7 +315,7 @@
         ["Win rate lukket", winLine, ""],
         ["Expectancy / lukket", usd(a.expectancy || 0), tone(a.expectancy || 0)],
         ["Snitt hold lukket", hold, ""],
-        ["Open risk", `${usd(risk.usd || 0)} (${pctn(risk.pct || 0)}) · ${risk.seats || 0} seter`, ""],
+        ["Kost i markedet", `${usd(risk.usd || 0)} (kost ${pctn(risk.pct || 0)} av EK) · ${risk.seats || 0} seter`, ""],
       ];
       const attrEl = $("attr");
       if (attrEl) {
