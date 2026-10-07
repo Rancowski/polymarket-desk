@@ -63,11 +63,43 @@ def _tape_skip(m: dict) -> bool:
     return False
 
 
+def _event_expected_n(rows: list[dict]) -> int:
+    """Declared sibling count. Missing rows in the group must not look complete."""
+    n = len(rows)
+    questions = {str(r.get("question") or "")[:90] for r in rows}
+    ids = {str(r.get("condition_id") or "") for r in rows}
+    for r in rows:
+        try:
+            declared = int(r.get("event_n") or r.get("outcome_count") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        n = max(n, declared)
+        sibs = r.get("siblings") or []
+        if not isinstance(sibs, list) or not sibs:
+            continue
+        n = max(n, 1 + len(sibs))
+        extra = 0
+        for s in sibs:
+            if isinstance(s, dict):
+                sid = str(s.get("condition_id") or "")
+                sq = str(s.get("q") or s.get("question") or "")[:90]
+            else:
+                sid, sq = "", str(s)[:90]
+            if (sid and sid not in ids) and (sq not in questions):
+                extra += 1
+            elif sq and sq not in questions and not sid:
+                extra += 1
+        n = max(n, len(rows) + extra)
+    return n
+
+
 def partition_complete(rows: list[dict]) -> bool:
+    """True only when every sibling is present. Mid-sum alone is not complete."""
     if len(rows) < 2:
         return False
+    if len(rows) < _event_expected_n(rows):
+        return False
     texts = [str(r.get("question") or "").lower() for r in rows]
-    blob = " ".join(texts)
     if any("draw" in t or " tie" in f" {t} " or "uavgjort" in t for t in texts) and len(rows) >= 3:
         return True
     from agent.kalshi import _fed_want
@@ -76,19 +108,7 @@ def partition_complete(rows: list[dict]) -> bool:
     wants.discard(None)
     if len(wants) >= 3 and (wants & {"H0", "H25", "H26", "C25", "C26"}):
         return True
-    mids: list[float] = []
-    for r in rows:
-        try:
-            mids.append(float(r.get("yes_mid") or r.get("mid") or 0))
-        except (TypeError, ValueError):
-            continue
-    s = sum(mids)
-    if len(rows) == 2 and 0.94 <= s <= 1.06:
-        return True
-    if len(rows) >= 3 and 0.90 <= s <= 1.10:
-        return True
-    _ = blob
-    return False
+    return len(rows) >= 2
 
 
 _parse_end = parse_end
@@ -271,6 +291,30 @@ class Arb:
         )
         return n + need > MAX_SPORTS
 
+    def _log_reject(self, kind: str, reason: str, ident: str, extra: str = "") -> None:
+        log.info("%s reject %s %s %s", kind, reason, ident, extra)
+
+    def _same_shares(
+        self,
+        costs: list[float],
+        ask_sizes: list[float],
+        size_base: float,
+        cash: float,
+    ) -> tuple[float, str]:
+        """One share count for every leg. Combined package uses EDGE_TARGET once."""
+        if not costs or any(c <= 0 for c in costs):
+            return 0.0, "size"
+        total = sum(costs)
+        depth = min(ask_sizes) if ask_sizes else 0.0
+        _usd, shares, why = self._leg(total, depth, size_base, cash, EDGE_TARGET)
+        if why or shares <= 0:
+            return 0.0, "size"
+        shares = round(float(shares), 2)
+        for sz in ask_sizes:
+            if float(sz or 0) < shares:
+                return 0.0, "size"
+        return shares, ""
+
     def _complements(
         self,
         markets: list[dict],
@@ -296,44 +340,49 @@ class Arb:
             if _tape_skip(m):
                 continue
             if not (m.get("yes_token") and m.get("no_token")):
+                self._log_reject("complement", "one-leg", str(cid), "missing token")
                 continue
             yb = self._book(m, "yes")
             nb = self._book(m, "no")
             if not yb or not nb or yb.get("synthetic") or nb.get("synthetic"):
+                self._log_reject("complement", "one-leg", str(cid), "missing book")
                 continue
             yask = float(yb.get("best_ask") or 0)
             nask = float(nb.get("best_ask") or 0)
+            if yask <= 0 or nask <= 0:
+                self._log_reject("complement", "one-leg", str(cid), "ask<=0")
+                continue
             if not complement_edge(yask, nask):
                 continue
             yspread = float(yb.get("spread") or 0)
             nspread = float(nb.get("spread") or 0)
-            legs: list[tuple[str, str, dict, float, float]] = []
-            if yask <= nask:
-                order = (("YES", m["yes_token"], yb, yask, yspread), ("NO", m["no_token"], nb, nask, nspread))
-            else:
-                order = (("NO", m["no_token"], nb, nask, nspread), ("YES", m["yes_token"], yb, yask, yspread))
-            for side, token, book, cost, spr in order:
-                if (cid, side) in held_side:
-                    continue
-                if spr > LEG_SPREAD_MAX:
-                    self.n_blocked_spread += 1
-                    continue
-                legs.append((side, token, book, cost, float(book.get("ask_size") or 0)))
-            if not legs:
+            if yspread > LEG_SPREAD_MAX or nspread > LEG_SPREAD_MAX:
+                self.n_blocked_spread += 1
+                self._log_reject("complement", "spread", str(cid), f"YES={yspread:.3f} NO={nspread:.3f}")
                 continue
-            per = EDGE_TARGET / max(1, len(legs))
-            ok_legs: list[Ticket] = []
-            for side, token, book, cost, sz in legs:
-                usd, shares, why = self._leg(cost, sz, size_base, cash, per)
-                if why:
-                    continue
-                thesis = f"complement {side} ask {cost:.3f} YES+NO {yask+nask:.3f}"
-                ok_legs.append(_ticket(m, side, token, book, cost, shares, thesis, source="complement"))
-            if not ok_legs:
+            if (cid, "YES") in held_side or (cid, "NO") in held_side:
+                self._log_reject("complement", "one-leg", str(cid), "already held")
                 continue
-            out.extend(ok_legs)
-            for t in ok_legs:
-                held_side.add((cid, t.side))
+            if self._skip_sports(m, sports_n, sports_halt, out, need=2):
+                continue
+            ysz = float(yb.get("ask_size") or 0)
+            nsz = float(nb.get("ask_size") or 0)
+            shares, why = self._same_shares([yask, nask], [ysz, nsz], size_base, cash)
+            if why or shares <= 0:
+                self._log_reject("complement", "size", str(cid), why)
+                continue
+            thesis_y = f"complement YES ask {yask:.3f} YES+NO {yask+nask:.3f}"
+            thesis_n = f"complement NO ask {nask:.3f} YES+NO {yask+nask:.3f}"
+            pair = [
+                _ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis_y, source="complement"),
+                _ticket(m, "NO", m["no_token"], nb, nask, shares, thesis_n, source="complement"),
+            ]
+            if len(pair) != 2:
+                self._log_reject("complement", "one-leg", str(cid), "pair")
+                continue
+            out.extend(pair)
+            held_side.add((cid, "YES"))
+            held_side.add((cid, "NO"))
             if len(out) >= 6:
                 break
         return out
@@ -677,36 +726,66 @@ class Arb:
                 s_bid,
                 " ; ".join(labels)[:160],
             )
-            if not complete:
+            expected = _event_expected_n(rows)
+            if len(rows) < 2 or len(rows) < expected:
+                self._log_reject("partition", "missing-sibling", key, f"n={len(rows)} expected={expected}")
                 continue
             if any(_tape_skip(r) for r in rows):
                 continue
-            if s_ask <= 0 or s_ask > PARTITION_ASK_MAX:
+            if any(
+                str(r.get("condition_id") or "") in open_ids
+                or str(r.get("condition_id") or "") in held_yes
+                for r in rows
+            ):
+                self._log_reject("partition", "one-leg", key, "already open")
                 continue
-            missing = [r for r in rows if str(r.get("condition_id") or "") not in open_ids and str(r.get("condition_id") or "") not in held_yes]
-            if not missing:
+            if any(self._skip_sports(r, sports_n, sports_halt, out, need=len(rows)) for r in rows):
                 continue
-            if any(self._skip_sports(r, sports_n, sports_halt, out) for r in missing):
-                continue
-            per = EDGE_TARGET / max(1, len(missing))
-            for r in missing:
+            books: list[dict] = []
+            asks: list[float] = []
+            sizes: list[float] = []
+            blocked = ""
+            for r in rows:
                 yb = self._book(r, "yes")
-                if not yb or yb.get("synthetic"):
-                    continue
+                if not yb or yb.get("synthetic") or not r.get("yes_token"):
+                    blocked = "missing-sibling"
+                    break
+                cost = float(yb.get("best_ask") or 0)
+                if not (0.02 < cost < 0.98):
+                    blocked = "missing-sibling"
+                    break
                 if float(yb.get("spread") or 0) > LEG_SPREAD_MAX:
                     self.n_blocked_spread += 1
-                    continue
-                cost = float(yb.get("best_ask") or 0)
-                if cost <= 0.01 or cost >= 0.99:
-                    continue
+                    blocked = "spread"
+                    break
+                books.append(yb)
+                asks.append(cost)
+                sizes.append(float(yb.get("ask_size") or 0))
+            if blocked:
+                self._log_reject("partition", blocked, key, "")
+                continue
+            total = sum(asks)
+            if total <= 0 or total > PARTITION_ASK_MAX:
+                continue
+            shares, why = self._same_shares(asks, sizes, size_base, bankroll)
+            if why or shares <= 0:
+                self._log_reject("partition", "size", key, why)
+                continue
+            thesis = f"sum_ask_lt_1 S_ask={total:.3f} n={len(rows)}"
+            batch: list[Ticket] = []
+            for r, yb, cost in zip(rows, books, asks):
                 token = r.get("yes_token")
                 if not token:
-                    continue
-                usd, shares, why = self._leg(cost, float(yb.get("ask_size") or 0), size_base, bankroll, per)
-                if why:
-                    continue
-                thesis = f"sum_ask_lt_1 S_ask={s_ask:.3f} n={len(rows)}"
-                out.append(_ticket(r, "YES", token, yb, cost, shares, thesis, source="partition", source_detail=thesis))
+                    batch = []
+                    break
+                batch.append(
+                    _ticket(r, "YES", token, yb, cost, shares, thesis, source="partition", source_detail=thesis)
+                )
+            if len(batch) != len(rows):
+                self._log_reject("partition", "one-leg", key, f"n={len(batch)}")
+                continue
+            out.extend(batch)
+            for r in rows:
                 open_ids.add(str(r.get("condition_id")))
         return out
 

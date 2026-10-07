@@ -1022,6 +1022,42 @@ class Executor:
         )
         return {"status": "live", "response": data or signed, "ticket": payload}
 
+    def _paper_unfill(self, ticket: Ticket) -> None:
+        """Drop a paper seat so a failed pair/set does not leave one leg open."""
+        try:
+            self.store.close_position(ticket.condition_id, ticket.side)
+        except Exception:
+            log.exception("paper unfill %s", (ticket.question or "")[:40])
+
+    def submit_group(self, tickets: list[Ticket]) -> list[dict]:
+        """Paper: all legs or none. Live: sequential submit, no new CLOB batch."""
+        if not tickets:
+            return []
+        if len(tickets) == 1 or not settings.dry_run:
+            return [self.submit(t) for t in tickets]
+        done: list[Ticket] = []
+        results: list[dict] = []
+        for t in tickets:
+            try:
+                result = self.submit(t)
+            except Exception as exc:
+                for prev in reversed(done):
+                    self._paper_unfill(prev)
+                reason = str(exc)[:160]
+                log.info("paper group abort %s", reason)
+                return [{"status": "blocked", "reason": reason} for _ in tickets]
+            results.append(result)
+            if result.get("status") not in {"paper", "live"}:
+                for prev in reversed(done):
+                    self._paper_unfill(prev)
+                if done:
+                    self._paper_unfill(t)
+                reason = str(result.get("reason") or result.get("status") or "paper fail")
+                log.info("paper group abort %s", reason)
+                return [{"status": "blocked", "reason": reason} for _ in tickets]
+            done.append(t)
+        return results
+
     def _conditional_balance(self, token_id: str) -> float | None:
         """On-chain ERC-1155 size for this token. None = fetch failed, do not invent."""
         token = str(token_id or "").strip()

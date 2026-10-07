@@ -44,6 +44,25 @@ _KX_TICKER_RE = re.compile(
 )
 
 
+def _group_arb_tickets(tickets: list) -> list[list]:
+    """Complement by condition, partition by event. Other sources stay singleton."""
+    buckets: dict[tuple, list] = {}
+    order: list[tuple] = []
+    for t in tickets:
+        src = str(getattr(t, "source", "") or "")
+        if src == "complement":
+            key = ("complement", str(getattr(t, "condition_id", "") or ""))
+        elif src == "partition":
+            key = ("partition", str(getattr(t, "event_key", "") or ""))
+        else:
+            key = ("one", id(t))
+        if key not in buckets:
+            order.append(key)
+            buckets[key] = []
+        buckets[key].append(t)
+    return [buckets[k] for k in order]
+
+
 def _scrub_exit_reason(reason: str) -> str:
     """Exit logs must not print a rejected Kalshi ticker."""
     t = _KX_TICKER_RE.sub("", reason or "")
@@ -1283,37 +1302,47 @@ class Desk:
         src_fill = {"stats": 0, "kalshi": 0, "complement": 0, "partition": 0, "maker": 0, "grok": 0}
         failed_events: set[str] = set()
         pending_hedge = None
-        for ticket in arb_tickets:
-            if ticket.event_key in failed_events:
+        for group in _group_arb_tickets(arb_tickets):
+            if any(t.event_key in failed_events for t in group):
                 continue
             try:
-                result = self.exec.submit(ticket)
-                arb_n += 1
-                self.store.log_decision(
-                    condition_id=ticket.condition_id,
-                    question=ticket.question,
-                    side=ticket.side,
-                    mid=ticket.mid,
-                    p_hat=ticket.p_hat,
-                    edge_net=ticket.edge_net,
-                    action=result.get("status"),
-                    reason=ticket.thesis,
-                    payload=result,
-                )
-                if result.get("status") in {"live", "paper"}:
-                    bankroll = max(0.0, bankroll - ticket.size_usd)
-                    self._bought += 1
-                    src = str(ticket.source or "")
-                    if src in src_fill:
-                        src_fill[src] += 1
-                if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
-                    pending_hedge = ticket if pending_hedge is None else None
-                else:
-                    pending_hedge = None
+                results = self.exec.submit_group(group)
+                if len(results) != len(group):
+                    results = [{"status": "blocked", "reason": "paper group abort"}] * len(group)
+                for ticket, result in zip(group, results):
+                    arb_n += 1
+                    self.store.log_decision(
+                        condition_id=ticket.condition_id,
+                        question=ticket.question,
+                        side=ticket.side,
+                        mid=ticket.mid,
+                        p_hat=ticket.p_hat,
+                        edge_net=ticket.edge_net,
+                        action=result.get("status"),
+                        reason=ticket.thesis,
+                        payload=result,
+                    )
+                    if result.get("status") in {"live", "paper"}:
+                        bankroll = max(0.0, bankroll - ticket.size_usd)
+                        self._bought += 1
+                        src = str(ticket.source or "")
+                        if src in src_fill:
+                            src_fill[src] += 1
+                    if "sum-til-én" in (ticket.thesis or "") or "event-sett" in (ticket.thesis or ""):
+                        pending_hedge = ticket if pending_hedge is None else None
+                    else:
+                        pending_hedge = None
             except Exception as exc:
                 log.exception("Arb-ordre feilet")
-                failed_events.add(ticket.event_key)
-                if pending_hedge and pending_hedge.event_key == ticket.event_key:
+                for ticket in group:
+                    failed_events.add(ticket.event_key)
+                    self.store.log_decision(
+                        condition_id=ticket.condition_id,
+                        question=ticket.question,
+                        action="error",
+                        reason=str(exc),
+                    )
+                if pending_hedge and pending_hedge.event_key in {t.event_key for t in group}:
                     try:
                         self.exec.sell(
                             {
@@ -1332,12 +1361,6 @@ class Desk:
                     except Exception:
                         log.exception("Hedge-rollback feilet")
                     pending_hedge = None
-                self.store.log_decision(
-                    condition_id=ticket.condition_id,
-                    question=ticket.question,
-                    action="error",
-                    reason=str(exc),
-                )
         if arb_n:
             open_pos = self.store.positions("open")
 
