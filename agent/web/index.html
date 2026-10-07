@@ -352,11 +352,11 @@
         el.innerHTML = [
           ["Syklus", "edge-only. Redeem, deretter exits, deretter kun A/B/E (partition). Grok hver 6. syklus, logg, aldri kjøp/exit/veto. kjøpt 0 uten A/B/E er korrekt."],
           ["Redeem", "Hver syklus først: closed / data-api redeemable / (mid≥0,99 og bud≤0,02) → CTF/NegRisk redeem til pUSD. Tapere til 0 lukkes lokalt. Bud ≥ 0,98 på live bok → FAK @ bud. Aldri FAK 0,001. redeem_ok/redeem_err én gang per condition_id, 30 min cooldown."],
-          ["Kjøp", "Bare mekanisk mispris. A) Complement: YES-ask+NO-ask ≤ 0,975, FAK begge ben, 14–18 % samlet. B) Rent Kalshi-par (familie+kalender+samme utfall): |gap|≥6¢, ask 0,18–0,82, spread ≤0,04, 14–18 %. E) Partition: komplett sett YES-asks ≤0,97 → kjøp manglende ben. Ingen favoritter. Ingen Grok-tickets. motpart/år/dato/pin = skip. maker off, locked off."],
+          ["Kjøp", "Bare mekanisk mispris. A) Complement: YES-ask+NO-ask ≤ 0,975, FAK begge ben, 14–18 % samlet. B) Rent Kalshi-par (familie+kalender+samme utfall): |gap|−spread ≥10¢, ask 0,18–0,82, spread ≤0,04, 14–18 %. E) Partition: komplett sett YES-asks ≤0,97 → kjøp manglende ben. Ingen favoritter. Ingen Grok-tickets. motpart/år/dato/pin = skip. maker off, locked off."],
           ["10 seter", "Maks 10 åpne. Samme event_key maks 25 %. Deployed ≥ 75 % → bare exits/redeem. Aldri average down. Ett sete per condition_id (complement YES+NO unntatt)."],
           ["Maker", "maker off, locked off."],
           ["Exits", "Hvis A/B/E-kanten er borte: stopp bud ≤ avg×0,90. Ta bud ≥ avg×1,12 eller ≥0,90, deretter trail 6 % HWM. Kant borte og −8¢ vs avg → flatten FAK. Kalshi ≥6¢ mot åpen side → flatten. Dust < $1 eller <0,1 % innskutt. Salg gulves til on-chain, aldri ceil til 5. Grok p_hat selger aldri."],
-          ["Kalshi", "Bare samme utfall og dato. |gap|≥6¢. Grok kan ikke blokke. Ingen par = vekt 0."],
+          ["Kalshi", "Bare samme utfall og dato. Kjøp: |gap|−spread ≥10¢. Grok kan ikke blokke. Ingen par = vekt 0."],
           ["Sikring", "HALT hopper nye kjøp og live-salg; dashboard :8788 kjører. Paper-redeem når DRY_RUN=true. DRY_RUN=false → live locked, CLOB stengt, HTTP oppe."],
         ].map(([k, v]) => `<div class="row-item"><p class="q">${k}</p><div class="meta">${v}</div></div>`).join("");
         return;

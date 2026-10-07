@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from agent.arb import Arb
+from agent.arb import Arb, ticket_log_payload
 from agent.brain import Brain
 from agent.config import SKIP_QUESTION_PATTERNS, live_forbidden, settings
 from agent.executor import Executor
@@ -1311,6 +1311,8 @@ class Desk:
                     results = [{"status": "blocked", "reason": "paper group abort"}] * len(group)
                 for ticket, result in zip(group, results):
                     arb_n += 1
+                    pay = dict(result) if isinstance(result, dict) else {"status": result}
+                    pay.update(ticket_log_payload(ticket))
                     self.store.log_decision(
                         condition_id=ticket.condition_id,
                         question=ticket.question,
@@ -1320,7 +1322,7 @@ class Desk:
                         edge_net=ticket.edge_net,
                         action=result.get("status"),
                         reason=ticket.thesis,
-                        payload=result,
+                        payload=pay,
                     )
                     if result.get("status") in {"live", "paper"}:
                         bankroll = max(0.0, bankroll - ticket.size_usd)

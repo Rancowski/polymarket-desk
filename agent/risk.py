@@ -862,6 +862,8 @@ class Risk:
         force_reason: str | None = None,
         market: dict | None = None,
     ) -> tuple[dict | None, str]:
+        # Price-based only: bid vs avg and bid vs HWM. p_hat never sells.
+        estimate = None
         shares = float(pos.get("shares") or 0)
         avg = float(pos.get("avg_cost") or 0)
         if shares <= 0 or avg <= 0:

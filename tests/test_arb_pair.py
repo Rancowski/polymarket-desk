@@ -5,11 +5,11 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.arb import EDGE_TARGET, Arb
+from agent.arb import EDGE_TARGET, Arb, kalshi_should_buy, ticket_log_payload
 from agent.config import settings as cfg
 from agent.executor import Executor
 from agent.kalshi import pair_ok, pair_ok_selfcheck
-from agent.risk import Ticket
+from agent.risk import Risk, Ticket
 from agent.store import Store
 
 EQ = 131.0
@@ -28,6 +28,13 @@ class FakeStore:
     def positions(self, status: str = "open") -> list:
         _ = status
         return list(self._open)
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        _ = key
+        return default
+
+    def set_meta(self, key: str, value: str) -> None:
+        _ = (key, value)
 
 
 class FakeScout:
@@ -300,3 +307,100 @@ def test_submit_maker_and_tape_blocked(tmp_path):
         print("FIXTURE submit maker/tape blocked, fills", len(fills))
     finally:
         store.conn.close()
+
+
+def _kalshi_mkt(pm: float, k_yes: float, spread: float = 0.02, ask: float | None = None) -> dict:
+    cost = float(ask if ask is not None else pm)
+    book = _book(cost, spread=spread)
+    return {
+        "condition_id": "fed-h25",
+        "question": "Fed hike 25 bps after the September 2026 meeting",
+        "category": "economics",
+        "event_key": "fed-sep-2026",
+        "yes_token": "yes-fed",
+        "no_token": "no-fed",
+        "book": book,
+        "no_book": _book(max(0.02, round(1.0 - cost, 4)), spread=spread),
+        "yes_mid": pm,
+        "mid": pm,
+        "hours_left": 720,
+        "kalshi": {
+            "ticker": "KXFEDDECISION-26SEP-H25",
+            "title": "Fed decision 25bp",
+            "yes": k_yes,
+            "pm_yes": pm,
+        },
+    }
+
+
+def test_kalshi_gap_6c_zero_tickets():
+    assert kalshi_should_buy(True, 0.06, 0.40, 0.02) is False
+    arb = _arb()
+    tickets = arb._kalshi_gap([_kalshi_mkt(0.40, 0.46, spread=0.02, ask=0.40)], CASH, set())
+    assert tickets == []
+    print("FIXTURE kalshi gap 0.06 spread 0.02 ->", len(tickets), "tickets")
+
+
+def test_kalshi_gap_12c_ticket_real_edge():
+    arb = _arb()
+    tickets = arb._kalshi_gap([_kalshi_mkt(0.40, 0.52, spread=0.02, ask=0.40)], CASH, set())
+    assert len(tickets) == 1, tickets
+    t = tickets[0]
+    assert t.source == "kalshi"
+    assert abs(t.edge_net - 0.10) < 0.015
+    assert abs(t.p_hat - 0.52) < 1e-6
+    assert t.p_hat != 0.99
+    assert t.confidence == "mechanical"
+    pay = ticket_log_payload(t)
+    assert "gap" in pay or "gap_c" in pay
+    assert pay.get("edge_net") != 0.05
+    print("FIXTURE kalshi gap 0.12 -> edge_net", t.edge_net, "p_hat", t.p_hat)
+
+
+def test_complement_ask_sum_096_real_edge():
+    arb = _arb()
+    tickets = arb._complements(
+        [_binary("c96", 0.46, 0.50)],
+        bankroll=CASH,
+        open_ids=set(),
+        equity=EQ,
+    )
+    assert len(tickets) == 2, tickets
+    for t in tickets:
+        assert abs(t.p_hat - 0.04) < 0.011
+        assert abs(t.edge_net - 0.03) < 0.011
+        assert t.p_hat != 0.99
+        assert t.confidence == "mechanical"
+        pay = ticket_log_payload(t)
+        assert abs(pay["ask_sum"] - 0.96) < 0.011
+        assert pay.get("edge_net") != 0.05
+    print("FIXTURE complement ask_sum 0.96 p_hat", tickets[0].p_hat, "edge_net", tickets[0].edge_net)
+
+
+def test_evaluate_exit_ignores_p_hat():
+    store = FakeStore(deposited=131.0)
+    risk = Risk(store)
+    pos = {
+        "condition_id": "hold-1",
+        "question": "Will the bill pass the Senate 2026?",
+        "category": "politics",
+        "event_key": "hold-1",
+        "side": "YES",
+        "shares": 20.0,
+        "avg_cost": 0.40,
+        "cur_price": 0.40,
+        "p_hat": 0.99,
+        "token_id": "tok-hold",
+    }
+    book = _book(0.42, spread=0.02)
+    book["best_bid"] = 0.40
+    book["mid"] = 0.41
+    ticket, why = risk.evaluate_exit(
+        pos,
+        book,
+        {"p_hat": 0.99, "p_yes": 0.99, "confidence": "high"},
+        131.0,
+    )
+    assert ticket is None, (ticket, why)
+    assert "hold" in str(why).lower()
+    print("FIXTURE evaluate_exit p_hat=0.99 bid unchanged ->", why)

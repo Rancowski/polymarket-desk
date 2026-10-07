@@ -31,8 +31,9 @@ COMPLEMENT_MAX_ASK_SUM = 0.975
 PARTITION_ASK_MAX = 0.97
 PARTITION_BID_FLAT = 1.03
 PARTITION_BID_DONE = 1.02
-KALSHI_GAP_MIN = 0.06
+KALSHI_GAP_MIN = 0.10
 LEG_SPREAD_MAX = 0.04
+SET_FEE_HAIRCUT = 0.01
 MAKER_SPREAD_MIN = 0.06
 EDGE_TARGET = 0.16
 MAKER_PCT = (0.06, 0.08)
@@ -46,9 +47,10 @@ def complement_edge(yask: float, nask: float) -> bool:
 
 
 def kalshi_should_buy(pair_ok_flag: bool, gap: float, ask: float, spread: float) -> bool:
+    net = abs(float(gap)) - max(0.0, float(spread))
     return (
         bool(pair_ok_flag)
-        and abs(float(gap)) >= KALSHI_GAP_MIN
+        and net >= KALSHI_GAP_MIN - 1e-9
         and 0.18 <= float(ask) <= 0.82
         and float(spread) <= LEG_SPREAD_MAX
     )
@@ -151,8 +153,18 @@ def _ticket(
     pm_mid: float | None = None,
     gap_c: float | None = None,
     tif: str = "FAK",
+    p_hat: float | None = None,
+    edge_net: float | None = None,
+    confidence: str = "mechanical",
+    ask_sum: float | None = None,
 ) -> Ticket:
     mid = float(book.get("mid") or cost)
+    if ask_sum is not None:
+        residual = round(1.0 - float(ask_sum), 4)
+        p_hat = residual
+        edge_net = round(residual - SET_FEE_HAIRCUT, 4)
+    p_hat_v = float(p_hat if p_hat is not None else 0.0)
+    edge_net_v = float(edge_net if edge_net is not None else 0.0)
     return Ticket(
         condition_id=market["condition_id"],
         question=market.get("question") or "",
@@ -164,10 +176,10 @@ def _ticket(
         best_bid=float(book.get("best_bid") or cost),
         best_ask=float(book.get("best_ask") or cost),
         spread=float(book.get("spread") or 0),
-        p_hat=0.99 if side == "YES" else 0.99,
-        edge_gross=max(0.0, 1.0 - cost) if side == "YES" else max(0.0, cost),
-        edge_net=0.05,
-        confidence="high",
+        p_hat=p_hat_v,
+        edge_gross=max(0.0, p_hat_v),
+        edge_net=edge_net_v,
+        confidence=confidence,
         thesis=thesis,
         limit_price=round(min(0.99, max(0.01, cost)), 2),
         size_usd=round(shares * cost, 2),
@@ -180,6 +192,23 @@ def _ticket(
         gap_c=gap_c,
         tif=tif,
     )
+
+
+def ticket_log_payload(ticket: Ticket) -> dict:
+    """Decision-log facts: real p_hat / edge_net plus gap or ask-sum. Never a stub 0.05."""
+    src = str(ticket.source or "")
+    data: dict = {
+        "source": src,
+        "p_hat": ticket.p_hat,
+        "edge_net": ticket.edge_net,
+        "confidence": ticket.confidence,
+    }
+    if ticket.gap_c is not None:
+        data["gap"] = round(float(ticket.gap_c) / 100.0, 4)
+        data["gap_c"] = ticket.gap_c
+    if src in {"complement", "partition"}:
+        data["ask_sum"] = round(1.0 - float(ticket.p_hat), 4)
+    return data
 
 
 class Arb:
@@ -388,11 +417,12 @@ class Arb:
             if why or shares <= 0:
                 self._log_reject("complement", "size", str(cid), why)
                 continue
-            thesis_y = f"complement YES ask {yask:.3f} YES+NO {yask+nask:.3f}"
-            thesis_n = f"complement NO ask {nask:.3f} YES+NO {yask+nask:.3f}"
+            ask_sum = yask + nask
+            thesis_y = f"complement YES ask {yask:.3f} YES+NO {ask_sum:.3f}"
+            thesis_n = f"complement NO ask {nask:.3f} YES+NO {ask_sum:.3f}"
             pair = [
-                _ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis_y, source="complement"),
-                _ticket(m, "NO", m["no_token"], nb, nask, shares, thesis_n, source="complement"),
+                _ticket(m, "YES", m["yes_token"], yb, yask, shares, thesis_y, source="complement", ask_sum=ask_sum),
+                _ticket(m, "NO", m["no_token"], nb, nask, shares, thesis_n, source="complement", ask_sum=ask_sum),
             ]
             if len(pair) != 2:
                 self._log_reject("complement", "one-leg", str(cid), "pair")
@@ -450,7 +480,7 @@ class Arb:
         return []
 
     def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_halt: bool = False) -> list[Ticket]:
-        """Clean Kalshi pair. |gap|≥6c, ask 0.18–0.82, spread ≤0.04."""
+        """Clean Kalshi pair. |gap|-spread ≥ 10c, ask 0.18–0.82, spread ≤0.04."""
         out: list[Ticket] = []
         size_base = self._size_base(bankroll)
         open_pos = self.store.positions("open")
@@ -508,6 +538,8 @@ class Arb:
                 continue
             ticker = str(ks.get("ticker") or "")
             gap_c = round(gap * 100.0, 1)
+            p_hat = k_yes if side == "YES" else (1.0 - k_yes)
+            edge_net = round(abs(float(gap)) - float(spread), 4)
             thesis = (
                 f"Kalshi-bekreftelse {k_yes:.2f} vs Poly {pm:.2f} gap={gap:+.2f} → {side}"
             )
@@ -527,6 +559,8 @@ class Arb:
                     kalshi_mid=k_yes if 0 < k_yes < 1 else None,
                     pm_mid=pm,
                     gap_c=gap_c,
+                    p_hat=p_hat,
+                    edge_net=edge_net,
                 )
             )
             open_ids.add(cid)
@@ -757,7 +791,18 @@ class Arb:
                     batch = []
                     break
                 batch.append(
-                    _ticket(r, "YES", token, yb, cost, shares, thesis, source="partition", source_detail=thesis)
+                    _ticket(
+                        r,
+                        "YES",
+                        token,
+                        yb,
+                        cost,
+                        shares,
+                        thesis,
+                        source="partition",
+                        source_detail=thesis,
+                        ask_sum=total,
+                    )
                 )
             if len(batch) != len(rows):
                 self._log_reject("partition", "one-leg", key, f"n={len(batch)}")
