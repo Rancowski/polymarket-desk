@@ -43,6 +43,7 @@ class Ticket:
     gap_c: float | None = None
     cycle_id: str | None = None
     tif: str = "FAK"  # FAK lift or GTC join-bid (maker)
+    edge_locked: float | None = None  # 1 - ask_sum on complement/partition; not P(win)
 
 
 def taker_fee_rate(category: str) -> float:
@@ -862,8 +863,10 @@ class Risk:
         force_reason: str | None = None,
         market: dict | None = None,
     ) -> tuple[dict | None, str]:
-        # Price-based only: bid vs avg and bid vs HWM. p_hat never sells.
+        # Price-based only: bid vs avg and bid vs HWM. p_hat / edge_locked never sell.
         estimate = None
+        _ = pos.get("p_hat")
+        _ = pos.get("edge_locked")
         shares = float(pos.get("shares") or 0)
         avg = float(pos.get("avg_cost") or 0)
         if shares <= 0 or avg <= 0:

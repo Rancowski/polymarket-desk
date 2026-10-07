@@ -44,6 +44,7 @@ VALID_SOURCES = frozenset(
         "redeem",
         "resolve",
         "flatten",
+        "paper_ghost",
     }
 )
 
@@ -62,6 +63,9 @@ _SIDE_MAP = {
     "RESOLVE": "RESOLVE",
     "RESOLVE_YES": "RESOLVE_YES",
     "RESOLVE_NO": "RESOLVE_NO",
+    "GHOST": "GHOST_YES",
+    "GHOST_YES": "GHOST_YES",
+    "GHOST_NO": "GHOST_NO",
 }
 
 
@@ -655,7 +659,7 @@ class Store:
             rows = cur.fetchall()
         for row in rows:
             su = normalize_side(row["side"])
-            if su in {f"RESOLVE_{yn}", "RESOLVE", f"REDEEM_{yn}", "REDEEM"}:
+            if su in {f"RESOLVE_{yn}", "RESOLVE", f"REDEEM_{yn}", "REDEEM", f"GHOST_{yn}", "GHOST"}:
                 return True
             if su == f"SELL_{yn}" or (su == "SELL" and yn == "YES"):
                 if int(row["dry_run"] or 0) == 0 and self._raw_is_matched(row["raw"]):
@@ -1320,8 +1324,136 @@ class Store:
             rows = cur.fetchall()
         return sum(1 for row in rows if self._raw_is_matched(row["raw"]))
 
+    def _ghost_miss_key(self, condition_id: str, side: str | None) -> str:
+        return f"ghost_miss:{condition_id}:{str(side or 'YES').upper()}"
+
+    def ghost_miss_n(self, condition_id: str, side: str | None) -> int:
+        raw = self.get_meta(self._ghost_miss_key(condition_id, side), "0")
+        try:
+            return int(raw or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _clear_ghost_miss(self, condition_id: str, side: str | None) -> None:
+        self.set_meta(self._ghost_miss_key(condition_id, side), "")
+
+    def _opening_buy_dry_run(self, condition_id: str, side: str | None) -> int | None:
+        """0 = live buy, 1 = paper-only buy, None = no buy fill."""
+        cid = str(condition_id or "").strip()
+        yn = str(side or "YES").upper()
+        if yn.startswith("BUY_"):
+            yn = yn[4:]
+        if not cid:
+            return None
+        if self._leg_has_live_buy(cid, yn):
+            return 0
+        paper = False
+        with self._lock:
+            cur = self.conn.execute(
+                "SELECT side, dry_run FROM fills WHERE condition_id=?",
+                (cid,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            su = normalize_side(row["side"])
+            if su.startswith("BUY_") and (su[4:] or "YES") == yn and int(row["dry_run"] or 0) == 1:
+                paper = True
+                break
+        if paper:
+            return 1
+        return None
+
+    def close_paper_ghost(self, pos: dict) -> bool:
+        """Close a paper seat flat: proceeds = cost. Not a resolve, not realized PnL."""
+        cid = str(pos.get("condition_id") or "").strip()
+        yn = str(pos.get("side") or "YES").upper()
+        if yn not in {"YES", "NO"}:
+            yn = "YES"
+        if not cid or self.has_close_fill(cid, yn):
+            return False
+        try:
+            shares = float(pos.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            avg = float(pos.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            avg = 0.0
+        if shares <= 0 and avg <= 0:
+            return False
+        cost = max(0.0, shares * avg)
+        self.add_fill(
+            condition_id=cid,
+            side=f"GHOST_{yn}",
+            price=round(avg, 4) if avg else 0.0,
+            size=shares,
+            cost=round(cost, 4),
+            dry_run=True,
+            question=pos.get("question"),
+            token_id=pos.get("token_id"),
+            source="paper_ghost",
+            source_detail="paper_ghost flat proceeds=cost",
+            cycle_id=self.get_meta("cycle_id") or None,
+            ts=utc_now(),
+            raw={
+                "paper_ghost": True,
+                "status": "matched",
+                "takingAmount": str(round(cost, 4)),
+                "question": pos.get("question"),
+                "source": "paper_ghost",
+            },
+        )
+        self.close_position(cid, pos.get("side"))
+        self._clear_ghost_miss(cid, yn)
+        self.log_decision(
+            condition_id=cid,
+            question=pos.get("question"),
+            side=yn,
+            action="paper_ghost",
+            reason=f"paper_ghost proceeds={cost:.2f} = cost",
+        )
+        log.info(
+            "paper_ghost %s %s shares=%.4f proceeds=%.2f (=cost)",
+            yn,
+            str(pos.get("question") or "")[:60],
+            shares,
+            cost,
+        )
+        return True
+
+    def _note_missing_seat(self, row: dict) -> None:
+        cid = str(row.get("condition_id") or "").strip()
+        yn = str(row.get("side") or "YES").upper()
+        if not cid:
+            return
+        n = self.ghost_miss_n(cid, yn) + 1
+        self.set_meta(self._ghost_miss_key(cid, yn), str(n))
+        dry = self._opening_buy_dry_run(cid, yn)
+        q = str(row.get("question") or cid)[:60]
+        if dry == 1:
+            if n == 1:
+                self.log_decision(
+                    condition_id=cid,
+                    question=row.get("question"),
+                    side=yn,
+                    action="ghost_missing",
+                    reason="ghost_missing data-api miss 1",
+                )
+                log.info("ghost_missing %s %s (paper, miss=1, still open)", yn, q)
+                return
+            self.close_paper_ghost(row)
+            return
+        self.log_decision(
+            condition_id=cid,
+            question=row.get("question"),
+            side=yn,
+            action="ghost_missing",
+            reason=f"live seat missing from data-api miss={n}",
+        )
+        log.warning("live seat missing from data-api %s %s miss=%s — not a resolve", yn, q, n)
+
     def sync_open_positions(self, live: list[dict]) -> None:
-        """Replace local open with data-api seats. Resolve vanished / mid≤0.02."""
+        """Merge data-api seats. Missing local paper is ghost_missing, not a fake loss."""
         cleaned = []
         dead: list[dict] = []
         for r in live:
@@ -1338,12 +1470,13 @@ class Store:
                 continue
             cleaned.append(r)
         live_keys = {(str(r.get("condition_id")), str(r.get("side") or "YES").upper()) for r in cleaned}
+        for r in cleaned:
+            self._clear_ghost_miss(str(r.get("condition_id") or ""), r.get("side"))
         local_open = self.positions("open")
         for row in local_open:
             key = (str(row.get("condition_id")), str(row.get("side") or "YES").upper())
             if key not in live_keys:
-                self.record_resolution(row, source="resolve", proceeds=0.0)
-                self.close_position(str(row.get("condition_id") or ""), row.get("side"))
+                self._note_missing_seat(row)
         for r in dead:
             self.record_resolution(r, source="redeem", proceeds=0.0)
             self.close_position(str(r.get("condition_id") or ""), r.get("side"))
@@ -1362,8 +1495,16 @@ class Store:
         return float(p.get("shares") or 0) * float(p.get("avg_cost") or 0)
 
     def shown_seats(self, open_pos: list[dict]) -> list[dict]:
-        """Seats shown in Posisjoner: size>0 and mid>0.01."""
-        return [p for p in (open_pos or []) if is_open_seat(p)]
+        """Seats shown in Posisjoner: size>0 and mid>0.01. Ghosts are not seats."""
+        out: list[dict] = []
+        for p in open_pos or []:
+            if not is_open_seat(p):
+                continue
+            cid = str(p.get("condition_id") or "")
+            if cid and self.ghost_miss_n(cid, p.get("side")) > 0:
+                continue
+            out.append(p)
+        return out
 
     def markedet_sum(self, open_pos: list[dict]) -> float:
         return sum(self.position_mtm(p) for p in self.shown_seats(open_pos))
@@ -1647,6 +1788,11 @@ class Store:
             return None
 
         for f in fills:
+            if str(f.get("source") or "").lower() == "paper_ghost":
+                continue
+            su = normalize_side(f.get("side"))
+            if su.startswith("GHOST"):
+                continue
             cid = str(f.get("condition_id") or "")
             direction, yn = _leg(f.get("side"))
             key = (cid, yn)

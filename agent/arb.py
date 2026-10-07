@@ -159,9 +159,11 @@ def _ticket(
     ask_sum: float | None = None,
 ) -> Ticket:
     mid = float(book.get("mid") or cost)
+    edge_locked_v: float | None = None
     if ask_sum is not None:
         residual = round(1.0 - float(ask_sum), 4)
-        p_hat = residual
+        edge_locked_v = residual
+        p_hat = 0.0
         edge_net = round(residual - SET_FEE_HAIRCUT, 4)
     p_hat_v = float(p_hat if p_hat is not None else 0.0)
     edge_net_v = float(edge_net if edge_net is not None else 0.0)
@@ -177,7 +179,7 @@ def _ticket(
         best_ask=float(book.get("best_ask") or cost),
         spread=float(book.get("spread") or 0),
         p_hat=p_hat_v,
-        edge_gross=max(0.0, p_hat_v),
+        edge_gross=max(0.0, edge_locked_v if edge_locked_v is not None else p_hat_v),
         edge_net=edge_net_v,
         confidence=confidence,
         thesis=thesis,
@@ -191,23 +193,29 @@ def _ticket(
         pm_mid=pm_mid if pm_mid is not None else mid,
         gap_c=gap_c,
         tif=tif,
+        edge_locked=edge_locked_v,
     )
 
 
 def ticket_log_payload(ticket: Ticket) -> dict:
-    """Decision-log facts: real p_hat / edge_net plus gap or ask-sum. Never a stub 0.05."""
+    """Decision-log facts: edge_locked / Kalshi p_hat / gap / ask-sum. Never a stub 0.05."""
     src = str(ticket.source or "")
     data: dict = {
         "source": src,
-        "p_hat": ticket.p_hat,
         "edge_net": ticket.edge_net,
         "confidence": ticket.confidence,
     }
     if ticket.gap_c is not None:
         data["gap"] = round(float(ticket.gap_c) / 100.0, 4)
         data["gap_c"] = ticket.gap_c
-    if src in {"complement", "partition"}:
-        data["ask_sum"] = round(1.0 - float(ticket.p_hat), 4)
+    locked = ticket.edge_locked
+    if locked is not None:
+        data["edge_locked"] = locked
+        data["ask_sum"] = round(1.0 - float(locked), 4)
+    elif src in {"complement", "partition"}:
+        data["ask_sum"] = None
+    else:
+        data["p_hat"] = ticket.p_hat
     return data
 
 

@@ -1313,12 +1313,13 @@ class Desk:
                     arb_n += 1
                     pay = dict(result) if isinstance(result, dict) else {"status": result}
                     pay.update(ticket_log_payload(ticket))
+                    locked = getattr(ticket, "edge_locked", None)
                     self.store.log_decision(
                         condition_id=ticket.condition_id,
                         question=ticket.question,
                         side=ticket.side,
                         mid=ticket.mid,
-                        p_hat=ticket.p_hat,
+                        p_hat=None if locked is not None else ticket.p_hat,
                         edge_net=ticket.edge_net,
                         action=result.get("status"),
                         reason=ticket.thesis,

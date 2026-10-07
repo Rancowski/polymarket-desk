@@ -367,14 +367,23 @@ def test_complement_ask_sum_096_real_edge():
     )
     assert len(tickets) == 2, tickets
     for t in tickets:
-        assert abs(t.p_hat - 0.04) < 0.011
+        assert t.edge_locked is not None
+        assert abs(float(t.edge_locked) - 0.04) < 0.011
         assert abs(t.edge_net - 0.03) < 0.011
+        assert abs(t.p_hat - 0.04) > 0.01
         assert t.p_hat != 0.99
         assert t.confidence == "mechanical"
         pay = ticket_log_payload(t)
+        assert "edge_locked" in pay
         assert abs(pay["ask_sum"] - 0.96) < 0.011
+        assert pay.get("p_hat") in (None, 0, 0.0) or "p_hat" not in pay
         assert pay.get("edge_net") != 0.05
-    print("FIXTURE complement ask_sum 0.96 p_hat", tickets[0].p_hat, "edge_net", tickets[0].edge_net)
+    print(
+        "FIXTURE complement ask_sum 0.96 edge_locked",
+        tickets[0].edge_locked,
+        "edge_net",
+        tickets[0].edge_net,
+    )
 
 
 def test_evaluate_exit_ignores_p_hat():
@@ -390,6 +399,7 @@ def test_evaluate_exit_ignores_p_hat():
         "avg_cost": 0.40,
         "cur_price": 0.40,
         "p_hat": 0.99,
+        "edge_locked": 0.04,
         "token_id": "tok-hold",
     }
     book = _book(0.42, spread=0.02)
@@ -398,9 +408,91 @@ def test_evaluate_exit_ignores_p_hat():
     ticket, why = risk.evaluate_exit(
         pos,
         book,
-        {"p_hat": 0.99, "p_yes": 0.99, "confidence": "high"},
+        {"p_hat": 0.99, "p_yes": 0.99, "edge_locked": 0.04, "confidence": "high"},
         131.0,
     )
     assert ticket is None, (ticket, why)
     assert "hold" in str(why).lower()
-    print("FIXTURE evaluate_exit p_hat=0.99 bid unchanged ->", why)
+    print("FIXTURE evaluate_exit edge_locked=0.04 bid unchanged ->", why)
+
+
+def _seed_open(store: Store, cid: str, *, dry_run: bool, cost: float = 10.0, shares: float = 25.0) -> None:
+    px = cost / shares
+    store.add_fill(
+        condition_id=cid,
+        side="BUY_YES",
+        price=px,
+        size=shares,
+        cost=cost,
+        dry_run=dry_run,
+        question="Paper ghost fixture",
+        token_id="tok-" + cid,
+        source="complement",
+        source_detail="complement YES+NO 0.90",
+        raw={"status": "matched", "takingAmount": str(cost)},
+    )
+    store.upsert_position(
+        condition_id=cid,
+        question="Paper ghost fixture",
+        category="politics",
+        event_key=cid,
+        side="YES",
+        token_id="tok-" + cid,
+        shares=shares,
+        avg_cost=px,
+        cur_price=px,
+        status="open",
+        entry_source="complement",
+    )
+
+
+def test_paper_absent_one_cycle_stays_open(tmp_path):
+    store = Store(tmp_path / "ghost1.db")
+    try:
+        _seed_open(store, "pg1", dry_run=True, cost=10.0, shares=25.0)
+        before = store.attribution_stats()["realized"]
+        store.sync_open_positions([])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert "pg1" in open_ids
+        assert store.attribution_stats()["realized"] == before
+        fills = store.recent_fills(20)
+        assert not any(str(f.get("source") or "") in {"resolve", "paper_ghost"} for f in fills)
+        assert not store.has_close_fill("pg1", "YES")
+        print("FIXTURE paper miss 1 -> still open realized", before)
+    finally:
+        store.conn.close()
+
+
+def test_paper_absent_two_cycles_paper_ghost_flat(tmp_path):
+    store = Store(tmp_path / "ghost2.db")
+    try:
+        _seed_open(store, "pg2", dry_run=True, cost=10.0, shares=25.0)
+        before = store.attribution_stats()["realized"]
+        store.sync_open_positions([])
+        store.sync_open_positions([])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert "pg2" not in open_ids
+        assert store.attribution_stats()["realized"] == before
+        fills = store.recent_fills(20)
+        ghosts = [f for f in fills if str(f.get("source") or "") == "paper_ghost"]
+        assert len(ghosts) == 1, fills
+        assert abs(float(ghosts[0].get("cost") or 0) - 10.0) < 1e-6
+        assert not any(str(f.get("source") or "") == "resolve" for f in fills)
+        print("FIXTURE paper miss 2 -> paper_ghost proceeds", ghosts[0].get("cost"), "realized", before)
+    finally:
+        store.conn.close()
+
+
+def test_live_absent_one_cycle_no_resolve(tmp_path):
+    store = Store(tmp_path / "ghost_live.db")
+    try:
+        _seed_open(store, "lv1", dry_run=False, cost=10.0, shares=25.0)
+        store.sync_open_positions([])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert "lv1" in open_ids
+        fills = store.recent_fills(20)
+        assert not any(str(f.get("source") or "") in {"resolve", "paper_ghost"} for f in fills)
+        assert not store.has_close_fill("lv1", "YES")
+        print("FIXTURE live miss 1 -> still open, no resolve")
+    finally:
+        store.conn.close()
