@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 
 from agent.config import SKIP_QUESTION_PATTERNS, settings
@@ -22,6 +21,7 @@ from agent.risk import (
     parse_end,
     size_ticket,
     sizing_base,
+    VENUE_MIN_SHARES,
 )
 
 log = logging.getLogger("arb")
@@ -252,17 +252,16 @@ class Arb:
         sports_halt = bool(Risk(self.store).sports_blocked(equity or size_base, size_base, cash=bankroll))
         at_cap = len(open_pos) >= settings.max_open_positions
         tickets: list[Ticket] = []
-        tickets.extend(self._complements(markets, bankroll, open_ids, sports_n, sports_halt, at_cap))
+        tickets.extend(self._complements(markets, bankroll, open_ids, sports_n, sports_halt, at_cap, equity=equity))
         taken = {t.condition_id for t in tickets}
         if not at_cap:
             tickets.extend(self._kalshi_gap(markets, bankroll, open_ids | taken, sports_n, sports_halt))
             taken = {t.condition_id for t in tickets}
-            tickets.extend(self._partition(markets, bankroll, open_ids | taken, sports_n, sports_halt, open_pos))
+            tickets.extend(self._partition(markets, bankroll, open_ids | taken, sports_n, sports_halt, open_pos, equity=equity))
             taken = {t.condition_id for t in tickets}
             if STATS_ENABLED:
                 tickets.extend(self._favorites(markets, bankroll, open_ids | taken, sports_n, sports_halt))
                 taken = {t.condition_id for t in tickets}
-            tickets.extend(self._makers(markets, bankroll, open_ids | taken))
         self.n_complement = sum(1 for t in tickets if t.source == "complement")
         self.n_kalshi_clean = sum(1 for t in tickets if t.source == "kalshi")
         self.n_partition = sum(1 for t in tickets if t.source == "partition")
@@ -298,18 +297,36 @@ class Arb:
         self,
         costs: list[float],
         ask_sizes: list[float],
-        size_base: float,
         cash: float,
+        equity: float,
     ) -> tuple[float, str]:
-        """One share count for every leg. Combined package uses EDGE_TARGET once."""
+        """One share count. Set costs min(cash, EDGE_TARGET*equity, book-fillable)."""
         if not costs or any(c <= 0 for c in costs):
             return 0.0, "size"
-        total = sum(costs)
-        depth = min(ask_sizes) if ask_sizes else 0.0
-        _usd, shares, why = self._leg(total, depth, size_base, cash, EDGE_TARGET)
-        if why or shares <= 0:
+        total = sum(float(c) for c in costs)
+        if total <= 0:
             return 0.0, "size"
-        shares = round(float(shares), 2)
+        avail = max(0.0, float(cash or 0))
+        eq = float(equity or 0)
+        if eq <= 0:
+            eq = avail
+        depth_shares = min((float(sz or 0) for sz in ask_sizes), default=0.0)
+        fillable = max(0.0, depth_shares * total)
+        budget = min(avail, EDGE_TARGET * eq, fillable)
+        if budget <= 0:
+            return 0.0, "size"
+        shares = budget / total
+        if shares < VENUE_MIN_SHARES:
+            bumped = VENUE_MIN_SHARES * total
+            if bumped > budget + 1e-9:
+                return 0.0, "size"
+            shares = VENUE_MIN_SHARES
+        shares = int(shares * 100 + 1e-9) / 100.0
+        if shares <= 0:
+            return 0.0, "size"
+        set_cost = shares * total
+        if set_cost > avail + 1e-6 or set_cost > EDGE_TARGET * eq + 1e-6:
+            return 0.0, "size"
         for sz in ask_sizes:
             if float(sz or 0) < shares:
                 return 0.0, "size"
@@ -323,9 +340,9 @@ class Arb:
         sports_n: int = 0,
         sports_halt: bool = False,
         at_cap: bool = False,
+        equity: float = 0.0,
     ) -> list[Ticket]:
         out: list[Ticket] = []
-        size_base = self._size_base(bankroll)
         cash = bankroll
         held_side = {
             (str(p.get("condition_id")), str(p.get("side") or "YES").upper())
@@ -367,7 +384,7 @@ class Arb:
                 continue
             ysz = float(yb.get("ask_size") or 0)
             nsz = float(nb.get("ask_size") or 0)
-            shares, why = self._same_shares([yask, nask], [ysz, nsz], size_base, cash)
+            shares, why = self._same_shares([yask, nask], [ysz, nsz], cash, equity)
             if why or shares <= 0:
                 self._log_reject("complement", "size", str(cid), why)
                 continue
@@ -429,47 +446,8 @@ class Arb:
         return out
 
     def _locked(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_halt: bool = False) -> list[Ticket]:
-        now = datetime.now(timezone.utc)
-        out: list[Ticket] = []
-        size_base = self._size_base(bankroll)
-        for m in markets:
-            cid = m.get("condition_id")
-            if not cid or cid in open_ids:
-                continue
-            if self._skip_sports(m, sports_n, sports_halt, out):
-                continue
-            if _finishing(m):
-                continue
-            if is_sports(m):
-                continue
-            end = _parse_end(m.get("end_date"))
-            if not end:
-                continue
-            elapsed = (now - end).total_seconds()
-            if elapsed < 90 * 60 or elapsed > 72 * 3600:
-                continue
-            yes = float(m.get("yes_mid") or m.get("mid") or 0.5)
-            if LOCKED_NO < yes < LOCKED_YES:
-                continue
-            side = "YES" if yes >= LOCKED_YES else "NO"
-            book = self._book(m, "yes" if side == "YES" else "no")
-            token = m.get("yes_token") if side == "YES" else m.get("no_token")
-            cost = float(book.get("best_ask") or (yes if side == "YES" else max(0.01, 1.0 - yes)))
-            if cost <= 0.05 or cost >= 0.98:
-                continue
-            if side == "YES" and cost < LOCKED_YES - 0.04:
-                continue
-            ask_sz = float(book.get("ask_size") or 0)
-            usd, shares, why = self._leg(cost, ask_sz, size_base, bankroll, CORE_PCT[1])
-            if why:
-                continue
-            hours = (now - end).total_seconds() / 3600
-            thesis = f"låst utfall {side} mid={yes:.2f} slutt for {hours:.0f}t siden"
-            out.append(_ticket(m, side, token, book, cost, shares, thesis, source="tape"))
-            open_ids.add(cid)
-            if len(out) >= 4:
-                break
-        return out
+        _ = (markets, bankroll, open_ids, sports_n, sports_halt)
+        return []
 
     def _kalshi_gap(self, markets: list[dict], bankroll: float, open_ids: set[str], sports_n: int = 0, sports_halt: bool = False) -> list[Ticket]:
         """Clean Kalshi pair. |gap|≥6c, ask 0.18–0.82, spread ≤0.04."""
@@ -698,10 +676,10 @@ class Arb:
         sports_n: int,
         sports_halt: bool,
         open_pos: list,
+        equity: float = 0.0,
     ) -> list[Ticket]:
         self.annotate_partitions(markets)
         out: list[Ticket] = []
-        size_base = self._size_base(bankroll)
         groups: dict[str, list[dict]] = {}
         for m in markets:
             key = str(m.get("event_key") or "")
@@ -767,7 +745,7 @@ class Arb:
             total = sum(asks)
             if total <= 0 or total > PARTITION_ASK_MAX:
                 continue
-            shares, why = self._same_shares(asks, sizes, size_base, bankroll)
+            shares, why = self._same_shares(asks, sizes, bankroll, equity)
             if why or shares <= 0:
                 self._log_reject("partition", "size", key, why)
                 continue
@@ -822,50 +800,5 @@ class Arb:
         return force
 
     def _makers(self, markets: list[dict], bankroll: float, open_ids: set[str]) -> list[Ticket]:
-        """Join bid when paid to wait. GTC, max 2. Not a view."""
-        out: list[Ticket] = []
-        size_base = self._size_base(bankroll)
-        for m in markets:
-            if len(out) >= 2:
-                break
-            cid = m.get("condition_id")
-            if not cid or cid in open_ids:
-                continue
-            if _tape_skip(m):
-                continue
-            h = hours_to_end(m)
-            if h is None or h > 72:
-                continue
-            try:
-                mid = float(m.get("yes_mid") or m.get("mid") or 0)
-            except (TypeError, ValueError):
-                mid = 0.0
-            if not (0.25 <= mid <= 0.75):
-                continue
-            yb = self._book(m, "yes")
-            if not yb or yb.get("synthetic"):
-                continue
-            spread = float(yb.get("spread") or 0)
-            if spread < MAKER_SPREAD_MIN:
-                continue
-            if mid <= 0.5:
-                side, token, book = "YES", m.get("yes_token"), yb
-            else:
-                nb = self._book(m, "no")
-                if not nb or nb.get("synthetic"):
-                    continue
-                side, token, book = "NO", m.get("no_token"), nb
-            bid = float(book.get("best_bid") or 0)
-            if bid < 0.18 or bid > 0.82:
-                continue
-            if not token:
-                continue
-            usd, shares, why = self._leg(bid, float(book.get("bid_size") or 0), size_base, bankroll, MAKER_PCT[1])
-            if why:
-                continue
-            thesis = f"maker join bid {bid:.3f} spread {spread:.3f}"
-            t = _ticket(m, side, token, book, bid, shares, thesis, source="maker", source_detail=thesis, tif="GTC")
-            t.limit_price = round(bid, 2)
-            out.append(t)
-            open_ids.add(cid)
-        return out
+        _ = (markets, bankroll, open_ids)
+        return []

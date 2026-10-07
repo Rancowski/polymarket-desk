@@ -284,6 +284,8 @@ def _state() -> dict[str, Any]:
             "kalshi": True,
             "sig": settings.signature_type,
             "batch": settings.estimate_batch,
+            "maker": False,
+            "locked": False,
         },
         "version": _version(),
         "update": _update_status(),

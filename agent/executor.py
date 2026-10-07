@@ -837,7 +837,7 @@ class Executor:
             log.info("HALT: skip buy %s", (ticket.question or "")[:60])
             return {"status": "blocked", "reason": "HALT"}
         src = str(getattr(ticket, "source", "") or "")
-        if src not in {"complement", "kalshi", "partition", "maker"}:
+        if src not in {"complement", "kalshi", "partition"}:
             log.error("freeze: blocked buy source=%s %s", src, (ticket.question or "")[:60])
             return {
                 "status": "blocked",
@@ -898,7 +898,7 @@ class Executor:
         if getattr(ticket, "synthetic", False):
             raise RuntimeError("live-kjøp avvist: syntetisk bok")
         src = str(getattr(ticket, "source", "") or "")
-        if src not in {"complement", "partition", "maker"} and is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
+        if src not in {"complement", "partition"} and is_sports({"question": ticket.question, "category": ticket.category, "event_key": ticket.event_key}):
             if not (0.18 < float(ticket.limit_price) < 0.82):
                 raise RuntimeError("sports ekstrem-pris")
             sports_pos = [p for p in self.store.positions("open") if is_sports(p)]
