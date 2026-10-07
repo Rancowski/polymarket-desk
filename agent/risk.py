@@ -601,12 +601,40 @@ class Risk:
         return None
 
     def buys_blocked(self, equity: float, deposited: float) -> str | None:
-        """HALT or live locked. No daily freeze, no 85% desk stop."""
-        _ = (equity, deposited)
+        """HALT, live lock, or paper daily/weekly loss halt. Exits/redeem still run."""
+        _ = deposited
         locked = live_forbidden()
         if locked:
             return locked
-        return self.halted()
+        halt = self.halted()
+        if halt:
+            return halt
+        if not settings.dry_run:
+            return None
+        eq = float(equity or 0)
+        daily_pct = float(settings.daily_loss_halt_pct or 0)
+        day_anchor = self.store.float_meta("day_anchor_equity")
+        if day_anchor and float(day_anchor) > 0 and daily_pct > 0:
+            daily_dd = (float(day_anchor) - eq) / float(day_anchor)
+            if daily_dd >= daily_pct - 1e-12:
+                reason = (
+                    f"daily loss halt {daily_dd:.1%} >= {daily_pct:.0%} "
+                    f"(equity={eq:.2f} day_anchor={float(day_anchor):.2f})"
+                )
+                log.info("paper buy halt: %s", reason)
+                return reason
+        weekly_pct = float(settings.weekly_loss_halt_pct or 0)
+        week_anchor = self.store.equity_hours_ago(7 * 24)
+        if week_anchor and float(week_anchor) > 0 and weekly_pct > 0:
+            weekly_dd = (float(week_anchor) - eq) / float(week_anchor)
+            if weekly_dd >= weekly_pct - 1e-12:
+                reason = (
+                    f"weekly loss halt {weekly_dd:.1%} >= {weekly_pct:.0%} "
+                    f"(equity={eq:.2f} week_anchor={float(week_anchor):.2f})"
+                )
+                log.info("paper buy halt: %s", reason)
+                return reason
+        return None
 
     def sports_blocked(self, equity: float, deposited: float, cash: float | None = None) -> str | None:
         """No category buy-bans. Seat caps live in evaluate()."""

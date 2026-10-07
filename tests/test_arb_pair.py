@@ -1,6 +1,7 @@
 """Complement pair + partition set tickets. pair_ok fixtures stay rejected."""
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from agent.arb import EDGE_TARGET, Arb, kalshi_should_buy, ticket_log_payload
 from agent.config import settings as cfg
 from agent.executor import Executor
 from agent.kalshi import pair_ok, pair_ok_selfcheck
+from agent.loop import Desk
 from agent.risk import Risk, Ticket
 from agent.store import Store
 
@@ -18,9 +20,15 @@ SET_CAP = EDGE_TARGET * EQ  # 20.96
 
 
 class FakeStore:
-    def __init__(self, deposited: float = 1000.0, open_pos: list | None = None) -> None:
+    def __init__(
+        self,
+        deposited: float = 1000.0,
+        open_pos: list | None = None,
+        meta: dict | None = None,
+    ) -> None:
         self._deposited = deposited
         self._open = list(open_pos or [])
+        self._meta = dict(meta or {})
 
     def deposited_usd(self, default: float = 0.0) -> float:
         return self._deposited
@@ -30,11 +38,26 @@ class FakeStore:
         return list(self._open)
 
     def get_meta(self, key: str, default: str = "") -> str:
-        _ = key
-        return default
+        val = self._meta.get(key)
+        if val is None:
+            return default
+        return str(val)
 
     def set_meta(self, key: str, value: str) -> None:
-        _ = (key, value)
+        self._meta[key] = value
+
+    def float_meta(self, key: str) -> float | None:
+        val = self._meta.get(key)
+        if val is None or val == "":
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    def equity_hours_ago(self, hours: float) -> float | None:
+        _ = hours
+        return self.float_meta("week_anchor_equity")
 
 
 class FakeScout:
@@ -481,6 +504,113 @@ def test_paper_absent_two_cycles_paper_ghost_flat(tmp_path):
         print("FIXTURE paper miss 2 -> paper_ghost proceeds", ghosts[0].get("cost"), "realized", before)
     finally:
         store.conn.close()
+
+
+def _paper_settings():
+    return replace(
+        cfg,
+        dry_run=True,
+        xai_api_key="xai-test-key-not-real",
+        halt_file=Path("C:/no-such-halt-polymarket-desk"),
+    )
+
+
+def _hold_pos() -> dict:
+    return {
+        "condition_id": "hold-halt",
+        "question": "Will the bill pass the Senate 2026?",
+        "category": "politics",
+        "event_key": "hold-halt",
+        "side": "YES",
+        "shares": 20.0,
+        "avg_cost": 0.40,
+        "cur_price": 0.40,
+        "token_id": "tok-hold-halt",
+    }
+
+
+def test_daily_halt_7pct_blocks_scan_exit_callable():
+    store = FakeStore(deposited=100.0, meta={"day_anchor_equity": 100.0})
+    paper = _paper_settings()
+    with (
+        patch("agent.risk.settings", paper),
+        patch("agent.risk.live_forbidden", return_value=None),
+    ):
+        arb = Arb(FakeScout(), store)
+        tickets = arb.scan([_binary("c1", 0.40, 0.50)], CASH, equity=93.0)
+        assert tickets == []
+        risk = Risk(store)
+        ticket, why = risk.evaluate_exit(_hold_pos(), _book(0.42, spread=0.02), None, 93.0)
+    assert ticket is None or isinstance(ticket, dict)
+    assert why
+    print("FIXTURE daily halt 7pct scan", len(tickets), "exit", why)
+
+
+def test_daily_halt_1pct_complement_not_blocked():
+    store = FakeStore(deposited=100.0, meta={"day_anchor_equity": 100.0})
+    paper = _paper_settings()
+    with (
+        patch("agent.risk.settings", paper),
+        patch("agent.risk.live_forbidden", return_value=None),
+    ):
+        arb = Arb(FakeScout(), store)
+        tickets = arb.scan([_binary("c1", 0.40, 0.50)], CASH, equity=99.0)
+    assert len(tickets) == 2, tickets
+    assert all(t.source == "complement" for t in tickets)
+    print("FIXTURE daily halt 1pct complement", len(tickets), "tickets")
+
+
+def test_paper_cycle_does_not_call_xai(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("XAI_API_KEY", "xai-test-key-not-real")
+    caplog.set_level(logging.INFO)
+    db = tmp_path / "cycle.db"
+    store = Store(db)
+    paper = _paper_settings()
+    markets = [_binary("c1", 0.40, 0.50)]
+    with (
+        patch("agent.loop.settings", paper),
+        patch("agent.risk.settings", paper),
+        patch("agent.executor.settings", paper),
+        patch("agent.brain.settings", paper),
+        patch("agent.loop.live_forbidden", return_value=None),
+        patch("agent.risk.live_forbidden", return_value=None),
+        patch("agent.loop.Store", return_value=store),
+        patch("agent.loop.threading.Thread"),
+        patch("agent.kalshi.fetch_open", return_value=[]),
+        patch("agent.kalshi.compare", return_value=(0, [])),
+    ):
+        desk = Desk()
+        desk.store = store
+        desk.risk = Risk(store)
+        desk.arb = Arb(desk.scout, store)
+        desk.exec = Executor(store)
+        desk.scout.fetch = lambda limit=150: markets
+        desk.exec.cancel_open = lambda: None
+        desk.exec.fetch_pm_snapshot = lambda force=False: {
+            "available": CASH,
+            "positions": [],
+            "mtm": 0.0,
+            "portfolio": EQ,
+        }
+        desk._cycle_i = 5
+        with (
+            patch.object(desk.brain, "estimate", wraps=None) as est,
+            patch.object(desk.brain, "_call") as call,
+            patch("agent.brain.requests.post") as post,
+        ):
+            est.side_effect = AssertionError("xAI estimate must not be called in paper")
+            call.side_effect = AssertionError("xAI _call must not be called in paper")
+            post.side_effect = AssertionError("xAI requests.post must not be called in paper")
+            result = desk.cycle()
+    assert result.get("ok") is True, result
+    assert est.call_count == 0
+    assert call.call_count == 0
+    assert post.call_count == 0
+    text = caplog.text
+    assert "grok=off" in text
+    assert "run_grok=True" not in text
+    print("FIXTURE paper cycle xAI not called grok=off")
+    store.conn.close()
 
 
 def test_live_absent_one_cycle_no_resolve(tmp_path):

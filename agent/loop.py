@@ -1244,14 +1244,13 @@ class Desk:
             return {"ok": True, "halted": True, "reason": reason}
 
         self._cycle_i += 1
-        run_grok = True
         log.info(
             "Syklus start dry_run=%s bankroll=%.2f equity=%.2f open=%s grok=%s n=%s",
             settings.dry_run,
             bankroll,
             equity,
             len(open_pos),
-            run_grok,
+            "off",
             self._cycle_i,
         )
 
@@ -1369,37 +1368,40 @@ class Desk:
 
         xai_cycle = 0.0
         grok_n = 0
-        run_grok = (self._cycle_i % 6 == 0) and len(open_pos) <= 3
-        if run_grok:
-            try:
-                prepaid = self.store.xai_prepaid_usd()
-                spent = self.store.api_spend(hours=None)
-                remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
-                if remaining >= 0.02:
-                    sample = [m for m in markets if not m.get("_open_only")][:3]
-                    estimates = self.brain.estimate(sample) if sample else {}
-                    grok_n = len(estimates)
-                    usage = getattr(self.brain, "last_usage", {}) or {}
-                    xai_cycle = float(usage.get("usd") or 0)
-                    if xai_cycle:
-                        self.store.add_api_cost(
-                            xai_cycle,
-                            str(usage.get("model") or ""),
-                            int(usage.get("tokens") or 0),
-                        )
-                    for cid, est in estimates.items():
-                        q = next((m.get("question") for m in sample if m.get("condition_id") == cid), cid)
-                        self.store.log_decision(
-                            condition_id=cid,
-                            question=q,
-                            p_hat=est.get("p_yes"),
-                            action="grok-log",
-                            reason="log-only conf=%s skip=%s" % (est.get("confidence"), est.get("skip")),
-                            payload=est,
-                        )
-                    log.info("Grok log-only n=%s cycle=%s seats=%s", grok_n, self._cycle_i, len(open_pos))
-            except Exception as exc:
-                log.warning("Grok log-only: %s", exc)
+        if settings.dry_run:
+            log.info("grok=off")
+        else:
+            run_grok = (self._cycle_i % 6 == 0) and len(open_pos) <= 3
+            if run_grok:
+                try:
+                    prepaid = self.store.xai_prepaid_usd()
+                    spent = self.store.api_spend(hours=None)
+                    remaining = max(0.0, prepaid - spent) if prepaid > 0 else 1.0
+                    if remaining >= 0.02:
+                        sample = [m for m in markets if not m.get("_open_only")][:3]
+                        estimates = self.brain.estimate(sample) if sample else {}
+                        grok_n = len(estimates)
+                        usage = getattr(self.brain, "last_usage", {}) or {}
+                        xai_cycle = float(usage.get("usd") or 0)
+                        if xai_cycle:
+                            self.store.add_api_cost(
+                                xai_cycle,
+                                str(usage.get("model") or ""),
+                                int(usage.get("tokens") or 0),
+                            )
+                        for cid, est in estimates.items():
+                            q = next((m.get("question") for m in sample if m.get("condition_id") == cid), cid)
+                            self.store.log_decision(
+                                condition_id=cid,
+                                question=q,
+                                p_hat=est.get("p_yes"),
+                                action="grok-log",
+                                reason="log-only conf=%s skip=%s" % (est.get("confidence"), est.get("skip")),
+                                payload=est,
+                            )
+                        log.info("Grok log-only n=%s cycle=%s seats=%s", grok_n, self._cycle_i, len(open_pos))
+                except Exception as exc:
+                    log.warning("Grok log-only: %s", exc)
 
         try:
             bankroll, equity, _ = self._refresh_portfolio()

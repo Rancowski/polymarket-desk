@@ -1,25 +1,27 @@
 # Autonom Polymarket-desk
 
-To roller i én prosess:
+Paper desk. `DRY_RUN` defaults to true. `DRY_RUN=false` locks CLOB and does not trade.
 
-1. **Scout + Brain (Grok)** — henter likvide markeder, estimerer P(YES), sier nei når den ikke vet.
-2. **Risk + Executor** — slår hardt på 8 % *netto* edge, 6 % posisjonstak, kategori-tak, tap-stopp, og plasserer limit-kjøp.
+Buys only:
+
+- **complement** — both legs (YES+NO on the same condition)
+- **kalshi** — only if `|gap| − spread >= 0.10`
+- **partition** — only if the set is complete
+
+maker off. locked off. Grok off in paper.
 
 Grok-chatten kan **ikke** holde nøkler og signere CLOB-ordrer. Dette programmet er det autonome oppsettet. Du gir det en **egen hot-wallet** med et beløp du tåler å tape.
 
 **Komplett PC-guide (start her): [SETUP.md](SETUP.md)**
 
-## Regler som er kodet inn
+## Freeze (kodet inn)
 
-- Inngang kun hvis `edge_net >= 8 %` etter spread + forventet fee + 5 pp modell-hårkutt
-- Confidence `low` handles aldri
-- Maks **6 %** av bankroll i kostnad per marked / samme event
-- Maks **30 %** per kategori
-- Maks 10 åpne posisjoner
-- Daglig tap 4 % / ukentlig 10 % → ingen nye kjøp
-- Hopper over 5/15-min crypto up/down
-- Limit-kjøp, ikke markedsgaloppering
-- `HALT`-fil i prosjektmappen stopper alt
+- Kjøp kun complement (begge ben), kalshi kun hvis `|gap|−spread >= 0.10`, partition kun hvis settet er komplett
+- maker off, locked off
+- Grok off i paper (ingen xAI-kall når `DRY_RUN=true`)
+- `DRY_RUN` default true. `DRY_RUN=false` låser CLOB og handler ikke
+- Paper: nye kjøp stopper når equity er ned `>= DAILY_LOSS_HALT_PCT` fra `day_anchor`, eller `>= WEEKLY_LOSS_HALT_PCT` fra 7d-anker. Exits, redeem og paper_redeem kjører fortsatt
+- `HALT`-fil hopper nye kjøp og live-salg; dashboard `:8788` kjører
 
 ## Hurtigstart
 
@@ -34,8 +36,6 @@ python main.py once                # én paper-syklus
 python main.py run                 # hvert 15. minutt
 ```
 
-Live: sett `DRY_RUN=false` i `.env` etter at paper ser sunt ut.
-
 Stopp øyeblikkelig: `touch HALT` (Windows: `New-Item HALT`).
 
 ## Sikkerhet
@@ -43,4 +43,3 @@ Stopp øyeblikkelig: `touch HALT` (Windows: `New-Item HALT`).
 - Bruk **kun** en slank hot-wallet. Aldri seed til hovedkonto.
 - `.env` skal aldri committes.
 - Hvis nøkkelen lekker, flytt USDC ut og dropp wallet.
-- Live autonom handel kan tape hele beløpet i wallet.
