@@ -626,3 +626,101 @@ def test_live_absent_one_cycle_no_resolve(tmp_path):
         print("FIXTURE live miss 1 -> still open, no resolve")
     finally:
         store.conn.close()
+
+
+def _desk_for_store(store: Store) -> Desk:
+    paper = _paper_settings()
+    with (
+        patch("agent.loop.settings", paper),
+        patch("agent.risk.settings", paper),
+        patch("agent.executor.settings", paper),
+        patch("agent.loop.live_forbidden", return_value=None),
+        patch("agent.risk.live_forbidden", return_value=None),
+        patch("agent.loop.Store", return_value=store),
+        patch("agent.loop.threading.Thread"),
+    ):
+        desk = Desk()
+    desk.store = store
+    desk.risk = Risk(store)
+    desk.exec = Executor(store)
+    desk.exec.cancel_open = lambda: 0
+    return desk
+
+
+def test_missing_snapshot_keeps_equity_and_dd(tmp_path):
+    store = Store(tmp_path / "snap_miss.db")
+    try:
+        store.set_meta("desk_equity", "131.0000")
+        store.set_meta("desk_cash", "109.0000")
+        store.set_meta("last_equity", "131.0000")
+        store.set_meta("last_cash", "109.0000")
+        store.set_meta("i_markedet", "22.0000")
+        store.set_meta("dd_from_peak", "-0.0600")
+        store.set_meta("day_anchor_equity", "140.0000")
+        store.set_meta("peak_equity", "140.0000")
+        desk = _desk_for_store(store)
+        for snap in (
+            {},
+            {"available": None, "portfolio": None, "mtm": None, "positions": None},
+        ):
+            desk.exec.fetch_pm_snapshot = lambda force=False, _s=snap: _s
+            cash, equity, _ = desk._refresh_portfolio()
+            assert equity == 131.0, equity
+            assert cash == 109.0, cash
+            assert store.float_meta("desk_equity") == 131.0
+            assert store.float_meta("dd_from_peak") == -0.06
+            assert store.float_meta("day_anchor_equity") == 140.0
+            assert store.float_meta("peak_equity") == 140.0
+            assert store.get_meta("i_markedet") == "22.0000"
+            assert store.get_meta("snapshot_missing") == "1"
+
+        def _boom(*, force=False):
+            raise RuntimeError("data-api down")
+
+        desk.exec.fetch_pm_snapshot = _boom
+        cash, equity, _ = desk._refresh_portfolio()
+        assert equity == 131.0
+        assert store.float_meta("dd_from_peak") == -0.06
+        paper = _paper_settings()
+        with (
+            patch("agent.risk.settings", paper),
+            patch("agent.risk.live_forbidden", return_value=None),
+        ):
+            block = Risk(store).buys_blocked(equity, 131.0)
+            tickets = Arb(FakeScout(), store).scan([_binary("c1", 0.40, 0.50)], CASH, equity=equity)
+        assert block == "snapshot_missing"
+        assert tickets == []
+        print("FIXTURE snapshot_missing keeps equity", equity, "dd", store.float_meta("dd_from_peak"))
+    finally:
+        store.conn.close()
+
+
+def test_real_snapshot_updates_equity_to_portfolio(tmp_path):
+    store = Store(tmp_path / "snap_ok.db")
+    try:
+        store.set_meta("desk_equity", "100.0000")
+        store.set_meta("desk_cash", "80.0000")
+        store.set_meta("dd_from_peak", "-0.0600")
+        desk = _desk_for_store(store)
+        desk.exec.fetch_pm_snapshot = lambda force=False: {
+            "available": 109.0,
+            "portfolio": 131.0,
+            "mtm": 22.0,
+            "positions": [],
+        }
+        cash, equity, _ = desk._refresh_portfolio()
+        assert abs(cash - 109.0) < 1e-6
+        assert abs(equity - 131.0) < 1e-6
+        assert abs(float(store.float_meta("desk_equity") or 0) - 131.0) < 1e-6
+        assert abs(float(store.float_meta("desk_cash") or 0) - 109.0) < 1e-6
+        assert store.get_meta("snapshot_missing") == ""
+        paper = _paper_settings()
+        with (
+            patch("agent.risk.settings", paper),
+            patch("agent.risk.live_forbidden", return_value=None),
+        ):
+            block = Risk(store).buys_blocked(equity, 131.0)
+        assert block is None
+        print("FIXTURE real snapshot equity", equity, "cash", cash)
+    finally:
+        store.conn.close()

@@ -609,6 +609,9 @@ class Risk:
         halt = self.halted()
         if halt:
             return halt
+        if (self.store.get_meta("snapshot_missing", "") or "").strip() in {"1", "true", "yes"}:
+            log.info("paper buy halt: snapshot_missing")
+            return "snapshot_missing"
         if not settings.dry_run:
             return None
         eq = float(equity or 0)

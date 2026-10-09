@@ -229,6 +229,13 @@ def _build_grok_batch(eligible: list) -> tuple[list, dict[str, int]]:
     return batch, counts
 
 
+def _pm_snapshot_missing(snap: Any) -> bool:
+    """True when fetch failed, snap is empty, or available/portfolio is absent."""
+    if not isinstance(snap, dict) or not snap:
+        return True
+    return snap.get("available") is None or snap.get("portfolio") is None
+
+
 class Desk:
     """To roller i én prosess: Scout+Brain vurderer, Risk+Executor handler."""
 
@@ -369,6 +376,27 @@ class Desk:
         except Exception as exc:
             log.warning("bootstrap portfolio: %s", exc)
 
+    def _keep_last_portfolio(self) -> tuple[float, float, list]:
+        """Missing data-api snapshot: keep last good marks. Do not stamp 0 into anchors."""
+        self.store.set_meta("snapshot_missing", "1")
+        cash = self.store.float_meta("desk_cash")
+        if cash is None:
+            cash = self.store.float_meta("last_cash")
+        equity = self.store.float_meta("desk_equity")
+        if equity is None:
+            equity = self.store.float_meta("last_equity")
+        cash = float(cash or 0)
+        equity = float(equity or 0)
+        open_pos = self.store.shown_seats(self.store.positions("open"))
+        log.warning(
+            "snapshot_missing keep desk_equity=%.2f desk_cash=%.2f i_markedet=%s dd_from_peak=%s",
+            equity,
+            cash,
+            self.store.get_meta("i_markedet", "") or "—",
+            self.store.get_meta("dd_from_peak", "") or "—",
+        )
+        return cash, equity, open_pos
+
     def _refresh_portfolio(self) -> tuple[float, float, list]:
         try:
             self.exec.cancel_open()
@@ -380,6 +408,8 @@ class Desk:
         except Exception as exc:
             log.warning("pm snapshot: %s", exc)
             snap = {}
+        if _pm_snapshot_missing(snap):
+            return self._keep_last_portfolio()
         live_pos = snap.get("positions")
         if live_pos is not None:
             try:
@@ -387,25 +417,21 @@ class Desk:
             except Exception as exc:
                 log.warning("sync posisjoner: %s", exc)
         open_pos = live_pos if live_pos is not None else self.store.positions("open")
-        available = snap.get("available")
-        cash, equity, open_cost, open_mtm = self.store.split_cash_equity(
-            float(available or 0), open_pos
-        )
+        cash = float(snap.get("available"))
+        equity = float(snap.get("portfolio"))
+        open_mtm = sum(self.store.position_mtm(p) for p in open_pos)
         api_mtm = snap.get("mtm")
         if api_mtm is not None:
             open_mtm = float(api_mtm)
-            equity = cash + open_mtm
         pm_available = cash
-        pm_portfolio = snap.get("portfolio")
-        if pm_portfolio is None:
-            pm_portfolio = equity
-        pm_portfolio = float(pm_portfolio)
+        pm_portfolio = equity
         gap = equity - pm_portfolio
         shown = self.store.shown_seats(open_pos)
         i_markedet = self.store.markedet_sum(shown)
         anchors = self.store.note_period_anchors(equity)
         self.store.mark_equity(cash, equity)
         self.store.save_snapshot(cash, equity, open_mtm)
+        self.store.set_meta("snapshot_missing", "")
         self.store.set_meta("pm_portfolio", f"{pm_portfolio:.4f}")
         self.store.set_meta("pm_available", f"{pm_available:.4f}")
         self.store.set_meta("desk_equity", f"{equity:.4f}")
