@@ -937,6 +937,99 @@ class Store:
         cid = str(condition_id or "").strip()
         return bool(cid and self.get_meta(f"redeem_ok:{cid}", ""))
 
+    def is_dry_run_only(self, condition_id: str, side: str | None) -> bool:
+        """True when the opening buy is paper and was never a live CLOB fill."""
+        return self._opening_buy_dry_run(condition_id, side) == 1
+
+    def last_mark_proceeds(self, pos: dict) -> float:
+        try:
+            shares = float(pos.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            mark = float(pos.get("cur_price") or 0)
+        except (TypeError, ValueError):
+            mark = 0.0
+        try:
+            val = float(pos.get("current_value") or 0)
+        except (TypeError, ValueError):
+            val = 0.0
+        return max(0.0, max(val, shares * mark))
+
+    def credit_off_book(self, pos: dict) -> bool:
+        """Credit realized once after data-api dropped the seat. No second fill."""
+        cid = str(pos.get("condition_id") or "").strip()
+        yn = str(pos.get("side") or "YES").upper()
+        if yn not in {"YES", "NO"}:
+            yn = "YES"
+        if not cid:
+            return False
+        if self.has_close_fill(cid, yn):
+            self.close_position(cid, pos.get("side"))
+            return False
+        try:
+            shares = float(pos.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            avg = float(pos.get("avg_cost") or 0)
+        except (TypeError, ValueError):
+            avg = 0.0
+        try:
+            mark = float(pos.get("cur_price") or 0)
+        except (TypeError, ValueError):
+            mark = 0.0
+        if shares <= 0 and avg <= 0:
+            return False
+        cost = max(0.0, shares * avg)
+        value = self.last_mark_proceeds(pos)
+        winner = mark >= 0.98 - 1e-12
+        dust = (not winner) and value < 1.0 - 1e-12
+        if winner:
+            proceeds = value
+        elif dust:
+            proceeds = cost
+        else:
+            return False
+        px = (proceeds / shares) if shares > 0 else 0.0
+        paper = not self._leg_has_live_buy(cid, yn)
+        self.add_fill(
+            condition_id=cid,
+            side="REDEEM",
+            price=round(px, 4),
+            size=shares,
+            cost=round(proceeds, 4),
+            dry_run=paper,
+            question=pos.get("question"),
+            token_id=pos.get("token_id"),
+            source="redeem",
+            source_detail="off_book last_mark" if winner else "closed_dust proceeds=cost",
+            cycle_id=self.get_meta("cycle_id") or None,
+            raw={
+                "redeem": True,
+                "status": "matched",
+                "takingAmount": str(round(proceeds, 4)),
+                "question": pos.get("question"),
+                "source": "redeem",
+            },
+        )
+        if not self.get_meta(f"redeem_ok:{cid}", ""):
+            self.set_meta(f"redeem_ok:{cid}", utc_now())
+        if dust:
+            self.close_dust(cid, pos.get("side"))
+        else:
+            self.close_position(cid, pos.get("side"))
+        log.info(
+            "credit_off_book %s %s proceeds=%.2f cost=%.2f winner=%s dust=%s",
+            yn,
+            str(pos.get("question") or cid)[:50],
+            proceeds,
+            cost,
+            winner,
+            dust,
+        )
+        return True
+
     def close_dust(self, condition_id: str, side: str | None = None) -> None:
         with self._lock:
             if side:
@@ -1430,6 +1523,9 @@ class Store:
         yn = str(row.get("side") or "YES").upper()
         if not cid:
             return
+        if self.has_close_fill(cid, yn):
+            self.close_position(cid, row.get("side"))
+            return
         n = self.ghost_miss_n(cid, yn) + 1
         self.set_meta(self._ghost_miss_key(cid, yn), str(n))
         dry = self._opening_buy_dry_run(cid, yn)
@@ -1447,6 +1543,8 @@ class Store:
                 return
             self.close_paper_ghost(row)
             return
+        if self.credit_off_book(row):
+            return
         self.log_decision(
             condition_id=cid,
             question=row.get("question"),
@@ -1463,22 +1561,6 @@ class Store:
         for r in live:
             cid = str(r.get("condition_id") or "").strip()
             if not cid:
-                continue
-            yn = r.get("side")
-            if self.is_redeemed(cid):
-                self.close_position(cid, yn)
-                q = str(r.get("question") or cid)[:50]
-                self.log_decision(
-                    condition_id=cid,
-                    question=r.get("question"),
-                    side=yn,
-                    action="paper_redeem",
-                    reason="paper_redeem already",
-                )
-                log.info("paper_redeem %s paper_redeem already", q)
-                continue
-            if self.is_dust(cid, yn):
-                self.close_dust(cid, yn)
                 continue
             try:
                 mid = float(r.get("cur_price") or 0)
@@ -1522,10 +1604,6 @@ class Store:
                 continue
             cid = str(p.get("condition_id") or "")
             if cid and self.ghost_miss_n(cid, p.get("side")) > 0:
-                continue
-            if cid and self.is_redeemed(cid):
-                continue
-            if cid and self.is_dust(cid, p.get("side")):
                 continue
             out.append(p)
         return out
@@ -1760,13 +1838,25 @@ class Store:
                 """
             )
             rows = [dict(r) for r in cur.fetchall()]
+        closed_cids: set[str] = set()
+        for row in rows:
+            su = normalize_side(row.get("side"))
+            src = str(row.get("source") or "").lower()
+            if su.startswith("REDEEM") or su.startswith("RESOLVE") or src in {"redeem", "resolve"}:
+                closed_cids.add(str(row.get("condition_id") or ""))
         out: list[dict] = []
         for row in rows:
             dry = int(row.get("dry_run") or 0) == 1
             if dry:
+                cid = str(row.get("condition_id") or "")
                 su = normalize_side(row.get("side"))
                 src = str(row.get("source") or "").lower()
-                if not (su.startswith("REDEEM") or src == "redeem"):
+                is_close = (
+                    su.startswith("REDEEM")
+                    or su.startswith("RESOLVE")
+                    or src in {"redeem", "resolve"}
+                )
+                if not is_close and cid not in closed_cids:
                     continue
             if not self._raw_is_matched(row.get("raw")):
                 continue

@@ -761,8 +761,78 @@ def _hormuz_dust_row() -> dict:
     }
 
 
-def test_paper_redeem_winner_leaves_open_realized_once(tmp_path):
-    store = Store(tmp_path / "redeem_win.db")
+def _seed_live_winner(store: Store, row: dict) -> None:
+    store.add_fill(
+        condition_id=row["condition_id"],
+        side="BUY_YES",
+        price=0.81,
+        size=21.0,
+        cost=17.01,
+        dry_run=False,
+        question=row["question"],
+        token_id=row["token_id"],
+        source="complement",
+        raw={"status": "matched", "takingAmount": "17.01"},
+    )
+    store.upsert_position(**row)
+
+
+def test_api_still_has_winner_stays_open_realized_unchanged(tmp_path):
+    store = Store(tmp_path / "redeem_on_book.db")
+    try:
+        row = _winner_row()
+        _seed_live_winner(store, row)
+        before_r = store.attribution_stats()["realized"]
+        desk = _desk_for_store(store)
+        n, logs = desk._run_redeems(store.positions("open"), {})
+        assert n >= 1, logs
+        assert any("redeem pending, still on book" in str(r.get("reason") or "") for r in logs)
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] in open_ids
+        assert store.attribution_stats()["realized"] == before_r
+        desk.exec.fetch_pm_snapshot = lambda force=False: {
+            "available": 109.47,
+            "portfolio": 130.92,
+            "mtm": 21.0,
+            "positions": [dict(row)],
+        }
+        cash, equity, _ = desk._refresh_portfolio()
+        assert abs(cash - 109.47) < 1e-6
+        assert abs(equity - 130.92) < 1e-6
+        assert abs(store.float_meta("i_markedet") - 21.0) < 1e-6
+        assert row["condition_id"] in {p["condition_id"] for p in store.positions("open")}
+        assert store.attribution_stats()["realized"] == before_r
+        n2, logs2 = desk._run_redeems([dict(row)], {})
+        assert any("redeem pending, still on book" in str(r.get("reason") or "") for r in logs2)
+        assert store.attribution_stats()["realized"] == before_r
+        print("FIXTURE api winner still on book realized", before_r, "imarkedet 21")
+    finally:
+        store.conn.close()
+
+
+def test_api_drops_winner_credits_realized_once(tmp_path):
+    store = Store(tmp_path / "redeem_drop.db")
+    try:
+        row = _winner_row()
+        _seed_live_winner(store, row)
+        desk = _desk_for_store(store)
+        desk._run_redeems(store.positions("open"), {})
+        before_r = store.attribution_stats()["realized"]
+        assert row["condition_id"] in {p["condition_id"] for p in store.positions("open")}
+        store.sync_open_positions([])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] not in open_ids
+        after_r = store.attribution_stats()["realized"]
+        assert abs(after_r - before_r - 3.99) < 1e-6, (before_r, after_r)
+        store.sync_open_positions([])
+        assert store.attribution_stats()["realized"] == after_r
+        print("FIXTURE api drop winner realized once", after_r)
+    finally:
+        store.conn.close()
+
+
+def test_dry_run_only_paper_redeem_leaves_open_cash_unchanged(tmp_path):
+    store = Store(tmp_path / "redeem_paper_only.db")
     try:
         row = _winner_row()
         store.add_fill(
@@ -771,61 +841,87 @@ def test_paper_redeem_winner_leaves_open_realized_once(tmp_path):
             price=0.81,
             size=21.0,
             cost=17.01,
-            dry_run=False,
+            dry_run=True,
             question=row["question"],
             token_id=row["token_id"],
             source="complement",
             raw={"status": "matched", "takingAmount": "17.01"},
         )
         store.upsert_position(**row)
+        store.set_meta("desk_cash", "109.4700")
+        store.set_meta("desk_equity", "130.9200")
         before_r = store.attribution_stats()["realized"]
-        before_mkt = store.markedet_sum(store.shown_seats(store.positions("open")))
-        assert abs(before_mkt - 21.0) < 1e-6
         desk = _desk_for_store(store)
         n, logs = desk._run_redeems(store.positions("open"), {})
         assert n >= 1, logs
         assert any(r.get("action") == "paper_redeem" for r in logs)
         open_ids = {p["condition_id"] for p in store.positions("open")}
         assert row["condition_id"] not in open_ids
-        shown = store.shown_seats(store.positions("open"))
-        after_mkt = store.markedet_sum(shown)
-        assert abs(before_mkt - after_mkt - 21.0) < 1e-6
         after_r = store.attribution_stats()["realized"]
         assert abs(after_r - before_r - 3.99) < 1e-6, (before_r, after_r)
-        store.sync_open_positions([dict(row)])
-        open_ids = {p["condition_id"] for p in store.positions("open")}
-        assert row["condition_id"] not in open_ids
-        n2, logs2 = desk._run_redeems([dict(row)], {})
-        assert n2 >= 1
-        assert any("already" in str(r.get("reason") or "") for r in logs2)
-        assert store.attribution_stats()["realized"] == after_r
-        print("FIXTURE paper_redeem winner left open realized", after_r, "imarkedet", after_mkt)
+        desk.exec.fetch_pm_snapshot = lambda force=False: {
+            "available": 109.47,
+            "portfolio": 130.92,
+            "mtm": 0.0,
+            "positions": [],
+        }
+        cash, equity, _ = desk._refresh_portfolio()
+        assert abs(cash - 109.47) < 1e-6
+        assert abs(equity - 130.92) < 1e-6
+        print("FIXTURE dry_run-only paper_redeem left open cash", cash, "realized", after_r)
     finally:
         store.conn.close()
 
 
-def test_dust_under_1_closes_and_does_not_reappear(tmp_path):
+def test_dust_dropped_by_api_closes_once(tmp_path):
     store = Store(tmp_path / "dust_h.db")
     try:
         row = _hormuz_dust_row()
+        store.add_fill(
+            condition_id=row["condition_id"],
+            side="BUY_YES",
+            price=0.10,
+            size=5.0,
+            cost=0.50,
+            dry_run=False,
+            question=row["question"],
+            token_id=row["token_id"],
+            source="kalshi",
+            raw={"status": "matched", "takingAmount": "0.50"},
+        )
         store.upsert_position(**row)
-        desk = _desk_for_store(store)
-        desk.scout.book = lambda *a, **k: {
-            "best_bid": 0.09,
-            "best_ask": 0.10,
-            "spread": 0.01,
-            "mid": 0.09,
-            "synthetic": False,
-        }
-        sold, logs = desk._run_exits(store.positions("open"), {}, {}, equity=131.0)
-        assert sold >= 1, logs
-        open_ids = {p["condition_id"] for p in store.positions("open")}
-        assert row["condition_id"] not in open_ids
         store.sync_open_positions([dict(row)])
+        assert row["condition_id"] in {p["condition_id"] for p in store.positions("open")}
+        before_r = store.attribution_stats()["realized"]
+        store.sync_open_positions([])
         open_ids = {p["condition_id"] for p in store.positions("open")}
         assert row["condition_id"] not in open_ids
-        shown = store.shown_seats(store.positions("open"))
-        assert all(p.get("condition_id") != row["condition_id"] for p in shown)
-        print("FIXTURE dust 0.45 closed no reappear")
+        after_r = store.attribution_stats()["realized"]
+        assert abs(after_r - before_r) < 1e-6, (before_r, after_r)
+        closes = [
+            f
+            for f in store.recent_fills(20)
+            if str(f.get("source") or "") == "redeem"
+        ]
+        assert len(closes) == 1
+        store.sync_open_positions([])
+        closes2 = [
+            f
+            for f in store.recent_fills(20)
+            if str(f.get("source") or "") == "redeem"
+        ]
+        assert len(closes2) == 1
+        print("FIXTURE dust 0.45 dropped by api closed once")
     finally:
         store.conn.close()
+
+
+def test_rules_tab_has_no_stale_grok_or_band():
+    html = Path("agent/web/index.html").read_text(encoding="utf-8")
+    assert "Grok hver 6" not in html
+    assert "14–18" not in html
+    assert "14-18" not in html
+    assert "Maker off" in html
+    assert "Grok off i paper" in html
+    assert "DRY_RUN=false" in html
+    print("FIXTURE rules tab copy")

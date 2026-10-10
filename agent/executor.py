@@ -1553,21 +1553,54 @@ class Executor:
     def _record_redeem(self, pos: dict, txh: str, neg: bool, paper: bool) -> None:
         # Paper redeem must not increase cash as if the chain paid.
         cid = str(pos.get("condition_id") or "")
-        shares = float(pos.get("shares") or 0)
-        try:
-            mark = float(pos.get("cur_price") or 0)
-        except (TypeError, ValueError):
-            mark = 0.0
-        px = 1.0 if mark >= 0.5 else 0.0
         already = self.store.get_meta(f"redeem_ok:{cid}", "")
+        dry_only = bool(paper and self.store.is_dry_run_only(cid, pos.get("side")))
         if not already:
+            self.store.set_meta(f"redeem_ok:{cid}", str(int(time.time())))
+        if dry_only:
+            if not self.store.has_close_fill(cid, pos.get("side")):
+                proceeds = self.store.last_mark_proceeds(pos)
+                shares = float(pos.get("shares") or 0)
+                px = (proceeds / shares) if shares else 0.0
+                self.store.add_fill(
+                    condition_id=cid,
+                    side="REDEEM",
+                    price=round(px, 4),
+                    size=shares,
+                    cost=round(proceeds, 4),
+                    dry_run=True,
+                    question=pos.get("question"),
+                    token_id=pos.get("token_id"),
+                    source="redeem",
+                    source_detail="dry_run_only last_mark",
+                    cycle_id=self.store.get_meta("cycle_id") or None,
+                    raw={
+                        "redeem": True,
+                        "tx": txh,
+                        "neg_risk": neg,
+                        "takingAmount": str(round(proceeds, 4)),
+                        "status": "matched",
+                        "source": "redeem",
+                        "question": pos.get("question"),
+                    },
+                )
+            self.store.close_position(cid)
+            try:
+                self.store.clear_dust(cid, pos.get("side"))
+            except Exception:
+                pass
+            return
+        if not paper and not already:
+            shares = float(pos.get("shares") or 0)
+            proceeds = self.store.last_mark_proceeds(pos)
+            px = (proceeds / shares) if shares else 0.0
             self.store.add_fill(
                 condition_id=cid,
                 side="REDEEM",
-                price=px,
+                price=round(px, 4),
                 size=shares,
-                cost=round(shares * px, 4),
-                dry_run=paper,
+                cost=round(proceeds, 4),
+                dry_run=False,
                 question=pos.get("question"),
                 token_id=pos.get("token_id"),
                 source="redeem",
@@ -1577,18 +1610,13 @@ class Executor:
                     "redeem": True,
                     "tx": txh,
                     "neg_risk": neg,
-                    "takingAmount": str(shares),
+                    "takingAmount": str(round(proceeds, 4)),
                     "status": "matched",
                     "source": "redeem",
                     "question": pos.get("question"),
                 },
             )
-            self.store.set_meta(f"redeem_ok:{cid}", str(int(time.time())))
-        self.store.close_position(cid)
-        try:
-            self.store.clear_dust(cid, pos.get("side"))
-        except Exception:
-            pass
+        # Still on the data-api book: keep the seat, do not move realized.
 
     def redeem(self, pos: dict) -> dict:
         """On-chain CTF redeem via proxy/relayer. Winners → pUSD. Never FAK."""

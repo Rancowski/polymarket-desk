@@ -419,14 +419,15 @@ class Desk:
         open_pos = self.store.positions("open")
         cash = float(snap.get("available"))
         equity = float(snap.get("portfolio"))
-        open_mtm = sum(self.store.position_mtm(p) for p in open_pos)
+        book_pos = live_pos if live_pos is not None else open_pos
+        open_mtm = sum(self.store.position_mtm(p) for p in book_pos)
         api_mtm = snap.get("mtm")
         if api_mtm is not None:
             open_mtm = float(api_mtm)
         pm_available = cash
         pm_portfolio = equity
         gap = equity - pm_portfolio
-        shown = self.store.shown_seats(open_pos)
+        shown = self.store.shown_seats(book_pos)
         i_markedet = self.store.markedet_sum(shown)
         anchors = self.store.note_period_anchors(equity)
         self.store.mark_equity(cash, equity)
@@ -783,9 +784,12 @@ class Desk:
         ready: list[dict] = []
         for cid, rows in winners.items():
             if self.store.get_meta(f"redeem_ok:{cid}", ""):
-                self.store.close_position(cid)
                 pos0 = rows[0]
-                why = "paper_redeem already"
+                if self.store.is_dry_run_only(cid, pos0.get("side")):
+                    self.store.close_position(cid)
+                    why = "paper_redeem already"
+                else:
+                    why = "redeem pending, still on book"
                 if cid not in logged:
                     self.store.log_decision(
                         condition_id=cid,
@@ -801,7 +805,6 @@ class Desk:
                     (pos0.get("question") or "")[:50],
                     why,
                 )
-                n += 1
                 continue
             if self._redeem_cooldown(cid):
                 why = "redeem_err cooldown 30m"
@@ -823,7 +826,13 @@ class Desk:
             status = str(result.get("status") or "redeem_ok")
             txh = str(result.get("tx") or "")
             action = "paper_redeem" if status == "paper_redeem" else "redeem_ok"
-            why = f"{status} tx={txh[:18] if txh else '—'}"
+            pos0 = rows[0] if rows else {}
+            if status == "paper_redeem" and not self.store.is_dry_run_only(
+                cid, pos0.get("side")
+            ):
+                why = "redeem pending, still on book"
+            else:
+                why = f"{status} tx={txh[:18] if txh else '—'}"
             self.store.set_meta(f"redeem_err:{cid}", "")
             if cid not in logged:
                 self.store.log_decision(
@@ -929,25 +938,20 @@ class Desk:
             except (TypeError, ValueError):
                 val_pre = 0.0
             value_pre = max(val_pre, shares_pre * mark_pre)
-            if self.store.is_redeemed(str(cid or "")):
-                self.store.close_position(str(cid or ""), side)
-                continue
             if (
                 value_pre < 1.0 - 1e-12
                 and mark_pre < 0.90
                 and resolved_state(pos, {}, {}) != "winner"
             ):
-                self.store.close_dust(str(cid or ""), str(side or "YES"))
-                why = "closed_dust under $1"
+                why = "hold dust still on book"
                 self.store.log_decision(
                     condition_id=cid,
                     question=pos.get("question"),
                     side=side,
-                    action="closed_dust",
+                    action="hold",
                     reason=why,
                 )
-                log_rows.append(_row("closed_dust", why))
-                sold += 1
+                log_rows.append(_row("hold", why))
                 continue
             if mark_pre >= 0.90:
                 try:
@@ -957,17 +961,15 @@ class Desk:
             elif self.store.is_dust(str(cid or ""), str(side or "YES")) or self.store.dust_close_fresh(
                 str(cid or ""), str(side or "YES")
             ):
-                self.store.close_dust(str(cid or ""), str(side or "YES"))
-                why = "closed_dust under $1"
+                why = "hold dust still on book"
                 self.store.log_decision(
                     condition_id=cid,
                     question=pos.get("question"),
                     side=side,
-                    action="closed_dust",
+                    action="hold",
                     reason=why,
                 )
-                log_rows.append(_row("closed_dust", why))
-                sold += 1
+                log_rows.append(_row("hold", why))
                 continue
             if not token:
                 why = "mangler token_id"
