@@ -933,6 +933,10 @@ class Store:
     def is_dust(self, condition_id: str, side: str | None) -> bool:
         return bool(self.get_meta(self._dust_key(condition_id, side), ""))
 
+    def is_redeemed(self, condition_id: str) -> bool:
+        cid = str(condition_id or "").strip()
+        return bool(cid and self.get_meta(f"redeem_ok:{cid}", ""))
+
     def close_dust(self, condition_id: str, side: str | None = None) -> None:
         with self._lock:
             if side:
@@ -1460,6 +1464,22 @@ class Store:
             cid = str(r.get("condition_id") or "").strip()
             if not cid:
                 continue
+            yn = r.get("side")
+            if self.is_redeemed(cid):
+                self.close_position(cid, yn)
+                q = str(r.get("question") or cid)[:50]
+                self.log_decision(
+                    condition_id=cid,
+                    question=r.get("question"),
+                    side=yn,
+                    action="paper_redeem",
+                    reason="paper_redeem already",
+                )
+                log.info("paper_redeem %s paper_redeem already", q)
+                continue
+            if self.is_dust(cid, yn):
+                self.close_dust(cid, yn)
+                continue
             try:
                 mid = float(r.get("cur_price") or 0)
             except (TypeError, ValueError):
@@ -1502,6 +1522,10 @@ class Store:
                 continue
             cid = str(p.get("condition_id") or "")
             if cid and self.ghost_miss_n(cid, p.get("side")) > 0:
+                continue
+            if cid and self.is_redeemed(cid):
+                continue
+            if cid and self.is_dust(cid, p.get("side")):
                 continue
             out.append(p)
         return out
@@ -1738,8 +1762,12 @@ class Store:
             rows = [dict(r) for r in cur.fetchall()]
         out: list[dict] = []
         for row in rows:
-            if int(row.get("dry_run") or 0) == 1:
-                continue
+            dry = int(row.get("dry_run") or 0) == 1
+            if dry:
+                su = normalize_side(row.get("side"))
+                src = str(row.get("source") or "").lower()
+                if not (su.startswith("REDEEM") or src == "redeem"):
+                    continue
             if not self._raw_is_matched(row.get("raw")):
                 continue
             out.append(self._decorate_fill(row))

@@ -724,3 +724,108 @@ def test_real_snapshot_updates_equity_to_portfolio(tmp_path):
         print("FIXTURE real snapshot equity", equity, "cash", cash)
     finally:
         store.conn.close()
+
+
+def _winner_row() -> dict:
+    return {
+        "condition_id": "isr-iran-sep30",
+        "question": "Israel x Iran ceasefire through September 30",
+        "category": "geopolitics",
+        "event_key": "isr-iran-sep30",
+        "side": "YES",
+        "token_id": "tok-isr-iran",
+        "shares": 21.0,
+        "avg_cost": 0.81,
+        "cur_price": 1.0,
+        "current_value": 21.0,
+        "status": "open",
+        "redeemable": True,
+        "entry_source": "complement",
+    }
+
+
+def _hormuz_dust_row() -> dict:
+    return {
+        "condition_id": "hormuz-dust",
+        "question": "Will Hormuz traffic stay normal through December 31 2026",
+        "category": "geopolitics",
+        "event_key": "hormuz-dust",
+        "side": "YES",
+        "token_id": "tok-hormuz",
+        "shares": 5.0,
+        "avg_cost": 0.10,
+        "cur_price": 0.09,
+        "current_value": 0.45,
+        "status": "open",
+        "entry_source": "kalshi",
+    }
+
+
+def test_paper_redeem_winner_leaves_open_realized_once(tmp_path):
+    store = Store(tmp_path / "redeem_win.db")
+    try:
+        row = _winner_row()
+        store.add_fill(
+            condition_id=row["condition_id"],
+            side="BUY_YES",
+            price=0.81,
+            size=21.0,
+            cost=17.01,
+            dry_run=False,
+            question=row["question"],
+            token_id=row["token_id"],
+            source="complement",
+            raw={"status": "matched", "takingAmount": "17.01"},
+        )
+        store.upsert_position(**row)
+        before_r = store.attribution_stats()["realized"]
+        before_mkt = store.markedet_sum(store.shown_seats(store.positions("open")))
+        assert abs(before_mkt - 21.0) < 1e-6
+        desk = _desk_for_store(store)
+        n, logs = desk._run_redeems(store.positions("open"), {})
+        assert n >= 1, logs
+        assert any(r.get("action") == "paper_redeem" for r in logs)
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] not in open_ids
+        shown = store.shown_seats(store.positions("open"))
+        after_mkt = store.markedet_sum(shown)
+        assert abs(before_mkt - after_mkt - 21.0) < 1e-6
+        after_r = store.attribution_stats()["realized"]
+        assert abs(after_r - before_r - 3.99) < 1e-6, (before_r, after_r)
+        store.sync_open_positions([dict(row)])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] not in open_ids
+        n2, logs2 = desk._run_redeems([dict(row)], {})
+        assert n2 >= 1
+        assert any("already" in str(r.get("reason") or "") for r in logs2)
+        assert store.attribution_stats()["realized"] == after_r
+        print("FIXTURE paper_redeem winner left open realized", after_r, "imarkedet", after_mkt)
+    finally:
+        store.conn.close()
+
+
+def test_dust_under_1_closes_and_does_not_reappear(tmp_path):
+    store = Store(tmp_path / "dust_h.db")
+    try:
+        row = _hormuz_dust_row()
+        store.upsert_position(**row)
+        desk = _desk_for_store(store)
+        desk.scout.book = lambda *a, **k: {
+            "best_bid": 0.09,
+            "best_ask": 0.10,
+            "spread": 0.01,
+            "mid": 0.09,
+            "synthetic": False,
+        }
+        sold, logs = desk._run_exits(store.positions("open"), {}, {}, equity=131.0)
+        assert sold >= 1, logs
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] not in open_ids
+        store.sync_open_positions([dict(row)])
+        open_ids = {p["condition_id"] for p in store.positions("open")}
+        assert row["condition_id"] not in open_ids
+        shown = store.shown_seats(store.positions("open"))
+        assert all(p.get("condition_id") != row["condition_id"] for p in shown)
+        print("FIXTURE dust 0.45 closed no reappear")
+    finally:
+        store.conn.close()
